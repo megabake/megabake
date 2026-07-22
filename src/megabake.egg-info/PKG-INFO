@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: megabake
+Version: 0.1.0
+Summary: torch.export to megakernel: compile once, distribute everywhere
+License: BSD-3-Clause
+Requires-Python: >=3.10
+Requires-Dist: torch>=2.4
+Requires-Dist: safetensors>=0.4
+Requires-Dist: huggingface_hub>=0.20
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: transformers>=4.40; extra == "dev"

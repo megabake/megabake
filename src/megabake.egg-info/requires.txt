@@ -1,0 +1,7 @@
+torch>=2.4
+safetensors>=0.4
+huggingface_hub>=0.20
+
+[dev]
+pytest>=7.0
+transformers>=4.40

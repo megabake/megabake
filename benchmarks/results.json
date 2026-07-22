@@ -1,0 +1,172 @@
+{
+  "metadata": {
+    "gpu": "NVIDIA H200 MIG 2g.35gb",
+    "sm_count": 32,
+    "cuda_version": "12.4",
+    "torch_version": "2.6.0+cu124",
+    "warmup_iters": 10,
+    "bench_iters": 50
+  },
+  "results": [
+    {
+      "backend": "megabake",
+      "model_name": "linear_256x512",
+      "compile_time_ms": 967.8112110123038,
+      "median_latency_us": 237.15199530124664,
+      "kernel_count": 1,
+      "peak_memory_mb": 0.25439453125,
+      "max_abs_diff": 1.52587890625e-05,
+      "error": null
+    },
+    {
+      "backend": "torch.compile",
+      "model_name": "linear_256x512",
+      "compile_time_ms": 1317.3073306679726,
+      "median_latency_us": 65.15199691057205,
+      "kernel_count": 1,
+      "peak_memory_mb": 32.25146484375,
+      "max_abs_diff": 0.0,
+      "error": null
+    },
+    {
+      "backend": "megabake",
+      "model_name": "linear_512x1024",
+      "compile_time_ms": 130.71663863956928,
+      "median_latency_us": 357.7919900417328,
+      "kernel_count": 1,
+      "peak_memory_mb": 33.02490234375,
+      "max_abs_diff": 0.0009765625,
+      "error": null
+    },
+    {
+      "backend": "torch.compile",
+      "model_name": "linear_512x1024",
+      "compile_time_ms": 68.68876703083515,
+      "median_latency_us": 69.50400024652481,
+      "kernel_count": 1,
+      "peak_memory_mb": 34.01171875,
+      "max_abs_diff": 0.0,
+      "error": null
+    },
+    {
+      "backend": "megabake",
+      "model_name": "mlp_silu",
+      "compile_time_ms": 238.55056101456285,
+      "median_latency_us": 515.7440006732941,
+      "kernel_count": 1,
+      "peak_memory_mb": 32.51171875,
+      "max_abs_diff": 0.00048828125,
+      "error": null
+    },
+    {
+      "backend": "torch.compile",
+      "model_name": "mlp_silu",
+      "compile_time_ms": 60.8076979406178,
+      "median_latency_us": 87.42400258779526,
+      "kernel_count": 3,
+      "peak_memory_mb": 33.001953125,
+      "max_abs_diff": 0.0,
+      "error": null
+    },
+    {
+      "backend": "megabake",
+      "model_name": "mlp_gelu",
+      "compile_time_ms": 139.2399868927896,
+      "median_latency_us": 363.2799983024597,
+      "kernel_count": 1,
+      "peak_memory_mb": 32.63037109375,
+      "max_abs_diff": 0.00048828125,
+      "error": null
+    },
+    {
+      "backend": "torch.compile",
+      "model_name": "mlp_gelu",
+      "compile_time_ms": 67.02926894649863,
+      "median_latency_us": 96.30399942398071,
+      "kernel_count": 3,
+      "peak_memory_mb": 32.751953125,
+      "max_abs_diff": 0.0,
+      "error": null
+    },
+    {
+      "backend": "megabake",
+      "model_name": "mlp_3layer",
+      "compile_time_ms": 149.4132219813764,
+      "median_latency_us": 408.160001039505,
+      "kernel_count": 1,
+      "peak_memory_mb": 32.69482421875,
+      "max_abs_diff": 0.0001220703125,
+      "error": null
+    },
+    {
+      "backend": "torch.compile",
+      "model_name": "mlp_3layer",
+      "compile_time_ms": 127.27123498916626,
+      "median_latency_us": 123.85600060224533,
+      "kernel_count": 5,
+      "peak_memory_mb": 32.75146484375,
+      "max_abs_diff": 0.0,
+      "error": null
+    },
+    {
+      "backend": "megabake",
+      "model_name": "rmsnorm_mlp",
+      "compile_time_ms": 270.7803542725742,
+      "median_latency_us": 659.6800088882446,
+      "kernel_count": 1,
+      "peak_memory_mb": 32.5185546875,
+      "max_abs_diff": 0.000244140625,
+      "error": null
+    },
+    {
+      "backend": "torch.compile",
+      "model_name": "rmsnorm_mlp",
+      "compile_time_ms": 123.80885519087315,
+      "median_latency_us": 112.71999776363373,
+      "kernel_count": 4,
+      "peak_memory_mb": 33.0029296875,
+      "max_abs_diff": 0.0,
+      "error": null
+    },
+    {
+      "backend": "megabake",
+      "model_name": "layernorm_mlp",
+      "compile_time_ms": 143.7386879697442,
+      "median_latency_us": 384.4799995422363,
+      "kernel_count": 1,
+      "peak_memory_mb": 32.63232421875,
+      "max_abs_diff": 0.000244140625,
+      "error": null
+    },
+    {
+      "backend": "torch.compile",
+      "model_name": "layernorm_mlp",
+      "compile_time_ms": 122.33716482296586,
+      "median_latency_us": 115.80800265073776,
+      "kernel_count": 4,
+      "peak_memory_mb": 32.75439453125,
+      "max_abs_diff": 0.0,
+      "error": null
+    },
+    {
+      "backend": "megabake",
+      "model_name": "llama_decoder",
+      "compile_time_ms": 342.131903860718,
+      "median_latency_us": 1418.287992477417,
+      "kernel_count": 1,
+      "peak_memory_mb": 32.15087890625,
+      "max_abs_diff": 0.001953125,
+      "error": null
+    },
+    {
+      "backend": "torch.compile",
+      "model_name": "llama_decoder",
+      "compile_time_ms": 727.1444452926517,
+      "median_latency_us": 455.24799823760986,
+      "kernel_count": 13,
+      "peak_memory_mb": 32.166015625,
+      "max_abs_diff": 0.001953125,
+      "error": null
+    }
+  ]
+}
