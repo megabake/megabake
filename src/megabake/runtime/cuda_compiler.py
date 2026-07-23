@@ -22,9 +22,16 @@ def _get_sm_version() -> int:
     return props.major * 10 + props.minor
 
 
-def _compile_megakernel(force: bool = False) -> str:
-    """Compile all CUDA sources into a cubin. Returns path to .cubin."""
-    cache_key = "megakernel"
+def _compile_megakernel(force: bool = False, portable: bool = False) -> str:
+    """Compile all CUDA sources into a cubin/fatbin.
+
+    Args:
+        force: Recompile even if cached.
+        portable: If True, produce a fatbin with SM80 + SM90a cubins and a
+            compute_80 PTX fallback.  If False (default), produce a single
+            cubin for the current GPU — faster compilation for development.
+    """
+    cache_key = "megakernel" + ("_portable" if portable else "")
     if not force and cache_key in _COMPILED_CACHE:
         so_path = _COMPILED_CACHE[cache_key]
         if os.path.exists(so_path):
@@ -58,7 +65,6 @@ def _compile_megakernel(force: bool = False) -> str:
     # Remove forward declarations since the functions are already defined above
     lines = megakernel_content.split('\n')
     filtered = []
-    skip_fwd_decl = False
     for line in lines:
         # Skip forward declarations of task functions
         if line.strip().startswith('__device__ void task_') and line.strip().endswith(';'):
@@ -75,33 +81,51 @@ def _compile_megakernel(force: bool = False) -> str:
     combined_src.write_text(combined)
 
     sm = _get_sm_version()
-    cubin_path = str(build_dir / f"megakernel_sm{sm}.cubin")
 
-    arch = f"sm_{sm}a" if sm >= 90 else f"sm_{sm}"
-    cmd = [
-        "nvcc",
-        str(combined_src),
-        "-cubin",
-        f"-arch={arch}",
-        "-std=c++17",
-        "--use_fast_math",
-        "--expt-relaxed-constexpr",
-        f"-I{_CUTLASS_INCLUDE}",
-        "-o", cubin_path,
-        "-diag-suppress=177",  # suppress unused variable warnings
-    ]
+    if portable:
+        out_path = str(build_dir / "megakernel.fatbin")
+        cmd = [
+            "nvcc",
+            str(combined_src),
+            "-fatbin",
+            "-gencode=arch=compute_80,code=sm_80",
+            "-gencode=arch=compute_90a,code=sm_90a",
+            "-gencode=arch=compute_80,code=compute_80",
+            "-std=c++17",
+            "--use_fast_math",
+            "--expt-relaxed-constexpr",
+            f"-I{_CUTLASS_INCLUDE}",
+            "-o", out_path,
+            "-diag-suppress=177",
+        ]
+    else:
+        out_path = str(build_dir / f"megakernel_sm{sm}.cubin")
+        arch = f"sm_{sm}a" if sm >= 90 else f"sm_{sm}"
+        cmd = [
+            "nvcc",
+            str(combined_src),
+            "-cubin",
+            f"-arch={arch}",
+            "-std=c++17",
+            "--use_fast_math",
+            "--expt-relaxed-constexpr",
+            f"-I{_CUTLASS_INCLUDE}",
+            "-o", out_path,
+            "-diag-suppress=177",
+        ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=300 if portable else 120)
     if result.returncode != 0:
         raise RuntimeError(
             f"CUDA compilation failed:\nCMD: {' '.join(cmd)}\n"
             f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
         )
 
-    _COMPILED_CACHE[cache_key] = cubin_path
-    return cubin_path
+    _COMPILED_CACHE[cache_key] = out_path
+    return out_path
 
 
-def get_megakernel_cubin() -> str:
-    """Get path to compiled megakernel cubin, compiling if needed."""
-    return _compile_megakernel()
+def get_megakernel_cubin(portable: bool = False) -> str:
+    """Get path to compiled megakernel cubin/fatbin, compiling if needed."""
+    return _compile_megakernel(portable=portable)
