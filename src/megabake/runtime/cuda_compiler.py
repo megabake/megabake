@@ -10,6 +10,12 @@ import torch
 _CUDA_SRC_DIR = Path(__file__).resolve().parent.parent.parent / "cuda"
 _COMPILED_CACHE: dict[str, str] = {}
 
+_CUTLASS_INCLUDE = Path("/home/devuser/pytorch/third_party/cutlass/include")
+if not _CUTLASS_INCLUDE.exists():
+    _env = os.environ.get("CUTLASS_PATH")
+    if _env:
+        _CUTLASS_INCLUDE = Path(_env) / "include"
+
 
 def _get_sm_version() -> int:
     props = torch.cuda.get_device_properties(0)
@@ -76,8 +82,10 @@ def _compile_megakernel(force: bool = False) -> str:
         str(combined_src),
         "-cubin",
         f"-arch=sm_{sm}",
+        "-std=c++17",
         "--use_fast_math",
         "--expt-relaxed-constexpr",
+        f"-I{_CUTLASS_INCLUDE}",
         "-o", cubin_path,
         "-diag-suppress=177",  # suppress unused variable warnings
     ]

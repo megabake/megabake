@@ -262,7 +262,9 @@ def print_table(results: list[BenchmarkResult]) -> None:
         tc = [r for r in runs if r.backend == "torch.compile" and r.error is None]
         if mb and tc:
             speedup = tc[0].median_latency_us / mb[0].median_latency_us
-            print(f"{'':>48s} Speedup: {speedup:.2f}x (megabake vs torch.compile)")
+            mb_k = mb[0].kernel_count
+            tc_k = tc[0].kernel_count
+            print(f"{'':>37s} Speedup: {speedup:.2f}x  ({mb_k} kernel vs {tc_k} kernels)")
         print(sep)
 
 
