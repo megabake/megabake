@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from megabake.data_types import OpType, ScheduleHeader, SCHEDULE_MAGIC
-from megabake.schedule_compiler.graph_walker import compile_schedule
+from megabake.data_types import OpType, ScheduleHeader, SCHEDULE_MAGIC, UopCode
+from megabake.schedule_compiler.graph_walker import compile_schedule, compile_model
 from megabake.schedule_compiler.serializer import load_schedule
 
 
@@ -42,7 +42,7 @@ class TestSimpleModels:
         x = torch.randn(1, 256, device=DEVICE, dtype=torch.float16)
         data = compile_schedule(model, x, sm_version=90)
         header, tasks, *_ = load_schedule(data)
-        assert header.num_tasks >= 3  # fc1 + silu + fc2
+        assert header.num_tasks >= 2  # fc1+silu (fused) + fc2
 
     def test_shape_ops_eliminated(self):
         """Reshape and transpose produce zero tasks."""
@@ -70,6 +70,40 @@ class TestSimpleModels:
         weight_values = list(weights.values())
         assert any("weight" in w for w in weight_values), \
             f"Expected 'weight' in weight names, got: {weight_values}"
+
+    def test_fused_elementwise_silu_mul(self):
+        """SiLU(x) * y should fuse into a single FUSED_ELEMENTWISE task."""
+        class SwiGLU(torch.nn.Module):
+            def forward(self, x, y):
+                return torch.nn.functional.silu(x) * y
+
+        model = SwiGLU().cuda().half().eval()
+        x = torch.randn(4, 256, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 256, device=DEVICE, dtype=torch.float16)
+        data = compile_schedule(model, (x, y), sm_version=90)
+        header, tasks, *_ = load_schedule(data)
+        op_types = [t.op_type for t in tasks]
+        assert OpType.FUSED_ELEMENTWISE in op_types, \
+            f"Expected FUSED_ELEMENTWISE, got {op_types}"
+        fused = [t for t in tasks if t.op_type == OpType.FUSED_ELEMENTWISE][0]
+        assert fused.dimensions[0] == 4 * 256
+        assert fused.dimensions[1] >= 3  # at least LOAD+SILU+LOAD+MUL+STORE
+
+    def test_fused_elementwise_triple_chain(self):
+        """add -> relu -> neg should fuse into one FUSED_ELEMENTWISE."""
+        class TripleChain(torch.nn.Module):
+            def forward(self, x, y):
+                return -(torch.relu(x + y))
+
+        model = TripleChain().cuda().half().eval()
+        x = torch.randn(4, 128, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 128, device=DEVICE, dtype=torch.float16)
+        data = compile_schedule(model, (x, y), sm_version=90)
+        header, tasks, *_ = load_schedule(data)
+        op_types = [t.op_type for t in tasks]
+        assert OpType.FUSED_ELEMENTWISE in op_types, \
+            f"Expected FUSED_ELEMENTWISE, got {op_types}"
+        assert len(tasks) == 1
 
     def test_schedule_metadata(self):
         """Schedule header has correct metadata."""

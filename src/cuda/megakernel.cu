@@ -18,6 +18,8 @@ __device__ void task_copy(const TaskDesc& task, void** buffers,
                            const int* dyn_dims, int tile_id);
 __device__ void task_rope(const TaskDesc& task, void** buffers,
                            const int* dyn_dims, int tile_id);
+__device__ void task_fused_elementwise(const TaskDesc& task, void** buffers,
+                                       const int* dyn_dims, int tile_id);
 
 __device__ __forceinline__ void dispatch_task(
     const TaskDesc& task, void** buffers, const int* dyn_dims, int tile_id
@@ -31,6 +33,9 @@ __device__ __forceinline__ void dispatch_task(
         case OP_INDEX:       task_index(task, buffers, dyn_dims, tile_id);       break;
         case OP_COPY:        task_copy(task, buffers, dyn_dims, tile_id);        break;
         case OP_ROPE:        task_rope(task, buffers, dyn_dims, tile_id);        break;
+        case OP_MATMUL_SILU: task_matmul(task, buffers, dyn_dims, tile_id);     break;
+        case OP_MATMUL_GELU: task_matmul(task, buffers, dyn_dims, tile_id);     break;
+        case OP_FUSED_ELEMENTWISE: task_fused_elementwise(task, buffers, dyn_dims, tile_id); break;
     }
 }
 

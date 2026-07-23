@@ -77,11 +77,12 @@ def _compile_megakernel(force: bool = False) -> str:
     sm = _get_sm_version()
     cubin_path = str(build_dir / f"megakernel_sm{sm}.cubin")
 
+    arch = f"sm_{sm}a" if sm >= 90 else f"sm_{sm}"
     cmd = [
         "nvcc",
         str(combined_src),
         "-cubin",
-        f"-arch=sm_{sm}",
+        f"-arch={arch}",
         "-std=c++17",
         "--use_fast_math",
         "--expt-relaxed-constexpr",

@@ -6,7 +6,7 @@ import struct as _struct
 import torch
 from torch.export import export
 
-from megabake.data_types import TaskDesc, OpType, UNUSED_BUFFER
+from megabake.data_types import TaskDesc, OpType, ElemCode, UopCode, UNUSED_BUFFER, pack_uop
 from megabake.schedule_compiler.op_table import ATEN_OP_MAP, SHAPE_OPS
 from megabake.schedule_compiler.shape_ops import (
     StridedView, contiguous_strides,
@@ -141,6 +141,200 @@ def _extract_dimensions(op_type: int, node, out_shape: list[int]) -> list[int]:
     return dims
 
 
+_EPILOGUE_FUSE = {
+    ElemCode.SILU: OpType.MATMUL_SILU,
+    ElemCode.GELU: OpType.MATMUL_GELU,
+}
+
+
+def _fuse_tasks(
+    tasks: list[TaskDesc], buffer_sizes: dict[int, int]
+) -> list[TaskDesc]:
+    """Fuse adjacent MATMUL + unary ELEMENTWISE into a single fused op."""
+    read_counts: dict[int, int] = {}
+    for t in tasks:
+        for buf in t.buffer_indices[1:]:
+            if buf != UNUSED_BUFFER:
+                read_counts[buf] = read_counts.get(buf, 0) + 1
+
+    fused: list[TaskDesc] = []
+    skip = False
+    for i, task in enumerate(tasks):
+        if skip:
+            skip = False
+            continue
+
+        if (
+            task.op_type == OpType.MATMUL
+            and i + 1 < len(tasks)
+            and tasks[i + 1].op_type == OpType.ELEMENTWISE
+            and tasks[i + 1].op_code in _EPILOGUE_FUSE
+        ):
+            nxt = tasks[i + 1]
+            mid_buf = task.buffer_indices[0]
+            if nxt.buffer_indices[1] == mid_buf and read_counts.get(mid_buf, 0) == 1:
+                task.op_type = _EPILOGUE_FUSE[nxt.op_code]
+                task.buffer_indices[0] = nxt.buffer_indices[0]
+                buffer_sizes.pop(mid_buf, None)
+                skip = True
+
+        fused.append(task)
+
+    return fused
+
+
+_FUSABLE_UNARY = frozenset({
+    ElemCode.SILU, ElemCode.GELU, ElemCode.RELU, ElemCode.SIGMOID,
+    ElemCode.TANH, ElemCode.EXP, ElemCode.LOG, ElemCode.RSQRT,
+    ElemCode.NEG, ElemCode.ABS,
+})
+
+_FUSABLE_BINARY = frozenset({
+    ElemCode.ADD, ElemCode.MUL, ElemCode.SUB, ElemCode.DIV,
+})
+
+_ELEM_TO_UOP = {
+    ElemCode.ADD: UopCode.ADD, ElemCode.MUL: UopCode.MUL,
+    ElemCode.SUB: UopCode.SUB, ElemCode.DIV: UopCode.DIV,
+    ElemCode.SILU: UopCode.SILU, ElemCode.GELU: UopCode.GELU,
+    ElemCode.RELU: UopCode.RELU, ElemCode.SIGMOID: UopCode.SIGMOID,
+    ElemCode.TANH: UopCode.TANH, ElemCode.EXP: UopCode.EXP,
+    ElemCode.LOG: UopCode.LOG, ElemCode.RSQRT: UopCode.RSQRT,
+    ElemCode.NEG: UopCode.NEG, ElemCode.ABS: UopCode.ABS,
+}
+
+
+def _is_fusable_elem(task: TaskDesc) -> bool:
+    if task.op_type != OpType.ELEMENTWISE:
+        return False
+    if task.op_code in _FUSABLE_UNARY:
+        return True
+    if task.op_code in _FUSABLE_BINARY:
+        if task.buffer_indices[2] == UNUSED_BUFFER:
+            return False
+        if task.dimensions[2] != 0 or task.dimensions[3] != 0:
+            return False
+        return True
+    return False
+
+
+def _fuse_elementwise_chains(
+    tasks: list[TaskDesc], buffer_sizes: dict[int, int], sm_version: int,
+) -> list[TaskDesc]:
+    """Fuse consecutive same-numel ELEMENTWISE tasks into a single FUSED_ELEMENTWISE
+    with a micro-op program interpreted on-GPU."""
+    read_counts: dict[int, int] = {}
+    for t in tasks:
+        for buf in t.buffer_indices[1:]:
+            if buf != UNUSED_BUFFER:
+                read_counts[buf] = read_counts.get(buf, 0) + 1
+
+    chains: list[list[int]] = []
+    i = 0
+    while i < len(tasks):
+        if _is_fusable_elem(tasks[i]):
+            chain = [i]
+            j = i + 1
+            while j < len(tasks) and _is_fusable_elem(tasks[j]):
+                prev_out = tasks[chain[-1]].buffer_indices[0]
+                curr = tasks[j]
+                if (
+                    prev_out in curr.buffer_indices[1:8]
+                    and read_counts.get(prev_out, 0) == 1
+                    and curr.dimensions[0] == tasks[chain[-1]].dimensions[0]
+                ):
+                    chain.append(j)
+                    j += 1
+                else:
+                    break
+            if len(chain) >= 2:
+                chains.append(chain)
+            i = j
+        else:
+            i += 1
+
+    if not chains:
+        return tasks
+
+    skip_indices: set[int] = set()
+    fused_at: dict[int, TaskDesc] = {}
+
+    for chain in chains:
+        chain_tasks = [tasks[idx] for idx in chain]
+        numel = chain_tasks[0].dimensions[0]
+
+        intermediate_bufs = {tasks[idx].buffer_indices[0] for idx in chain[:-1]}
+        final_output = chain_tasks[-1].buffer_indices[0]
+
+        buffer_slots = [final_output]
+        buf_to_slot: dict[int, int] = {}
+        buf_to_reg: dict[int, int] = {}
+        uops: list[int] = []
+        next_reg = 0
+
+        def _ensure_loaded(buf: int) -> int:
+            nonlocal next_reg
+            if buf in buf_to_reg:
+                return buf_to_reg[buf]
+            if buf not in buf_to_slot:
+                buf_to_slot[buf] = len(buffer_slots)
+                buffer_slots.append(buf)
+            reg = next_reg; next_reg += 1
+            uops.append(pack_uop(UopCode.LOAD, dst=reg, src1=buf_to_slot[buf]))
+            buf_to_reg[buf] = reg
+            return reg
+
+        for ct in chain_tasks:
+            s1_reg = _ensure_loaded(ct.buffer_indices[1])
+
+            if ct.op_code in _FUSABLE_BINARY:
+                s2_reg = _ensure_loaded(ct.buffer_indices[2])
+                dst_reg = next_reg; next_reg += 1
+                uops.append(pack_uop(_ELEM_TO_UOP[ct.op_code],
+                                     dst=dst_reg, src1=s1_reg, src2=s2_reg))
+            else:
+                dst_reg = next_reg; next_reg += 1
+                uops.append(pack_uop(_ELEM_TO_UOP[ct.op_code],
+                                     dst=dst_reg, src1=s1_reg))
+
+            buf_to_reg[ct.buffer_indices[0]] = dst_reg
+
+        uops.append(pack_uop(UopCode.STORE, dst=0,
+                              src1=buf_to_reg[final_output]))
+
+        if len(uops) > 8 or len(buffer_slots) > 8 or next_reg > 8:
+            continue
+
+        buf_indices = buffer_slots + [UNUSED_BUFFER] * (8 - len(buffer_slots))
+        dims = [numel, len(uops)] + [0] * 6
+        strides = uops + [0] * (8 - len(uops))
+
+        fused_task = TaskDesc(
+            op_type=OpType.FUSED_ELEMENTWISE,
+            op_code=0,
+            num_tiles=compute_tiles(OpType.FUSED_ELEMENTWISE, dims, sm_version),
+            buffer_indices=buf_indices,
+            dimensions=dims,
+            strides=strides,
+        )
+
+        fused_at[chain[0]] = fused_task
+        for idx in chain[1:]:
+            skip_indices.add(idx)
+        for buf in intermediate_bufs:
+            buffer_sizes.pop(buf, None)
+
+    result = []
+    for i, task in enumerate(tasks):
+        if i in skip_indices:
+            continue
+        if i in fused_at:
+            result.append(fused_at[i])
+        else:
+            result.append(task)
+    return result
+
+
 def compile_model(
     model: torch.nn.Module,
     example_input,
@@ -157,6 +351,8 @@ def compile_model(
     decomp_table = torch._decomp.core_aten_decompositions()
     preserve_ops = [
         torch.ops.aten.scaled_dot_product_attention.default,
+        torch.ops.aten.silu.default,
+        torch.ops.aten.gelu.default,
     ]
     for op in preserve_ops:
         decomp_table.pop(op, None)
@@ -410,6 +606,9 @@ def compile_model(
                     out_meta = out_meta[0]
                 if isinstance(out_meta, torch.Tensor):
                     output_shape = [int(s) for s in out_meta.shape]
+
+    tasks = _fuse_tasks(tasks, buffer_sizes)
+    tasks = _fuse_elementwise_chains(tasks, buffer_sizes, sm_version)
 
     placements, total_workspace = plan_buffers(tasks, buffer_sizes, weight_buffers)
 

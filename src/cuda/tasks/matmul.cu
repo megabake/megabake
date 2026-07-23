@@ -9,42 +9,6 @@
 
 using namespace cute;
 
-static constexpr int BM = 128;
-static constexpr int BN = 128;
-static constexpr int BK = 32;
-static constexpr int STAGES = 2;
-
-// SM80 MMA: 16x8x16, fp16 in, fp32 out, TN layout (both A and B are K-contiguous)
-using MmaAtom_t = MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>;
-// 2x4 atom grid = 256 threads. Tile<128,128,16> makes each gemm() cover the full
-// BM×BN output tile with register-level repetition, which also makes A and B
-// fragments 128-bit aligned for LDSM loads.
-using TiledMma_t = TiledMMA<MmaAtom_t,
-    Layout<Shape<_2, _4, _1>>,
-    Tile<Int<BM>, Int<BN>, _16>>;
-
-// Swizzled shared memory
-using SmemAtom_t = decltype(composition(
-    Swizzle<3, 3, 3>{},
-    make_layout(make_shape(Int<8>{}, Int<BK>{}),
-                make_stride(Int<BK>{}, Int<1>{}))
-));
-using SmemLayoutA_t = decltype(tile_to_shape(SmemAtom_t{},
-    make_shape(Int<BM>{}, Int<BK>{}, Int<STAGES>{})));
-using SmemLayoutB_t = decltype(tile_to_shape(SmemAtom_t{},
-    make_shape(Int<BN>{}, Int<BK>{}, Int<STAGES>{})));
-
-// G2S: cp.async 128-bit, 256 threads arranged 64×4
-using G2SCopy_t = decltype(make_tiled_copy(
-    Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, half_t>{},
-    Layout<Shape<Int<64>, Int<4>>, Stride<Int<4>, Int<1>>>{},
-    Layout<Shape<Int<1>,  Int<8>>>{}
-));
-
-// S2R: LDSM 128-bit for register loading
-using S2RAtomA_t = Copy_Atom<SM75_U32x4_LDSM_N, half_t>;
-using S2RAtomB_t = Copy_Atom<SM75_U32x4_LDSM_N, half_t>;
-
 // Scalar fallback for non-transposed B (rare)
 __device__ void matmul_scalar(
     const __half* A, const __half* B, __half* C,
@@ -78,6 +42,249 @@ __device__ void matmul_scalar(
         }
     }
 }
+
+__device__ __forceinline__ float apply_epilogue(float v, uint16_t op_type) {
+    if (op_type == OP_MATMUL_SILU) {
+        return v / (1.0f + __expf(-v));
+    } else if (op_type == OP_MATMUL_GELU) {
+        return v * 0.5f * (1.0f + erff(v * 0.7071067811865476f));
+    }
+    return v;
+}
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+
+// ==================== SM90 WGMMA path ====================
+
+static constexpr int BM = 128;
+static constexpr int BN = 128;
+static constexpr int BK = 64;
+static constexpr int STAGES = 3;
+
+// WGMMA: 64x128x16, fp16→fp32, both operands from shared memory (SS)
+// 2 warpgroups tiled in M → 128 threads × 2 = 256 threads, BM=128
+using MmaAtom_t = MMA_Atom<SM90_64x128x16_F32F16F16_SS<GMMA::Major::K, GMMA::Major::K>>;
+using TiledMma_t = TiledMMA<MmaAtom_t, Layout<Shape<_2, _1, _1>>>;
+
+// GMMA-compatible 128-byte swizzle (Swizzle<3,4,3>)
+using SmemLayoutA_t = decltype(tile_to_shape(
+    GMMA::Layout_K_SW128_Atom<half_t>{},
+    make_shape(Int<BM>{}, Int<BK>{}, Int<STAGES>{})));
+using SmemLayoutB_t = decltype(tile_to_shape(
+    GMMA::Layout_K_SW128_Atom<half_t>{},
+    make_shape(Int<BN>{}, Int<BK>{}, Int<STAGES>{})));
+
+// cp.async: 256 threads, K-major access, 128-bit vectorized loads
+using G2SCopy_t = decltype(make_tiled_copy(
+    Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, half_t>{},
+    Layout<Shape<_32, _8>, Stride<_8, _1>>{},
+    Layout<Shape<_1, _8>>{}));
+
+__device__ void task_matmul(const TaskDesc& task, void** buffers,
+                            const int* dyn_dims, int tile_id) {
+    half_t*       C = (half_t*)buffers[task.buffer_indices[0]];
+    const half_t* A = (const half_t*)buffers[task.buffer_indices[1]];
+    const half_t* B = (const half_t*)buffers[task.buffer_indices[2]];
+
+    const int M = task.dimensions[0];
+    const int N = task.dimensions[1];
+    const int K = task.dimensions[2];
+    const int b_transposed = task.strides[0];
+
+    if (!b_transposed) {
+        matmul_scalar((const __half*)A, (const __half*)B, (__half*)C,
+                      M, N, K, b_transposed, tile_id, task.num_tiles);
+        return;
+    }
+
+    // --- CuTe WGMMA GEMM (TN layout, transposed B) ---
+
+    int tiles_m = (M + BM - 1) / BM;
+    int tiles_n = (N + BN - 1) / BN;
+    int total_out_tiles = tiles_m * tiles_n;
+    int per_sm = (total_out_tiles + (int)task.num_tiles - 1) / (int)task.num_tiles;
+    int my_start = tile_id * per_sm;
+    int my_end   = my_start + per_sm;
+    if (my_end > total_out_tiles) my_end = total_out_tiles;
+    if (my_start >= total_out_tiles) return;
+
+    auto cta_tiler = make_shape(Int<BM>{}, Int<BN>{}, Int<BK>{});
+
+    // A: (M,K) row-major, K-contiguous
+    auto mA = make_tensor(make_gmem_ptr(A), make_shape(M, K), make_stride(K, Int<1>{}));
+    // B: (N,K) row-major, K-contiguous (transposed weight)
+    auto mB = make_tensor(make_gmem_ptr(B), make_shape(N, K), make_stride(K, Int<1>{}));
+    // C: (M,N) row-major
+    auto mC = make_tensor(make_gmem_ptr(C), make_shape(M, N), make_stride(N, Int<1>{}));
+
+    // Identity tensors for boundary predication
+    auto cA = make_identity_tensor(make_shape(M, K));
+    auto cB = make_identity_tensor(make_shape(N, K));
+    auto cC = make_identity_tensor(make_shape(M, N));
+
+    // Shared memory with 128-byte alignment for GMMA descriptors
+    extern __shared__ char smem[];
+    constexpr int smem_a_size = cosize(SmemLayoutA_t{}) * sizeof(half_t);
+    constexpr int smem_a_aligned = (smem_a_size + 127) & ~127;
+    half_t* sa_ptr = reinterpret_cast<half_t*>(smem);
+    half_t* sb_ptr = reinterpret_cast<half_t*>(smem + smem_a_aligned);
+    auto sA = make_tensor(make_smem_ptr(sa_ptr), SmemLayoutA_t{});
+    auto sB = make_tensor(make_smem_ptr(sb_ptr), SmemLayoutB_t{});
+
+    TiledMma_t tiled_mma;
+    G2SCopy_t  g2s_copy_a;
+    G2SCopy_t  g2s_copy_b;
+    int idx = threadIdx.x;
+
+    // Position-independent swizzle for cp.async destinations
+    Tensor sA_pi = as_position_independent_swizzle_tensor(sA);
+    Tensor sB_pi = as_position_independent_swizzle_tensor(sB);
+
+    for (int t = my_start; t < my_end; t++) {
+        int tm = t / tiles_n;
+        int tn = t % tiles_n;
+        auto cta_coord = make_coord(tm, tn, _);
+
+        Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X, _1>{});
+        Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X, _1, _1>{});
+        Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{});
+
+        Tensor idA = local_tile(cA, cta_tiler, cta_coord, Step<_1, X, _1>{});
+        Tensor idB = local_tile(cB, cta_tiler, cta_coord, Step< X, _1, _1>{});
+        Tensor idC = local_tile(cC, cta_tiler, cta_coord, Step<_1, _1, X>{});
+
+        // --- G2S partitions ---
+        ThrCopy thr_g2s_a = g2s_copy_a.get_slice(idx);
+        Tensor tAgA = thr_g2s_a.partition_S(gA);
+        Tensor tAsA = thr_g2s_a.partition_D(sA_pi);
+        Tensor tAidA = thr_g2s_a.partition_S(idA);
+
+        ThrCopy thr_g2s_b = g2s_copy_b.get_slice(idx);
+        Tensor tBgB = thr_g2s_b.partition_S(gB);
+        Tensor tBsB = thr_g2s_b.partition_D(sB_pi);
+        Tensor tBidB = thr_g2s_b.partition_S(idB);
+
+        // M/N boundary predicates
+        auto pA = make_tensor<bool>(make_shape(size<1>(tAidA), Int<1>{}),
+                                    make_stride(Int<1>{}, Int<0>{}));
+        CUTE_UNROLL
+        for (int i = 0; i < size<0>(pA); ++i) {
+            pA(i, 0) = get<0>(tAidA(0, i, 0, 0)) < M;
+        }
+
+        auto pB = make_tensor<bool>(make_shape(size<1>(tBidB), Int<1>{}),
+                                    make_stride(Int<1>{}, Int<0>{}));
+        CUTE_UNROLL
+        for (int i = 0; i < size<0>(pB); ++i) {
+            pB(i, 0) = get<0>(tBidB(0, i, 0, 0)) < N;
+        }
+
+        // --- MMA partitions (GMMA smem descriptors, not register copies) ---
+        ThrMMA thr_mma_s = tiled_mma.get_slice(idx);
+        Tensor tCsA = thr_mma_s.partition_A(sA);
+        Tensor tCsB = thr_mma_s.partition_B(sB);
+        Tensor tCgC = thr_mma_s.partition_C(gC);
+        Tensor tCrA = thr_mma_s.make_fragment_A(tCsA);
+        Tensor tCrB = thr_mma_s.make_fragment_B(tCsB);
+        Tensor tCrC = thr_mma_s.make_fragment_C(tCgC);
+        clear(tCrC);
+
+        // --- Pipeline ---
+        auto K_TILE_MAX = size<3>(tAgA);
+        auto K_PIPE_MAX = size<3>(tAsA);
+
+        // Prefetch first STAGES-1 tiles
+        CUTE_UNROLL
+        for (int p = 0; p < K_PIPE_MAX - 1; ++p) {
+            copy_if(g2s_copy_a, pA, tAgA(_, _, _, p), tAsA(_, _, _, p));
+            copy_if(g2s_copy_b, pB, tBgB(_, _, _, p), tBsB(_, _, _, p));
+            cp_async_fence();
+        }
+
+        int k_pipe_read  = 0;
+        int k_pipe_write = K_PIPE_MAX - 1;
+
+        // Main K-loop
+        CUTE_NO_UNROLL
+        for (int k_tile = 0; k_tile < K_TILE_MAX; ++k_tile) {
+            int k_tile_next = k_tile + (K_PIPE_MAX - 1);
+            k_tile_next = (k_tile_next >= K_TILE_MAX) ? K_TILE_MAX - 1 : k_tile_next;
+
+            // Issue cp.async for next tile
+            copy_if(g2s_copy_a, pA, tAgA(_, _, _, k_tile_next), tAsA(_, _, _, k_pipe_write));
+            copy_if(g2s_copy_b, pB, tBgB(_, _, _, k_tile_next), tBsB(_, _, _, k_pipe_write));
+            cp_async_fence();
+
+            ++k_pipe_write;
+            k_pipe_write = (k_pipe_write == K_PIPE_MAX) ? 0 : k_pipe_write;
+
+            // Wait for current tile
+            cp_async_wait<0>();
+            __syncthreads();
+
+            // WGMMA compute with warpgroup synchronization
+            warpgroup_fence_operand(tCrC);
+            warpgroup_arrive();
+            gemm(tiled_mma, tCrA(_, _, _, k_pipe_read), tCrB(_, _, _, k_pipe_read), tCrC);
+            warpgroup_commit_batch();
+            warpgroup_wait<0>();
+            warpgroup_fence_operand(tCrC);
+
+            ++k_pipe_read;
+            k_pipe_read = (k_pipe_read == K_PIPE_MAX) ? 0 : k_pipe_read;
+        }
+
+        // --- Epilogue ---
+        Tensor tCidC = thr_mma_s.partition_C(idC);
+        const uint16_t op = task.op_type;
+
+        CUTE_UNROLL
+        for (int i = 0; i < size(tCrC); ++i) {
+            if (elem_less(tCidC(i), make_shape(M, N))) {
+                tCgC(i) = half_t(apply_epilogue(tCrC(i), op));
+            }
+        }
+
+        __syncthreads();
+    }
+}
+
+#else
+
+// ==================== SM80 path ====================
+
+static constexpr int BM = 128;
+static constexpr int BN = 128;
+static constexpr int BK = 32;
+static constexpr int STAGES = 2;
+
+// SM80 MMA: 16x8x16, fp16 in, fp32 out, TN layout (both A and B are K-contiguous)
+using MmaAtom_t = MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>;
+using TiledMma_t = TiledMMA<MmaAtom_t,
+    Layout<Shape<_2, _4, _1>>,
+    Tile<Int<BM>, Int<BN>, _16>>;
+
+// Swizzled shared memory
+using SmemAtom_t = decltype(composition(
+    Swizzle<3, 3, 3>{},
+    make_layout(make_shape(Int<8>{}, Int<BK>{}),
+                make_stride(Int<BK>{}, Int<1>{}))
+));
+using SmemLayoutA_t = decltype(tile_to_shape(SmemAtom_t{},
+    make_shape(Int<BM>{}, Int<BK>{}, Int<STAGES>{})));
+using SmemLayoutB_t = decltype(tile_to_shape(SmemAtom_t{},
+    make_shape(Int<BN>{}, Int<BK>{}, Int<STAGES>{})));
+
+// G2S: cp.async 128-bit, 256 threads arranged 64×4
+using G2SCopy_t = decltype(make_tiled_copy(
+    Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, half_t>{},
+    Layout<Shape<Int<64>, Int<4>>, Stride<Int<4>, Int<1>>>{},
+    Layout<Shape<Int<1>,  Int<8>>>{}
+));
+
+// S2R: LDSM 128-bit for register loading
+using S2RAtomA_t = Copy_Atom<SM75_U32x4_LDSM_N, half_t>;
+using S2RAtomB_t = Copy_Atom<SM75_U32x4_LDSM_N, half_t>;
 
 __device__ void task_matmul(const TaskDesc& task, void** buffers,
                             const int* dyn_dims, int tile_id) {
@@ -255,16 +462,19 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
             }
         }
 
-        // --- Epilogue: fp32 accum -> fp16, write to global with bounds check ---
+        // --- Epilogue: optional activation on fp32 accum, then convert to fp16 ---
         Tensor tCidC = thr_mma_s.partition_C(idC);
+        const uint16_t op = task.op_type;
 
         CUTE_UNROLL
         for (int i = 0; i < size(tCrC); ++i) {
             if (elem_less(tCidC(i), make_shape(M, N))) {
-                tCgC(i) = half_t(tCrC(i));
+                tCgC(i) = half_t(apply_epilogue(tCrC(i), op));
             }
         }
 
         __syncthreads();
     }
 }
+
+#endif

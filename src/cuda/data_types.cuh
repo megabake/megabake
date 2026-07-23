@@ -9,6 +9,27 @@
 #define OP_INDEX        0x06
 #define OP_COPY         0x07
 #define OP_ROPE         0x08
+#define OP_MATMUL_SILU        0x09
+#define OP_MATMUL_GELU        0x0A
+#define OP_FUSED_ELEMENTWISE  0x0B
+
+// Micro-op codes for fused elementwise interpreter
+#define UOP_LOAD    0x00
+#define UOP_STORE   0x01
+#define UOP_ADD     0x02
+#define UOP_MUL     0x03
+#define UOP_SUB     0x04
+#define UOP_DIV     0x05
+#define UOP_SILU    0x06
+#define UOP_GELU    0x07
+#define UOP_RELU    0x08
+#define UOP_TANH_U  0x09
+#define UOP_NEG     0x0A
+#define UOP_EXP     0x0B
+#define UOP_SIGMOID 0x0C
+#define UOP_RSQRT   0x0D
+#define UOP_LOG     0x0E
+#define UOP_ABS     0x0F
 
 #define ELEM_ADD          0x00
 #define ELEM_MUL          0x01

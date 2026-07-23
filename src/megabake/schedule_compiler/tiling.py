@@ -6,7 +6,7 @@ from megabake.data_types import OpType
 def compute_tiles(op_type: int, dims: list[int], sm_version: int) -> int:
     max_sms = {80: 108, 90: 132, 100: 144}.get(sm_version, 132)
 
-    if op_type == OpType.MATMUL:
+    if op_type in (OpType.MATMUL, OpType.MATMUL_SILU, OpType.MATMUL_GELU):
         M, N = dims[0], dims[1]
         tiles_m = (M + 127) // 128
         tiles_n = (N + 127) // 128
@@ -14,7 +14,7 @@ def compute_tiles(op_type: int, dims: list[int], sm_version: int) -> int:
     elif op_type == OpType.ATTENTION:
         batch, num_heads = dims[0], dims[1]
         return min(batch * num_heads, max_sms)
-    elif op_type == OpType.ELEMENTWISE:
+    elif op_type in (OpType.ELEMENTWISE, OpType.FUSED_ELEMENTWISE):
         total = dims[0]
         return min((total + 4095) // 4096, max_sms)
     elif op_type == OpType.REDUCE:

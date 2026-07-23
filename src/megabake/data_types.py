@@ -4,14 +4,17 @@ import struct
 
 
 class OpType(IntEnum):
-    MATMUL      = 0x01
-    ATTENTION   = 0x02
-    ELEMENTWISE = 0x03
-    REDUCE      = 0x04
-    EMBEDDING   = 0x05
-    INDEX       = 0x06
-    COPY        = 0x07
-    ROPE        = 0x08
+    MATMUL             = 0x01
+    ATTENTION          = 0x02
+    ELEMENTWISE        = 0x03
+    REDUCE             = 0x04
+    EMBEDDING          = 0x05
+    INDEX              = 0x06
+    COPY               = 0x07
+    ROPE               = 0x08
+    MATMUL_SILU        = 0x09
+    MATMUL_GELU        = 0x0A
+    FUSED_ELEMENTWISE  = 0x0B
 
 
 class ElemCode(IntEnum):
@@ -34,6 +37,29 @@ class ElemCode(IntEnum):
     CAST        = 0x10
     MASKED_FILL = 0x11
     POW         = 0x12
+
+
+class UopCode(IntEnum):
+    LOAD    = 0x00
+    STORE   = 0x01
+    ADD     = 0x02
+    MUL     = 0x03
+    SUB     = 0x04
+    DIV     = 0x05
+    SILU    = 0x06
+    GELU    = 0x07
+    RELU    = 0x08
+    TANH    = 0x09
+    NEG     = 0x0A
+    EXP     = 0x0B
+    SIGMOID = 0x0C
+    RSQRT   = 0x0D
+    LOG     = 0x0E
+    ABS     = 0x0F
+
+
+def pack_uop(opcode: int, dst: int = 0, src1: int = 0, src2: int = 0) -> int:
+    return (opcode & 0xFF) | ((dst & 0xF) << 8) | ((src1 & 0xF) << 12) | ((src2 & 0xF) << 16)
 
 
 class ReduceCode(IntEnum):

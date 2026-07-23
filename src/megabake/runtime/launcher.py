@@ -28,6 +28,11 @@ def _init_driver():
         raise RuntimeError(f"cuInit failed with error {err}")
 
 
+def _get_sm_version() -> int:
+    props = torch.cuda.get_device_properties(0)
+    return props.major * 10 + props.minor
+
+
 def _load_module():
     global _module, _kernel
     if _module is not None:
@@ -47,6 +52,16 @@ def _load_module():
     )
     if err != 0:
         raise RuntimeError(f"cuModuleGetFunction failed with error {err}")
+
+    if _get_sm_version() >= 90:
+        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8
+        err = _cuda_driver.cuFuncSetAttribute(
+            _kernel,
+            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            102400,
+        )
+        if err != 0:
+            raise RuntimeError(f"cuFuncSetAttribute failed with error {err}")
 
 
 def run_single_task(
@@ -128,15 +143,16 @@ def _launch_cooperative(
     """Launch megakernel via cuLaunchCooperativeKernel."""
     _load_module()
 
-    # Use default shared memory limit (48KB) rather than optin which may be
-    # tiny on MIG partitions. 48KB is enough for our reduction buffers.
-    default_smem = ctypes.c_int()
-    _cuda_driver.cuDeviceGetAttribute(
-        ctypes.byref(default_smem),
-        8,  # CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK
-        0,
-    )
-    smem_bytes = default_smem.value
+    if _get_sm_version() >= 90:
+        smem_bytes = 102400
+    else:
+        default_smem = ctypes.c_int()
+        _cuda_driver.cuDeviceGetAttribute(
+            ctypes.byref(default_smem),
+            8,  # CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK
+            0,
+        )
+        smem_bytes = default_smem.value
 
     arg_tasks = ctypes.c_void_p(d_tasks_ptr)
     arg_num_tasks = ctypes.c_int(num_tasks)

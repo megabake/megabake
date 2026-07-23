@@ -183,6 +183,48 @@ class TestTransformerBlockE2E:
         )
 
 
+class TestFusedElementwiseE2E:
+    def test_silu_mul(self):
+        """SiLU(x) * y fuses into FUSED_ELEMENTWISE and computes correctly."""
+
+        class SiLUMul(torch.nn.Module):
+            def forward(self, x, y):
+                return torch.nn.functional.silu(x) * y
+
+        model = SiLUMul().cuda().half().eval()
+        x = torch.randn(4, 256, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 256, device=DEVICE, dtype=torch.float16)
+
+        compiled = compile_model(model, (x, y), sm_version=SM_VERSION)
+        result = execute_model(compiled, model.state_dict(), [x, y])
+        ref = torch.nn.functional.silu(x) * y
+
+        assert result.shape == ref.shape
+        assert torch.allclose(result, ref, atol=1e-2, rtol=1e-2), (
+            f"Max diff: {(result - ref).abs().max().item():.6f}"
+        )
+
+    def test_add_relu_neg(self):
+        """add -> relu -> neg chain fuses and computes correctly."""
+
+        class AddReluNeg(torch.nn.Module):
+            def forward(self, x, y):
+                return -(torch.relu(x + y))
+
+        model = AddReluNeg().cuda().half().eval()
+        x = torch.randn(4, 128, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(4, 128, device=DEVICE, dtype=torch.float16)
+
+        compiled = compile_model(model, (x, y), sm_version=SM_VERSION)
+        result = execute_model(compiled, model.state_dict(), [x, y])
+        ref = -(torch.relu(x + y))
+
+        assert result.shape == ref.shape
+        assert torch.allclose(result, ref, atol=1e-2, rtol=1e-2), (
+            f"Max diff: {(result - ref).abs().max().item():.6f}"
+        )
+
+
 class TestTopLevelAPI:
     def test_compile_and_run(self):
         """Top-level megabake.compile() + megabake.run() API."""
