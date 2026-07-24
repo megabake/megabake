@@ -48,8 +48,89 @@ __device__ __forceinline__ float apply_epilogue(float v, uint16_t op_type) {
         return v / (1.0f + __expf(-v));
     } else if (op_type == OP_MATMUL_GELU) {
         return v * 0.5f * (1.0f + erff(v * 0.7071067811865476f));
+    } else if (op_type == OP_MATMUL_GELU_TANH) {
+        float c = 0.7978845608028654f * (v + 0.044715f * v * v * v);
+        return v * 0.5f * (1.0f + tanhf(c));
     }
     return v;
+}
+
+// Skinny matmul for M < 128: tiles over N columns across all SMs,
+// caches A in shared memory, each thread processes one output column at a time.
+#define SKINNY_MAX_M 64
+__device__ void matmul_skinny(
+    const __half* A, const __half* B, __half* C,
+    int M, int N, int K,
+    int tile_id, int num_tiles, uint16_t op_type)
+{
+    int active_tiles = min(num_tiles, (int)gridDim.x);
+    int cols_per_tile = (N + active_tiles - 1) / active_tiles;
+    int n_start = tile_id * cols_per_tile;
+    int n_end = min(n_start + cols_per_tile, N);
+    if (n_start >= N) return;
+
+    extern __shared__ char smem[];
+    __half* a_smem = (__half*)smem;
+
+    int bk = min(K, 51200 / max(M, 1));
+    bk = bk & ~7;
+    if (bk < 8) bk = 8;
+
+    for (int n_base = n_start; n_base < n_end; n_base += (int)blockDim.x) {
+        int my_n = n_base + (int)threadIdx.x;
+        bool valid = (my_n < n_end);
+
+        float acc[SKINNY_MAX_M];
+        #pragma unroll
+        for (int m = 0; m < SKINNY_MAX_M; m++) acc[m] = 0.0f;
+
+        for (int k_base = 0; k_base < K; k_base += bk) {
+            int kc = min(bk, K - k_base);
+            int a_total = M * kc;
+            for (int i = (int)threadIdx.x; i < a_total; i += (int)blockDim.x) {
+                int mr = i / kc;
+                int kr = i % kc;
+                a_smem[i] = A[(int64_t)mr * K + k_base + kr];
+            }
+            __syncthreads();
+
+            if (valid) {
+                const __half* b_ptr = B + (int64_t)my_n * K + k_base;
+                int kv = kc & ~7;
+                for (int k = 0; k < kv; k += 8) {
+                    float4 bv = *(const float4*)(b_ptr + k);
+                    const __half2* bh = (const __half2*)&bv;
+                    float2 bf0 = __half22float2(bh[0]);
+                    float2 bf1 = __half22float2(bh[1]);
+                    float2 bf2 = __half22float2(bh[2]);
+                    float2 bf3 = __half22float2(bh[3]);
+                    for (int m = 0; m < M && m < SKINNY_MAX_M; m++) {
+                        const float4 av = *(const float4*)(a_smem + m * kc + k);
+                        const __half2* ah = (const __half2*)&av;
+                        float2 af0 = __half22float2(ah[0]);
+                        float2 af1 = __half22float2(ah[1]);
+                        float2 af2 = __half22float2(ah[2]);
+                        float2 af3 = __half22float2(ah[3]);
+                        acc[m] += af0.x * bf0.x + af0.y * bf0.y
+                                + af1.x * bf1.x + af1.y * bf1.y
+                                + af2.x * bf2.x + af2.y * bf2.y
+                                + af3.x * bf3.x + af3.y * bf3.y;
+                    }
+                }
+                for (int k = kv; k < kc; k++) {
+                    float bval = __half2float(b_ptr[k]);
+                    for (int m = 0; m < M && m < SKINNY_MAX_M; m++)
+                        acc[m] += __half2float(a_smem[m * kc + k]) * bval;
+                }
+            }
+            __syncthreads();
+        }
+
+        if (valid) {
+            for (int m = 0; m < M && m < SKINNY_MAX_M; m++)
+                C[(int64_t)m * N + my_n] = __float2half(apply_epilogue(acc[m], op_type));
+        }
+    }
 }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -97,12 +178,17 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
         return;
     }
 
+    // Skinny matmul disabled: scalar FMA ~100x slower than tensor cores per FLOP,
+    // even with better SM utilization the net effect is a regression.
+    // CuTe path handles M < BM correctly via boundary predication.
+
     // --- CuTe WGMMA GEMM (TN layout, transposed B) ---
 
     int tiles_m = (M + BM - 1) / BM;
     int tiles_n = (N + BN - 1) / BN;
     int total_out_tiles = tiles_m * tiles_n;
-    int per_sm = (total_out_tiles + (int)task.num_tiles - 1) / (int)task.num_tiles;
+    int active_tiles = min((int)task.num_tiles, (int)gridDim.x);
+    int per_sm = (total_out_tiles + active_tiles - 1) / active_tiles;
     int my_start = tile_id * per_sm;
     int my_end   = my_start + per_sm;
     if (my_end > total_out_tiles) my_end = total_out_tiles;
@@ -219,7 +305,7 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
             k_pipe_write = (k_pipe_write == K_PIPE_MAX) ? 0 : k_pipe_write;
 
             // Wait for current tile
-            cp_async_wait<0>();
+            cp_async_wait<STAGES-2>();
             __syncthreads();
 
             // WGMMA compute with warpgroup synchronization
@@ -303,12 +389,17 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
         return;
     }
 
+    // Skinny matmul disabled: scalar FMA ~100x slower than tensor cores per FLOP,
+    // even with better SM utilization the net effect is a regression.
+    // CuTe path handles M < BM correctly via boundary predication.
+
     // --- CuTe tensor-core GEMM (TN layout, transposed B) ---
 
     int tiles_m = (M + BM - 1) / BM;
     int tiles_n = (N + BN - 1) / BN;
     int total_out_tiles = tiles_m * tiles_n;
-    int per_sm = (total_out_tiles + (int)task.num_tiles - 1) / (int)task.num_tiles;
+    int active_tiles = min((int)task.num_tiles, (int)gridDim.x);
+    int per_sm = (total_out_tiles + active_tiles - 1) / active_tiles;
     int my_start = tile_id * per_sm;
     int my_end   = my_start + per_sm;
     if (my_end > total_out_tiles) my_end = total_out_tiles;

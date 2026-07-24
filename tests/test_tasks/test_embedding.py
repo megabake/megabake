@@ -25,7 +25,7 @@ class TestEmbedding:
             op_type=OpType.EMBEDDING, op_code=0,
             dimensions=[num_indices, embed_dim, vocab_size] + [0] * 5,
         )
-        result = run_single_task(task, [indices, table], [num_indices, embed_dim], DTYPE)
+        result = run_single_task(task, [table, indices], [num_indices, embed_dim], DTYPE)
         assert torch.equal(ref, result)
 
     def test_single_token(self):
@@ -37,5 +37,5 @@ class TestEmbedding:
             op_type=OpType.EMBEDDING, op_code=0,
             dimensions=[1, embed_dim, vocab_size] + [0] * 5,
         )
-        result = run_single_task(task, [indices, table], [1, embed_dim], DTYPE)
+        result = run_single_task(task, [table, indices], [1, embed_dim], DTYPE)
         assert torch.equal(ref, result)

@@ -15,6 +15,7 @@ class OpType(IntEnum):
     MATMUL_SILU        = 0x09
     MATMUL_GELU        = 0x0A
     FUSED_ELEMENTWISE  = 0x0B
+    MATMUL_GELU_TANH   = 0x0C
 
 
 class ElemCode(IntEnum):
@@ -37,6 +38,9 @@ class ElemCode(IntEnum):
     CAST        = 0x10
     MASKED_FILL = 0x11
     POW         = 0x12
+    COS         = 0x13
+    SIN         = 0x14
+    GELU_TANH   = 0x15
 
 
 class UopCode(IntEnum):
@@ -56,6 +60,7 @@ class UopCode(IntEnum):
     RSQRT   = 0x0D
     LOG     = 0x0E
     ABS     = 0x0F
+    GELU_TANH = 0x10
 
 
 def pack_uop(opcode: int, dst: int = 0, src1: int = 0, src2: int = 0) -> int:

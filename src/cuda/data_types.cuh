@@ -12,6 +12,7 @@
 #define OP_MATMUL_SILU        0x09
 #define OP_MATMUL_GELU        0x0A
 #define OP_FUSED_ELEMENTWISE  0x0B
+#define OP_MATMUL_GELU_TANH   0x0C
 
 // Micro-op codes for fused elementwise interpreter
 #define UOP_LOAD    0x00
@@ -30,6 +31,7 @@
 #define UOP_RSQRT   0x0D
 #define UOP_LOG     0x0E
 #define UOP_ABS     0x0F
+#define UOP_GELU_TANH 0x10
 
 #define ELEM_ADD          0x00
 #define ELEM_MUL          0x01
@@ -50,6 +52,9 @@
 #define ELEM_CAST         0x10
 #define ELEM_MASKED_FILL  0x11
 #define ELEM_POW          0x12
+#define ELEM_COS          0x13
+#define ELEM_SIN          0x14
+#define ELEM_GELU_TANH    0x15
 
 #define COPY_SIMPLE       0x00
 #define COPY_CAT          0x01

@@ -3,10 +3,10 @@
 from megabake.data_types import OpType
 
 
-def compute_tiles(op_type: int, dims: list[int], sm_version: int) -> int:
-    max_sms = {80: 108, 90: 132, 100: 144}.get(sm_version, 132)
+def compute_tiles(op_type: int, dims: list[int], sm_version: int, num_sms: int = 0) -> int:
+    max_sms = num_sms if num_sms > 0 else {80: 108, 90: 132, 100: 144}.get(sm_version, 132)
 
-    if op_type in (OpType.MATMUL, OpType.MATMUL_SILU, OpType.MATMUL_GELU):
+    if op_type in (OpType.MATMUL, OpType.MATMUL_SILU, OpType.MATMUL_GELU, OpType.MATMUL_GELU_TANH):
         M, N = dims[0], dims[1]
         tiles_m = (M + 127) // 128
         tiles_n = (N + 127) // 128

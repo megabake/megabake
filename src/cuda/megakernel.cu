@@ -35,6 +35,7 @@ __device__ __forceinline__ void dispatch_task(
         case OP_ROPE:        task_rope(task, buffers, dyn_dims, tile_id);        break;
         case OP_MATMUL_SILU: task_matmul(task, buffers, dyn_dims, tile_id);     break;
         case OP_MATMUL_GELU: task_matmul(task, buffers, dyn_dims, tile_id);     break;
+        case OP_MATMUL_GELU_TANH: task_matmul(task, buffers, dyn_dims, tile_id); break;
         case OP_FUSED_ELEMENTWISE: task_fused_elementwise(task, buffers, dyn_dims, tile_id); break;
     }
 }

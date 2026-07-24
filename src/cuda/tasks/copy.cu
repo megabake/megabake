@@ -7,7 +7,7 @@ __device__ void task_copy(const TaskDesc& task, void** buffers,
 
     const uint32_t total_elems = task.dimensions[0];
     const int threads = blockDim.x;
-    const int num_tiles = task.num_tiles;
+    const int num_tiles = min((int)task.num_tiles, (int)gridDim.x);
 
     const uint32_t elems_per_tile = (total_elems + num_tiles - 1) / num_tiles;
     const uint32_t start = tile_id * elems_per_tile;
@@ -31,17 +31,31 @@ __device__ void task_copy(const TaskDesc& task, void** buffers,
     } else {
         const __half* in0 = (const __half*)buffers[task.buffer_indices[1]];
 
-        // strides[0] = ndim (0 means flat copy)
-        // strides[1..4] = source strides per dim
-        // strides[5] = source offset (in elements)
-        // dimensions[1..4] = source shape per dim
         const int ndim = task.strides[0];
         if (ndim <= 0) {
-            for (uint32_t i = start + threadIdx.x; i < end; i += threads) {
-                out[i] = in0[i];
+            // Vectorized flat copy using float4 (128-bit = 8 halves)
+            const uint32_t count = end - start;
+            const uint32_t vec_count = count / 8;
+            const uint32_t vec_start = start / 8;
+
+            if (start % 8 == 0) {
+                const float4* src4 = reinterpret_cast<const float4*>(in0);
+                float4* dst4 = reinterpret_cast<float4*>(out);
+                for (uint32_t i = threadIdx.x; i < vec_count; i += threads) {
+                    dst4[vec_start + i] = src4[vec_start + i];
+                }
+                // Tail elements
+                uint32_t tail_start = start + vec_count * 8;
+                for (uint32_t i = tail_start + threadIdx.x; i < end; i += threads) {
+                    out[i] = in0[i];
+                }
+            } else {
+                for (uint32_t i = start + threadIdx.x; i < end; i += threads) {
+                    out[i] = in0[i];
+                }
             }
         } else {
-            const uint32_t src_offset = (uint32_t)task.strides[5];
+            const uint32_t src_offset = (uint32_t)task.strides[7];
             for (uint32_t i = start + threadIdx.x; i < end; i += threads) {
                 uint32_t remainder = i;
                 uint32_t src_idx = src_offset;

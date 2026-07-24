@@ -15,10 +15,14 @@ def compile(
     sm_version: int | None = None,
     dtype: torch.dtype = torch.float16,
 ) -> CompiledModel:
+    props = torch.cuda.get_device_properties(0)
     if sm_version is None:
-        props = torch.cuda.get_device_properties(0)
         sm_version = props.major * 10 + props.minor
-    return compile_model(model, example_input, sm_version, dtype=dtype)
+    num_sms = props.multi_processor_count
+    return compile_model(model, example_input, sm_version, dtype=dtype, num_sms=num_sms)
+
+
+_cached_state_dict: dict[int, dict[str, torch.Tensor]] = {}
 
 
 def run(
@@ -26,14 +30,11 @@ def run(
     model: torch.nn.Module,
     *inputs: torch.Tensor,
 ) -> torch.Tensor:
-    """Execute a compiled schedule through the megakernel.
-
-    Args:
-        compiled: Result from megabake.compile().
-        model: The original model (for weight access).
-        *inputs: Input tensors.
-
-    Returns:
-        Output tensor matching the model's forward() result.
-    """
-    return execute_model(compiled, model.state_dict(), list(inputs))
+    model_id = id(model)
+    if model_id not in _cached_state_dict:
+        sd = model.state_dict()
+        for name, buf in model.named_buffers():
+            if name not in sd:
+                sd[name] = buf
+        _cached_state_dict[model_id] = sd
+    return execute_model(compiled, _cached_state_dict[model_id], list(inputs))

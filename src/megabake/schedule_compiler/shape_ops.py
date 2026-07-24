@@ -58,12 +58,16 @@ def resolve_permute(view: StridedView, dims: list[int]) -> StridedView:
 
 
 def resolve_expand(view: StridedView, new_shape: list[int]) -> StridedView:
+    resolved = list(new_shape)
+    for i in range(len(resolved)):
+        if resolved[i] == -1 and i < len(view.shape):
+            resolved[i] = view.shape[i]
     new_strides = list(view.strides)
-    for i in range(len(new_shape)):
+    for i in range(len(resolved)):
         if i >= len(view.shape) or view.shape[i] == 1:
-            if new_shape[i] != 1:
+            if resolved[i] != 1:
                 new_strides[i] = 0
-    return StridedView(view.buffer_id, list(new_shape), new_strides, view.offset)
+    return StridedView(view.buffer_id, resolved, new_strides, view.offset)
 
 
 def resolve_squeeze(view: StridedView, dim: int | None) -> StridedView:

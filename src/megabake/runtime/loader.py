@@ -1,5 +1,6 @@
 """Load a compiled schedule and execute it through the megakernel."""
 
+import numpy as np
 import torch
 
 from megabake.schedule_compiler.graph_walker import CompiledModel
@@ -14,6 +15,7 @@ class _CachedRunner:
         "_compiled_id", "_d_tasks", "_ptr_tensor", "_d_dyn_dims",
         "_num_tasks", "_num_sms", "_workspace", "_weight_tensors",
         "_input_buffer_ids", "_output_buffer_id", "_output_shape", "_num_buffers",
+        "_arena", "_input_holders",
     )
 
     def __init__(self):
@@ -33,16 +35,27 @@ class _CachedRunner:
         self._weight_tensors = {}
         for wm in weight_maps:
             name = weight_names[wm.buffer_index]
-            self._weight_tensors[wm.buffer_index] = (
-                state_dict[name].contiguous().cuda().half()
-            )
+            if name.startswith("__folded__."):
+                self._weight_tensors[wm.buffer_index] = (
+                    compiled.folded_constants[wm.buffer_index]
+                )
+            else:
+                self._weight_tensors[wm.buffer_index] = (
+                    state_dict[name].contiguous().cuda().half()
+                )
+
+        # Arena allocation: single cudaMalloc, carve sub-regions
+        total_arena = 0
+        for bd in buffer_descs:
+            total_arena = max(total_arena, bd.offset + bd.size)
+        total_arena = max(total_arena, 2)
+        self._arena = torch.zeros(total_arena // 2, dtype=torch.float16, device="cuda")
 
         self._workspace = {}
         for bd in buffer_descs:
-            num_elements = max(bd.size // 2, 1)
-            self._workspace[bd.buffer_id] = torch.zeros(
-                num_elements, dtype=torch.float16, device="cuda"
-            )
+            offset_elems = bd.offset // 2
+            size_elems = max(bd.size // 2, 1)
+            self._workspace[bd.buffer_id] = self._arena[offset_elems:offset_elems + size_elems]
 
         ptrs = [0] * compiled.num_buffers
         for bd in buffer_descs:
@@ -50,12 +63,15 @@ class _CachedRunner:
         for buf_id, tensor in self._weight_tensors.items():
             ptrs[buf_id] = tensor.data_ptr()
 
+        # Fast task bytes upload via numpy
         task_bytes = b"".join(t.to_bytes() for t in tasks)
-        self._d_tasks = torch.tensor(
-            list(task_bytes), dtype=torch.uint8, device="cuda"
-        )
+        self._d_tasks = torch.from_numpy(
+            np.frombuffer(task_bytes, dtype=np.uint8).copy()
+        ).cuda()
+
         self._ptr_tensor = torch.tensor(ptrs, dtype=torch.int64, device="cuda")
         self._d_dyn_dims = torch.zeros(8, dtype=torch.int32, device="cuda")
+        self._input_holders = [None] * len(compiled.input_buffer_ids)
         self._compiled_id = id(compiled)
 
     def run(
@@ -68,8 +84,22 @@ class _CachedRunner:
             self._setup(compiled, state_dict)
 
         for i, input_buf_id in enumerate(self._input_buffer_ids):
-            input_data = inputs[i].contiguous().cuda().half().flatten()
-            self._workspace[input_buf_id][: input_data.numel()].copy_(input_data)
+            inp = inputs[i]
+            if inp.dtype == torch.float16 and inp.is_contiguous() and inp.is_cuda:
+                self._ptr_tensor[input_buf_id] = inp.data_ptr()
+                self._input_holders[i] = inp
+            else:
+                inp = inp.contiguous().cuda()
+                workspace = self._workspace[input_buf_id]
+                if inp.is_floating_point():
+                    input_data = inp.half().flatten()
+                    workspace[:input_data.numel()].copy_(input_data)
+                else:
+                    wb = workspace.view(torch.uint8)
+                    ib = inp.flatten().view(torch.uint8)
+                    wb[:ib.numel()].copy_(ib)
+                self._ptr_tensor[input_buf_id] = workspace.data_ptr()
+                self._input_holders[i] = None
 
         _launch_cooperative(
             self._d_tasks.data_ptr(),
@@ -78,7 +108,6 @@ class _CachedRunner:
             self._d_dyn_dims.data_ptr(),
             self._num_sms,
         )
-        torch.cuda.synchronize()
 
         numel = 1
         for s in self._output_shape:

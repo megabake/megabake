@@ -35,6 +35,8 @@ ATEN_OP_MAP: dict[object, tuple[int, int] | str] = {
     torch.ops.aten._to_copy.default:       (OpType.ELEMENTWISE, ElemCode.CAST),
     torch.ops.aten.masked_fill.Scalar:     (OpType.ELEMENTWISE, ElemCode.MASKED_FILL),
     torch.ops.aten.pow.Tensor_Scalar:      (OpType.ELEMENTWISE, ElemCode.POW),
+    torch.ops.aten.cos.default:            (OpType.ELEMENTWISE, ElemCode.COS),
+    torch.ops.aten.sin.default:            (OpType.ELEMENTWISE, ElemCode.SIN),
 
     # --- OP_REDUCE ---
     torch.ops.aten.sum.dim_IntList:        (OpType.REDUCE, ReduceCode.SUM),

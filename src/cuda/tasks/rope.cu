@@ -14,7 +14,9 @@ __device__ void task_rope(const TaskDesc& task, void** buffers,
     const uint32_t head_dim = task.dimensions[3];
     const uint32_t half_dim = head_dim / 2;
     const int threads = blockDim.x;
-    const int num_tiles = task.num_tiles;
+    const int num_tiles = min((int)task.num_tiles, (int)gridDim.x);
+    const int layout_bhsd = task.strides[0];
+    const uint32_t cos_stride = task.dimensions[4] ? task.dimensions[4] : half_dim;
 
     const uint32_t total_positions = batch * seq_len;
     const uint32_t pos_per_tile = (total_positions + num_tiles - 1) / num_tiles;
@@ -22,16 +24,23 @@ __device__ void task_rope(const TaskDesc& task, void** buffers,
     const uint32_t pos_end = min(pos_start + pos_per_tile, total_positions);
 
     for (uint32_t pos = pos_start; pos < pos_end; pos++) {
-        uint32_t seq_idx = pos % seq_len;
+        uint32_t b = pos / seq_len;
+        uint32_t s = pos % seq_len;
         for (uint32_t h = 0; h < num_heads; h++) {
-            uint32_t base_offset = pos * num_heads * head_dim + h * head_dim;
+            uint32_t base_offset;
+            if (layout_bhsd) {
+                base_offset = b * num_heads * seq_len * head_dim
+                            + h * seq_len * head_dim + s * head_dim;
+            } else {
+                base_offset = pos * num_heads * head_dim + h * head_dim;
+            }
             for (uint32_t d = threadIdx.x; d < half_dim; d += threads) {
                 float x0 = __half2float(in0[base_offset + d]);
                 float x1 = __half2float(in0[base_offset + d + half_dim]);
-                float c = __half2float(cos_cache[seq_idx * half_dim + d]);
-                float s = __half2float(sin_cache[seq_idx * half_dim + d]);
-                out[base_offset + d] = __float2half(x0 * c - x1 * s);
-                out[base_offset + d + half_dim] = __float2half(x1 * c + x0 * s);
+                float c = __half2float(cos_cache[s * cos_stride + d]);
+                float sv = __half2float(sin_cache[s * cos_stride + d]);
+                out[base_offset + d] = __float2half(x0 * c - x1 * sv);
+                out[base_offset + d + half_dim] = __float2half(x1 * c + x0 * sv);
             }
         }
     }
