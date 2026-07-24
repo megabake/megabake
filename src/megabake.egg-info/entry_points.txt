@@ -1,2 +1,0 @@
-[console_scripts]
-megabake = megabake.cli:main
