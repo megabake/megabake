@@ -39,7 +39,7 @@ class TestMatmul:
             dimensions=[M, N, K] + [0] * 5,
         )
         result = run_single_task(task, [A, B], [M, N], DTYPE)
-        assert torch.allclose(ref, result, atol=2.0, rtol=5e-2), \
+        assert torch.allclose(ref, result, atol=0.5, rtol=1e-2), \
             f"max diff: {(ref - result).abs().max().item()}"
 
     def test_rectangular(self):

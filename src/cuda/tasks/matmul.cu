@@ -178,9 +178,11 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
         return;
     }
 
-    // Skinny matmul disabled: scalar FMA ~100x slower than tensor cores per FLOP,
-    // even with better SM utilization the net effect is a regression.
-    // CuTe path handles M < BM correctly via boundary predication.
+    if (M <= 4) {
+        matmul_skinny((const __half*)A, (const __half*)B, (__half*)C,
+                      M, N, K, tile_id, task.num_tiles, task.op_type);
+        return;
+    }
 
     // --- CuTe WGMMA GEMM (TN layout, transposed B) ---
 
@@ -389,9 +391,11 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
         return;
     }
 
-    // Skinny matmul disabled: scalar FMA ~100x slower than tensor cores per FLOP,
-    // even with better SM utilization the net effect is a regression.
-    // CuTe path handles M < BM correctly via boundary predication.
+    if (M <= 4) {
+        matmul_skinny((const __half*)A, (const __half*)B, (__half*)C,
+                      M, N, K, tile_id, task.num_tiles, task.op_type);
+        return;
+    }
 
     // --- CuTe tensor-core GEMM (TN layout, transposed B) ---
 

@@ -8,6 +8,8 @@ def compute_tiles(op_type: int, dims: list[int], sm_version: int, num_sms: int =
 
     if op_type in (OpType.MATMUL, OpType.MATMUL_SILU, OpType.MATMUL_GELU, OpType.MATMUL_GELU_TANH):
         M, N = dims[0], dims[1]
+        if M <= 4:
+            return max_sms
         tiles_m = (M + 127) // 128
         tiles_n = (N + 127) // 128
         return min(tiles_m * tiles_n, max_sms)
