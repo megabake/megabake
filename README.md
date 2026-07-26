@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/megabake.png" width="120" />
+  <img src="assets/megabake.png" width="200" />
 </p>
 
 # megabake
