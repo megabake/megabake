@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/megabake.png" width="120" />
+</p>
+
 # megabake
 
 `torch.export` to megakernel: compile an entire PyTorch model into a **single cooperative CUDA kernel**.
