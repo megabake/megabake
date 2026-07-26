@@ -1,5 +1,7 @@
 # Megabake: First-Principles Redesign Analysis
 
+Informed by state-of-the-art megakernel research: Hazy Research "No Bubbles" (2025), MPK/Mirage Persistent Kernel (2025), Ada-MK (2024). Corrections to the original analysis are marked with `[REVISED]`.
+
 ---
 
 ## 0. Current Architecture Diagram
@@ -165,24 +167,25 @@ Bottlenecks marked with `[!]`/`[!!]`/`[!!!]` severity. All boxes 81 chars wide.
 │ [2] Graph Optimization                                                        │
 │     ├─ Constant folding                                                       │
 │     ├─ Dead code elimination                                                  │
-│     ├─ Common subexpression elimination  (NEW)                                │
+│     ├─ Common subexpression elimination                                       │
 │     └─ Identity op elimination                                                │
 │   │                                                                           │
 │   ▼                                                                           │
 │ [3] Cost-Model-Driven Fusion Planning                                         │
-│     ├─ Matmul epilogue: bias+act+residual  (NEW)                              │
+│     ├─ Matmul epilogue: bias+act+residual (runtime flags)                     │
 │     ├─ Elementwise chain > FUSED_ELEMENTWISE                                  │
-│     ├─ Single-pass norm+scale  (NEW)                                          │
+│     ├─ Single-pass norm+scale                                                 │
 │     └─ Fuse IFF cost_fused < cost_split                                       │
 │   │                                                                           │
 │   ▼                                                                           │
-│ [4] CUTLASS Autotuning  (NEW)                                                 │
-│     For each matmul shape (M, N, K):                                          │
-│     ├─ Tiles: 64x64, 64x128, 128x128, 128x256                                 │
-│     ├─ Score = SM_util x wave_eff x occupancy                                 │
-│     ├─ Split-K for bandwidth-bound (M<=4)                                     │
-│     ├─ Best config encoded in TaskDesc                                        │
-│     └─ Cached per (M, N, K, sm_version)                                       │
+│ [4] Matmul Strategy Selection (NEW — split by regime)                         │
+│     M <= 4 (decode):                                                          │
+│       Skinny matvec — CUDA cores, float4 loads, cp.async prefetch             │
+│       No tensor cores (bandwidth-bound, TC setup overhead wasted)             │
+│     M >= 16 (prefill):                                                        │
+│       CUTLASS multi-config — 3 tile variants, compile-time selection          │
+│       Tiles: 64x128, 128x128, 128x256                                        │
+│       Tensor cores: WGMMA (SM90) / mma.sync (SM80)                            │
 │                                                                               │
 └───────────────────────────────────────────────────────────────────────────────┘
                                         │                                        
@@ -190,111 +193,220 @@ Bottlenecks marked with `[!]`/`[!!]`/`[!!!]` severity. All boxes 81 chars wide.
 ┌───────────────────────────────────────────────────────────────────────────────┐
 │ COMPILE — LOW-LEVEL IR (Schedule IR)                                          │
 │                                                                               │
-│ [5] Memory Planning                                                           │
-│     ├─ DAG-based liveness analysis  (NEW)                                     │
-│     ├─ Layout propagation: col-major for B  (NEW)                             │
-│     ├─ Weight pre-transposition for decode  (NEW)                             │
-│     └─ Arena allocation (128-byte alignment)                                  │
+│ [5] Static Per-SM Task Assignment (NEW — from MPK)                            │
+│     ├─ Build dependency DAG from buffer producers/consumers                   │
+│     ├─ Topological sort, critical-path priority                               │
+│     ├─ Assign tasks to specific SMs (load-balanced bin-packing)               │
+│     ├─ Each SM gets private ordered task queue                                │
+│     ├─ Compute per-dependency counters (dep_count[])                          │
+│     └─ Plan SMEM page allocation per task per SM                              │
 │   │                                                                           │
 │   ▼                                                                           │
-│ [6] Scheduling                                                                │
-│     ├─ Build dependency DAG  (NEW)                                            │
-│     ├─ Topological sort, critical-path priority                               │
-│     ├─ Compute dep_counts[] + successor_lists[]                               │
-│     └─ Upload DAG metadata for device scheduler                               │
+│ [6] Memory Planning                                                           │
+│     ├─ DAG-based liveness analysis                                            │
+│     ├─ Layout propagation: col-major for B                                    │
+│     ├─ Weight pre-transposition for decode (col-major)                        │
+│     ├─ SMEM page assignment for inter-task handoff                            │
+│     └─ Arena allocation (128-byte alignment)                                  │
 │   │                                                                           │
 │   ▼                                                                           │
 │ [7] Serialization                                                             │
 │     Enhanced TaskDesc with:                                                   │
-│     ├─ tile_config (which CUTLASS variant)                                    │
-│     ├─ epilogue flags (bias, act, residual)                                   │
-│     └─ Dependency edges for event-driven sched                                │
+│     ├─ matmul_strategy (skinny_matvec | cutlass_config_id)                    │
+│     ├─ epilogue flags (bias, act, residual — runtime dispatch)                │
+│     ├─ sm_assignment[] (which SMs execute this task)                           │
+│     ├─ dep_count + successor_list (counter-based sync)                        │
+│     ├─ smem_pages[] (which pages to use, which to prefetch)                   │
+│     └─ chunk_count (for chunked dependencies)                                 │
 │                                                                               │
 └───────────────────────────────────────────────────────────────────────────────┘
                                         │                                        
                                         ▼                                        
 ┌───────────────────────────────────────────────────────────────────────────────┐
-│ CUDA COMPILATION (multi-config)                                               │
+│ CUDA COMPILATION (revised)                                                    │
 │                                                                               │
-│ CUTLASS GEMM — multiple tile configs compiled:                                │
-│   ├─ gemm_64x64_bk32   small shapes, high SM util                             │
-│   ├─ gemm_64x128_bk32  rectangular (MLP N=11008)                              │
-│   ├─ gemm_128x128_bk64 large shapes (current)                                 │
-│   ├─ gemm_128x256_bk64 very large N                                           │
-│   └─ gemm_splitk       M<=4 decode, K-split                                   │
+│ Decode matmul (M<=4) — skinny matvec:                                         │
+│   ├─ CUDA-core FMA, NOT tensor cores (bandwidth-bound)                        │
+│   ├─ float4 vectorized weight loads (128-bit per thread)                      │
+│   ├─ cp.async prefetch of next weight chunk                                   │
+│   └─ All SMs participate, N-split across SMs                                  │
+│                                                                               │
+│ Prefill matmul (M>=16) — CUTLASS multi-config:                                │
+│   ├─ gemm_64x128_bk32   rectangular (MLP shapes)                              │
+│   ├─ gemm_128x128_bk64  large shapes (current default)                        │
+│   └─ gemm_128x256_bk64  very large N                                          │
 │   dispatch_matmul() reads config from TaskDesc                                │
 │                                                                               │
-│ FlashAttention kernel  (NEW):                                                 │
+│ FlashAttention kernel:                                                        │
 │   ├─ K-tiled (block_kv = 64 or 128)                                           │
 │   ├─ Tensor cores: WGMMA (SM90) / mma.sync (SM80)                             │
 │   ├─ Online softmax (no materialized scores)                                  │
+│   ├─ cp.async prefetch next K/V block during compute                          │
+│   ├─ GQA-aware tiling: group queries sharing KV head on same SM               │
 │   └─ O(1) SMEM per head (vs O(seq_k) current)                                 │
 │                                                                               │
 │ Improved task kernels:                                                        │
 │   ├─ reduce.cu: float4 loads + single-pass norms                              │
-│   ├─ rope.cu:   float4 loads + SMEM cos/sin cache                             │
+│   ├─ rope.cu:   float4 pipeline (load/compute/store all as float4)            │
 │   └─ index.cu:  float4 vectorized                                             │
 │                                                                               │
-│ nvcc -cubin --use_fast_math -dlto                                             │
+│ __noinline__ on cold paths (embedding, index, copy)                           │
+│ Consolidated op_types: 9 types (from 12)                                      │
+│   ├─ ELEMENTWISE + FUSED_ELEMENTWISE merged                                   │
+│   ├─ COPY absorbed into ELEMENTWISE (identity)                                │
+│   └─ REDUCE subtypes via flag (rmsnorm | layernorm | softmax)                 │
+│                                                                               │
+│ nvcc -cubin --use_fast_math -dlto -std=c++17                                  │
 │                                                                               │
 └───────────────────────────────────────────────────────────────────────────────┘
                                         │                                        
                                         ▼                                        
 ┌───────────────────────────────────────────────────────────────────────────────┐
-│ RUNTIME — EVENT-DRIVEN SCHEDULER                                              │
+│ RUNTIME — COUNTER-BASED SCHEDULER (replaces BSP)                              │
 │                                                                               │
 │ Host:                                                                         │
 │   ├─ Same arena allocation + weight caching                                   │
 │   ├─ Weight pre-transposition (decode, cached)                                │
-│   ├─ Upload TaskDescs + dependency DAG                                        │
-│   └─ cuLaunchCooperativeKernel (unchanged)                                    │
+│   ├─ Upload TaskDescs + per-SM task queues + dep_counts[]                      │
+│   └─ cuLaunchCooperativeKernel (unchanged launch mechanism)                   │
 │                                                                               │
-│ Device:                                                                       │
-│   while (task_id = ready_queue.pop()) {                                       │
-│       if (blockIdx.x < tasks[task_id].num_tiles)                              │
-│           dispatch_task(tasks[task_id]);                                      │
-│       tile_barrier(num_tiles);  // participating                              │
-│       if (tid==0 && bid==0)                                                   │
-│           signal_dependents(atomicSub);                                       │
-│   }                                                                           │
+│ Device — per-SM execution loop:                                               │
+│   for each task in my_sm_queue[blockIdx.x]:                                   │
+│       // PREFETCH: load weights for THIS task (started by previous task)       │
+│       while (dep_count[task_id] != 0) {}  // spin on MY counter               │
+│       __syncthreads();                                                        │
 │                                                                               │
-│   Benefits vs BSP:                                                            │
-│   ├─ No idle SMs (pick up next ready task)                                    │
-│   ├─ Independent tasks run in parallel                                        │
-│   ├─ No global barrier for unrelated tasks                                    │
-│   └─ Straggler tolerance                                                      │
+│       dispatch_task(task);                                                    │
+│                                                                               │
+│       // SIGNAL: decrement successors' counters                                │
+│       if (threadIdx.x == 0)                                                   │
+│           for s in task.successors:                                            │
+│               atomicSub(&dep_count[s], 1);                                    │
+│                                                                               │
+│       // PREFETCH NEXT: start cp.async for next task's weights                 │
+│       start_prefetch(next_task.weight_pages);                                 │
+│                                                                               │
+│   No grid.sync(). No global ready queue. No atomic contention.                │
+│   Each SM spins only on its OWN task's counter — zero cross-SM traffic.       │
 │                                                                               │
 │   dispatch_task() switch(op_type):                                            │
-│   MATMUL    > CUTLASS variant by config_id                                    │
-│               fused epilogue: bias+act+residual                               │
-│               split-K for M<=4                                                │
-│   ATTENTION > FlashAttention with tensor cores                                │
-│   REDUCE    > float4 + single-pass RMSNorm                                    │
-│   ROPE      > float4 + SMEM cos/sin cache                                     │
-│   (others)  > float4 vectorized                                               │
+│   MATMUL_SKINNY > CUDA-core matvec, float4, cp.async prefetch                │
+│   MATMUL_GEMM   > CUTLASS variant by config_id                               │
+│                   fused epilogue: bias+act+residual (runtime flags)           │
+│   ATTENTION     > FlashAttention with tensor cores + KV prefetch              │
+│   REDUCE        > float4 + single-pass norms                                  │
+│   ROPE          > float4 pipeline                                             │
+│   (others)      > float4 vectorized                                           │
 │                                                                               │
 └───────────────────────────────────────────────────────────────────────────────┘
                                         │                                        
                                         ▼                                        
 ┌───────────────────────────────────────────────────────────────────────────────┐
-│ FUTURE: HYBRID PATH (prefill / large batch)                                   │
+│ PAGED SMEM + WEIGHT PREFETCH (NEW — from Hazy Research)                       │
 │                                                                               │
-│ CUDA Graph wrapping cuBLAS + megakernel nodes:                                │
-│   cuBLAS > megakernel(norm+act) > cuBLAS > ...                                │
-│   cuGraphLaunch(graph, stream) — zero overhead                                │
+│ SMEM divided into fixed pages:                                                │
+│   228 KB / 14 KB = 16 pages per SM (matches Hazy's H100 design)              │
+│                                                                               │
+│ Lifecycle:                                                                    │
+│   Task N compute phase:                                                       │
+│     Uses pages 0-3 for its data                                               │
+│     cp.async loads Task N+1 weights into pages 4-7                            │
+│   Task N completes:                                                           │
+│     Releases pages 0-3                                                        │
+│     Pages 4-7 already loaded for Task N+1                                     │
+│   Task N+1 starts:                                                            │
+│     Uses pages 4-7 (already warm)                                             │
+│     cp.async loads Task N+2 weights into pages 0-3 (recycled)                 │
+│                                                                               │
+│ Effect: weight loading OVERLAPS with compute. No idle memory bus.             │
+│ Hazy achieves 78% bandwidth utilization (vs typical 50%) this way.            │
+│                                                                               │
+│ Also enables SMEM handoff for inter-task data:                                │
+│   RMSNorm output written to SMEM page instead of HBM                         │
+│   Next matmul reads from SMEM page (30 cycles vs L2's 200 cycles)            │
+│   60+ norms × 170 cycle savings = ~10,000 cycles = ~7 us saved               │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘
+                                        │                                        
+                                        ▼                                        
+┌───────────────────────────────────────────────────────────────────────────────┐
+│ FUTURE EXTENSIONS                                                             │
+│                                                                               │
+│ Chunked Dependencies (from MPK):                                              │
+│   Split large tasks into chunks with separate dep counters.                   │
+│   Consumer starts on chunk 0 while producer still generating chunk 1-N.       │
+│   Eliminates pipeline stalls between large producer + small consumer.         │
+│                                                                               │
+│ INT8 Weight-Only Quantization (from Ada-MK):                                  │
+│   INT8 weights + FP16 scale per group, dequant in registers during matmul.    │
+│   Halves weight memory traffic = ~2x decode speedup (bandwidth-bound).        │
+│                                                                               │
+│ Hybrid cuBLAS Path (prefill / large batch):                                   │
+│   CUDA Graph wrapping cuBLAS + megakernel nodes.                              │
+│   cuGraphLaunch(graph, stream) — zero overhead.                               │
+│   Only for M>=32 compute-bound regime.                                        │
 │                                                                               │
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 0c. Why You Can't Use cuBLAS Inside a Megakernel (And What To Do Instead)
+## 0c. The GEMM Problem: Two Distinct Regimes
 
-### The Obvious Question
+### [REVISED] The original analysis treated GEMM as one problem. It is two.
 
-"Why not call cuBLAS/cuDNN from inside the megakernel and get the best of both worlds?"
+**Regime 1: M=1 Decode (bandwidth-bound)**
 
-### Why It's Impossible
+```
+Matmul M=1, N=4096, K=4096:
+  FLOPS = 2 × 1 × 4096 × 4096 = 33.5 MFLOP
+  Bytes = 4096 × 4096 × 2 = 33.5 MB (weight matrix)
+  Arithmetic intensity = 1 FLOP/byte
+  Tensor core throughput: 33.5 MFLOP / 150 TFLOP/s = 0.00022 us
+  HBM time at 500 GB/s: 67 us
+  Tensor cores idle 99.99% of time.
+```
+
+This is a matrix-vector multiply, not a matrix-matrix multiply. Tensor cores have setup overhead (load to SMEM, issue WGMMA, drain pipeline) that is wasted when M=1 — the data flows through faster via direct CUDA core FMA. Hazy Research confirms: "tensor cores are not helpful on Hopper" for M=1 decode.
+
+The 0.27x benchmark on `linear_256x512` is NOT a tiling problem. It is a **bandwidth utilization** problem. Megabake's skinny matmul uses all SMs (good) but loads weights inefficiently:
+- Element-by-element loads instead of `float4` (128-bit)
+- No prefetch overlap (`cp.async` for next chunk while computing current)
+- Potentially non-coalesced access patterns
+
+cuBLAS achieves ~80-90% bandwidth utilization on M=1 via vectorized column sweeps with software pipelining. Megabake achieves ~25%.
+
+**Fix:** Don't add CUTLASS tile configs for M=1. Fix the skinny matmul's memory access:
+1. `float4` vectorized weight loads (8x fewer load instructions)
+2. `cp.async` prefetch: load next weight chunk while computing current
+3. Coalesced access: all threads in warp read consecutive 128-byte cache lines
+
+**Regime 2: M>=16 Prefill (compute-bound)**
+
+```
+Matmul M=512, N=4096, K=4096:
+  Arithmetic intensity = 414 FLOP/byte
+  Compute bound. Tensor core efficiency matters.
+```
+
+Here CUTLASS multi-config IS the right answer. cuBLAS's advantage comes from autotuned tile sizes, and CUTLASS uses the same WGMMA/mma.sync instructions.
+
+**Fix:** Compile 3 CUTLASS tile variants (not 5 — diminishing returns past 3, confirmed by MPK's superoptimizer results):
+- `gemm_64x128_bk32` — rectangular, common MLP shapes
+- `gemm_128x128_bk64` — current default, large shapes
+- `gemm_128x256_bk64` — very large N
+
+With runtime epilogue flags (bias+act+residual) applied via branches, not template explosion:
+```cuda
+float v = acc;
+if (task.flags & HAS_BIAS)     v += bias[col];
+if (task.flags & HAS_SILU)     v *= 1.f / (1.f + expf(-v));
+if (task.flags & HAS_GELU)     v *= 0.5f * (1.f + erff(v * 0.7071f));
+if (task.flags & HAS_RESIDUAL) v += residual[idx];
+```
+Branch prediction makes this free (same branch for entire tile). Avoids 5×8=40 template instantiations.
+
+### Why cuBLAS Cannot Be Called From Device Code (unchanged)
 
 1. **cuBLAS is a host-side API.** `cublasGemmEx()` enqueues a kernel onto a CUDA stream from host code. Cannot be called from `__device__` code.
 
@@ -303,87 +415,18 @@ Bottlenecks marked with `[!]`/`[!!]`/`[!!!]` severity. All boxes 81 chars wide.
    - CDP has ~50 us overhead per child launch (worse than host launches)
    - Cooperative kernels (required for grid.sync) forbid CDP entirely
 
-3. **cuBLAS is closed-source.** No stable device-side ABI. Kernel names/signatures change between CUDA versions. Cannot link cuBLAS kernels into a custom binary.
-
-### What We CAN Do: Use CUTLASS Better
-
-cuBLAS's advantage is NOT magic hardware access. It's:
-- Autotuned tile sizes per shape
-- WGMMA/HMMA instruction selection (**we already have this via CuTe**)
-- Software pipelining with optimal stage counts (**we already have this**)
-- Split-K and Stream-K for load balancing (**missing**)
-- Epilogue fusion in registers (**missing**)
-- Multiple specialized kernel variants (**missing — we have one**)
-
-**CUTLASS is open-source and already linked into megabake.** The CuTe GEMM in `matmul.cu` uses CUTLASS types (`SM90_64x128x16_F32F16F16_SS`, `SM80_16x8x16_F32F16F16F32_TN`). These use the SAME tensor core instructions as cuBLAS.
-
-The gap is in TUNING, not in hardware access:
-
-| What cuBLAS has | What megabake has | Gap |
-|----------------|------------------|-----|
-| ~50 tile configs per arch | 1 fixed (128×128) | 50x fewer configs |
-| Split-K for bandwidth-bound | N-split only | Missing entirely |
-| Stream-K for load balancing | None | Missing entirely |
-| Bias+act+residual epilogue | Activation only (SiLU/GELU) | Partial |
-| Per-shape autotuning DB | No tuning | Missing entirely |
-| CUTLASS 3.x persistent kernels | Single-tile dispatch | Structural gap |
-
-### The Strategy: CUTLASS Multi-Config Autotuning
-
-**Phase 1 (Weeks 1-2): Compile multiple tile configs**
-```
-Compile 5 CUTLASS GEMM variants into the megakernel binary:
-  gemm_64x64    → small shapes, maximize SM utilization
-  gemm_64x128   → rectangular (common in MLP: M small, N=11008)
-  gemm_128x128  → current default, large shapes
-  gemm_128x256  → very large N, fewer tiles needed
-  gemm_splitk   → M<=4 decode, split K across all SMs
-```
-
-Each is a template instantiation of the same CuTe pipeline with different `BM, BN, BK, STAGES` constants. Same WGMMA/mma.sync instructions. ~2-3 KB extra cubin per variant.
-
-**Phase 2 (Week 3): Compile-time tile selection**
-```python
-def select_tile_config(M, N, K, num_sms):
-    best_score = 0
-    for (TM, TN, BK, STAGES) in TILE_CONFIGS:
-        tiles = ceil(M/TM) * ceil(N/TN)
-        util = min(tiles, num_sms) / num_sms
-        waves = ceil(tiles / num_sms)
-        efficiency = tiles / (waves * num_sms)
-        smem = (TM*BK + TN*BK) * STAGES * 2
-        score = util * efficiency * (1.0 if smem <= MAX_SMEM else 0.5)
-        if score > best_score:
-            best_score = score
-            best_config = config_id
-    return best_config
-```
-
-Store `config_id` in TaskDesc. `dispatch_matmul()` reads it and calls the right variant.
-
-**Phase 3 (Weeks 4-6): CUTLASS epilogue fusion**
-```cuda
-// In matmul epilogue, before writing to global memory:
-if (has_bias)    acc += __half2float(bias[col]);
-if (has_silu)    acc = acc * sigmoidf(acc);
-if (has_residual) acc += __half2float(residual[row * N + col]);
-out[row * N + col] = __float2half(acc);
-```
-
-This eliminates the separate ELEMENTWISE_ADD task + barrier per biased linear.
-
-**Expected result:** GEMM within 10-15% of cuBLAS on most shapes, within 5% on decode shapes. Combined with launch overhead elimination, this makes the pure megakernel approach viable.
+3. **cuBLAS is closed-source.** No stable device-side ABI. Kernel names/signatures change between CUDA versions.
 
 ### Comparison of Strategies
 
-| Strategy | GEMM quality | Launch overhead | Complexity | Timeline |
-|----------|-------------|-----------------|------------|----------|
-| Current (1 CuTe config) | 0.2-0.3x cuBLAS | 0 (1 kernel) | Low | Done |
-| CUTLASS multi-config (recommended) | 0.85-0.95x cuBLAS | 0 (1 kernel) | Medium | 4-6 weeks |
-| Hybrid cuBLAS + megakernel | 1.0x cuBLAS | ~0 (CUDA Graphs) | High | 6-8 weeks |
-| cuBLAS from device code | Impossible | N/A | N/A | N/A |
+| Strategy | GEMM quality (decode) | GEMM quality (prefill) | Complexity | Timeline |
+|----------|----------------------|----------------------|------------|----------|
+| Current (1 CuTe config) | 0.2-0.3x cuBLAS | 0.2-0.3x cuBLAS | Low | Done |
+| Fix skinny matvec + CUTLASS 3-config | 0.7-0.85x cuBLAS | 0.85-0.95x cuBLAS | Medium | 3 weeks |
+| + weight prefetch overlap (paged SMEM) | 0.85-0.95x cuBLAS | 0.85-0.95x cuBLAS | Medium-High | +2 weeks |
+| Hybrid cuBLAS + megakernel | 1.0x cuBLAS | 1.0x cuBLAS | High | 6-8 weeks |
 
-**Recommendation:** CUTLASS multi-config first. It keeps the pure megakernel architecture and closes most of the GEMM gap. Fall back to hybrid only if the remaining 5-15% gap matters for target workloads.
+**Recommendation:** Fix skinny matvec first (1 week, biggest decode unlock). CUTLASS multi-config second (2 weeks, prefill). Weight prefetch third (2 weeks, pushes decode to 85-95%).
 
 ---
 
@@ -395,22 +438,26 @@ A cooperative megakernel compiler: torch.export FX graph → flat `TaskDesc` arr
 
 ### Fundamental Design Errors
 
-**Error 1: Writing your own GEMM inside a persistent kernel.**
-Matmul is 80-95% of transformer inference time. cuBLAS has hundreds of person-years of autotuning per shape. Megabake has ONE CuTe GEMM with fixed 128x128 tiles.
+**Error 1: [REVISED] Skinny matmul wastes bandwidth, not compute.**
+The 0.27x on `linear_256x512` is a bandwidth utilization problem. At M=1, arithmetic intensity = 1 FLOP/byte — tensor cores are irrelevant. cuBLAS achieves ~80-90% bandwidth utilization via vectorized loads with software pipelining. Megabake's skinny matmul achieves ~25%. The fix is NOT more CUTLASS tile configs — it's vectorized loads (`float4`), `cp.async` prefetch, and coalesced access.
 
-Proof from your own data:
+For M>=16 (prefill), the original critique applies: fixed 128x128 tiles leave SM utilization poor on many shapes. CUTLASS multi-config fixes this.
+
+Proof from data:
 ```
 linear_256x512:  megabake 237 us vs torch.compile 65 us → 0.27x
 ```
-That's a single matmul. No fusion to save you. Your GEMM is 3.6x slower than cuBLAS on a basic shape. Every transformer layer pays this tax 7 times (Q/K/V/O projections + gate/up/down MLP).
+Both launch 1 kernel. Pure memory access efficiency gap.
 
-**Error 2: BSP execution serializes everything.**
-Grid.sync() after every task. ~100 tasks per SmolLM2-135M forward pass × 2.5 us = 250 us pure barrier cost. But worse: tasks with few tiles leave most SMs idle, and those idle SMs still hit the barrier.
+**Error 2: [REVISED] BSP execution serializes everything. Counter-based sync replaces it.**
+Grid.sync() after every task. ~100 tasks × 2.5 us = 250 us pure barrier cost. But the real problem: tasks with few tiles leave most SMs idle, and idle SMs still pay barrier cost.
 
-For a 256-element elementwise op (1 tile needed), 31 of 32 SMs are idle. The wall-clock cost is the SAME as if all 32 SMs were working.
+Both Hazy Research and MPK independently converge on the same replacement: per-dependency atomic counters + static per-SM task assignment. No global barrier, no global ready queue. Each SM polls only its own tasks' counters.
+
+The original proposal of an atomic ready queue is wrong — global queue = serialization point. 32 SMs doing `atomicAdd` on same address = 32-way contention.
 
 **Error 3: Attention kernel has no tensor cores and no flash-style tiling.**
-Q*K^T and Attn*V are dense matrix multiplies. Running them with scalar FMA in fp32 leaves 99% of H200 compute dark. FlashAttention uses tensor cores for both and tiles in the sequence dimension. Your implementation:
+Q*K^T and Attn*V are dense matrix multiplies. Running them with scalar FMA in fp32 leaves 99% of H200 compute dark. FlashAttention uses tensor cores for both and tiles in the sequence dimension. Current implementation:
 - Materializes full score matrix in shared memory: O(seq_k) SMEM
 - Serial loop over query positions
 - Scalar dot products (no HMMA/WGMMA)
@@ -420,7 +467,7 @@ This is why gemma-2b is 0.49x. Longer sequences amplify the gap.
 **Error 4: No vectorization in most kernels.**
 `reduce.cu`: element-by-element fp16 loads. 256 threads × 1 half per load = 512 bytes/cycle. With float4 vectorization: 256 × 16 bytes = 4096 bytes/cycle. 8x bandwidth difference.
 
-`rope.cu`: same problem. Element-by-element.
+`rope.cu`: same problem. Plus: should keep data as `float4` through entire compute pipeline, not just load/store.
 
 `index.cu`: same.
 
@@ -428,7 +475,15 @@ This is why gemma-2b is 0.49x. Longer sequences amplify the gap.
 RMSNorm reads input 2x (sum-of-squares pass, then normalize pass). LayerNorm reads 3x. Each pass is a full global memory traversal. A fused single-pass with online statistics halves the bandwidth.
 
 **Error 6: The uber-kernel design causes register pressure and I-cache pollution.**
-All 11 task implementations (576-line matmul, 186-line attention, etc.) are compiled into ONE binary. `SKINNY_MAX_M = 64` declares 64 float accumulators per thread even when M=1. The compiler can't fully optimize away dead code across the dispatch switch. SM90 matmul alone uses 96KB shared memory.
+All 12 task implementations compiled into ONE binary. SM90 matmul alone uses 96KB shared memory.
+
+Mitigations: `__noinline__` on cold paths (embedding, index, copy). Consolidate 12 op_types down to 9. Both Hazy (7 instruction types) and MPK accept this as inherent cost of persistent kernels — `__launch_bounds__(256, 1)` already gives compiler max freedom.
+
+**Error 7: [NEW] No weight prefetch overlap.**
+Current execution: compute task, THEN load weights for next task. Serial. ~50% of time is idle waiting for weight loads. Hazy Research achieves 78% bandwidth utilization (vs typical 50%) by overlapping weight loads with compute via `cp.async` and paged SMEM. This is the single biggest performance unlock not in the original analysis.
+
+**Error 8: [NEW] No cross-task SMEM handoff.**
+The original analysis (Section 8 Tier 4) dismissed SMEM handoff: "L2 handles it." This only considered bandwidth savings (correct that they're minimal for decode). But the analysis ignored latency accumulation: L2 is ~200 cycles per access, SMEM is ~30 cycles. Over 60+ norms per model: 60 × 170 cycles = 10,200 cycles = ~7 us. Small per-norm, meaningful in aggregate. Hazy's 78% bandwidth utilization comes partly from keeping activations in SMEM/registers between tasks.
 
 ---
 
@@ -436,13 +491,16 @@ All 11 task implementations (576-line matmul, 186-line attention, etc.) are comp
 
 | # | Bottleneck | Impact | Evidence |
 |---|-----------|--------|----------|
-| 1 | GEMM quality gap vs cuBLAS | 3-5x per matmul | linear benchmarks: 0.19-0.30x |
-| 2 | Attention: no tensor cores, no flash tiling | 2-5x on attention | gemma-2b: 0.49x overall |
-| 3 | SM underutilization (tiling) | 50-97% idle SMs on small tasks | PLAN.md analysis |
-| 4 | BSP barrier overhead | ~250-500 us per forward | ~100 barriers × 2.5 us |
-| 5 | No vectorization in reduce/rope/index | 2-8x bandwidth waste | Element-by-element loads |
-| 6 | Multi-pass reductions | 2-3x bandwidth for norms | RMSNorm: 2 passes, LayerNorm: 3 |
-| 7 | Matmul epilogue not fused (bias, residual add) | ~7.5 us × N biased linears | Extra task + barrier per bias |
+| 1 | Skinny matmul bandwidth waste (M=1) | 3-5x per matvec | linear benchmarks: 0.19-0.30x. Bandwidth utilization ~25% vs cuBLAS ~85% |
+| 2 | No weight prefetch overlap | ~50% time idle on memory | Hazy: 78% vs 50% utilization. ~1.5x potential |
+| 3 | Attention: no tensor cores, no flash tiling | 2-5x on attention | gemma-2b: 0.49x overall |
+| 4 | SM underutilization from BSP | 50-97% idle SMs on small tasks | 1-tile norm on 32 SMs = 97% idle |
+| 5 | BSP barrier overhead | ~250-500 us per forward | ~100 barriers × 2.5 us |
+| 6 | No vectorization in reduce/rope/index | 2-8x bandwidth waste | Element-by-element loads |
+| 7 | No inter-task SMEM handoff | ~7 us latency accumulation | 60 norms × 170 cycle L2-vs-SMEM gap |
+| 8 | Multi-pass reductions | 2-3x bandwidth for norms | RMSNorm: 2 passes, LayerNorm: 3 |
+| 9 | Matmul epilogue not fused | ~7.5 us × N biased linears | Extra task + barrier per bias |
+| 10 | CUTLASS tiling gap (M>=16 only) | 1.5-3x per prefill matmul | Fixed 128x128 vs optimal tile |
 
 ---
 
@@ -470,39 +528,56 @@ Minimum time = model_bytes / bandwidth
 
 Current megabake:       8844 us  (16.4x above floor)
 Current torch.compile:  7802 us  (14.4x above floor)
-Theoretical target:     ~800-1200 us (1.5-2.2x above floor, accounting for compute)
+Theoretical target:     ~700-900 us (1.3-1.7x above floor)
 ```
 
-Where does the 16.4x overhead come from?
+### [REVISED] Where Does the 16.4x Overhead Come From?
 
-| Source | Estimated us | % |
-|--------|-------------|---|
-| Weight reads (bandwidth-limited) | ~540 | 6.1% |
-| Matmul compute overhead vs optimal | ~3000 | 33.9% |
-| Attention compute | ~1500 | 17.0% |
-| BSP barriers (~100) | ~250 | 2.8% |
-| SM idle time (underutilization) | ~2000 | 22.6% |
-| Activation memory traffic (unneeded HBM round-trips) | ~200 | 2.3% |
-| Elementwise/reduce compute | ~800 | 9.0% |
-| Kernel launch + scheduler | ~554 | 6.3% |
+| Source | Estimated us | % | Fix |
+|--------|-------------|---|-----|
+| Weight reads at 25% BW utilization | ~2160 | 24.4% | Prefetch overlap + float4 loads → 78% util |
+| Weight reads at optimal (floor) | 540 | 6.1% | (irreducible) |
+| Attention compute (naive scalar) | ~1500 | 17.0% | FlashAttention with tensor cores |
+| SM idle time (BSP underutilization) | ~2000 | 22.6% | Static per-SM assignment |
+| BSP barriers (~100) | ~250 | 2.8% | Counter-based sync |
+| Inter-task HBM round-trips (no SMEM handoff) | ~200 | 2.3% | Paged SMEM handoff |
+| Elementwise/reduce compute (unvectorized) | ~800 | 9.0% | float4 + single-pass norms |
+| Kernel launch + host overhead | ~554 | 6.3% | (already 1 launch, irreducible) |
+| CUTLASS tiling overhead (M>=16 shapes) | ~840 | 9.5% | Multi-config (prefill only) |
 
-The matmul quality gap and SM underutilization account for ~57% of total runtime.
+The original analysis attributed 33.9% to "matmul compute overhead." This was misleading — for M=1 decode, the gap is bandwidth utilization, not compute. Reframing: **bandwidth waste (24.4%) + SM idling (22.6%) + attention (17%) = 64% of runtime is fixable.**
 
-### Where 2x Over torch.compile Is Possible
+### [REVISED] Where 2x+ Over torch.compile Is Possible
+
+The original analysis said megakernel advantage is "purely launch overhead elimination." This is wrong. State-of-the-art megakernels demonstrate three additional advantages:
+
+1. **Continuous memory streaming** (no bubbles between kernels): 78% vs 50% bandwidth utilization (Hazy). Worth ~1.5x on bandwidth-bound decode.
+
+2. **Cross-task weight prefetch overlap**: while SM computes task N, `cp.async` loads weights for task N+1. Separate kernel launches cannot do this — each kernel's first loads are cold.
+
+3. **No activation spilling to HBM**: with SMEM handoff + paged SMEM, intermediate activations stay in SMEM (30-cycle access) instead of round-tripping through L2 (200 cycles) or HBM.
+
+**Evidence from real systems:**
+- Hazy Research: 2.5x over vLLM on Llama-1B decode (H100)
+- MPK: 1.0-1.7x over SGLang on decode (H100)
+- Ada-MK: deployed in production ad serving
 
 **Possible (batch-1, seq=1 decode, small-medium models):**
 - Eliminate launch overhead: torch.compile launches 433 kernels × ~5 us = ~2165 us overhead (28% of its 7802 us)
-- Without CUDA Graphs, megabake's 1-launch advantage is worth ~1867 us
-- If GEMM quality matches cuBLAS, megabake wins by eliminating launches + L2 reuse
-- Theoretical: ~1.5-2x over torch.compile WITHOUT CUDA Graphs
+- Continuous memory streaming: ~1.5x additional from bandwidth utilization gap
+- Cross-task prefetch: further reduces effective memory latency
+- Combined theoretical: 2.0-2.5x over torch.compile WITHOUT CUDA Graphs
+
+**Harder (against CUDA Graphs):**
+- CUDA Graphs eliminates launch overhead but NOT memory bubbles between kernels
+- Each kernel in CUDA Graph still has cold-start weight loading
+- Megakernel with prefetch overlap maintains advantage: ~1.3-1.8x over CUDA Graphs
 
 **Impossible (any of these):**
-- Large batch (>=32): matmul is compute-bound, cuBLAS wins, fusion savings negligible
-- Long sequences (>=2048): FlashAttention vs naive attention is an unbridgeable gap
-- Against torch.compile + CUDA Graphs: CUDA Graphs eliminate launch overhead, leaving only the GEMM quality gap (which favors cuBLAS)
+- Large batch (>=32): matmul is compute-bound, cuBLAS wins
 - Against TensorRT: fully optimized fused kernels with cuBLAS-grade GEMM
 
-**The honest assessment:** 2x over torch.compile without CUDA Graphs is achievable on batch-1 decode with competitive GEMM. 2x over torch.compile WITH CUDA Graphs requires innovations beyond what any existing system has demonstrated.
+**The revised honest assessment:** 2x over torch.compile on batch-1 decode is achievable with the techniques described here. 1.3-1.8x over torch.compile + CUDA Graphs is achievable because CUDA Graphs cannot do cross-task prefetch or SMEM handoff. This is validated by Hazy (2.5x over vLLM which uses CUDA Graphs) and MPK (1.0-1.7x over SGLang).
 
 ---
 
@@ -517,22 +592,32 @@ Matmul M=1, N=4096, K=4096:
   Arithmetic intensity = 1 FLOP/byte
   At 500 GB/s: minimum 67 us
   Tensor core throughput: 33.5 MFLOP / 150 TFLOP/s = 0.00022 us
-  → Pure memory bound. Tensor cores idle 99.99% of time.
 ```
 
-Implication: for decode, GEMM quality doesn't matter IF you can saturate memory bandwidth. cuBLAS saturates it because it parallelizes across N columns. Megabake's skinny matmul does this too (uses all SMs via N-splitting). The gap must be in load efficiency.
+Pure memory bound. Tensor cores idle 99.99% of time.
+
+**[REVISED] Implication:** For decode, the relevant metric is **bandwidth utilization**, not GEMM quality. The question is what fraction of peak HBM bandwidth the kernel actually achieves.
+
+| System | Bandwidth Utilization | How |
+|--------|----------------------|-----|
+| cuBLAS | ~80-90% | Vectorized loads, software pipelining |
+| Megabake current | ~25% | Element-by-element loads, no prefetch |
+| Hazy Research | ~78% | CUDA core matvec, cp.async prefetch, paged SMEM |
+| Target | ~75-85% | float4 loads + cp.async prefetch |
+
+Using CUDA cores (not tensor cores) for M=1 is correct — Hazy confirms: "CUDA cores suffice on Hopper, tensor cores only marginally helpful on Blackwell."
 
 ### Prefill (M=512+): Compute-Bound
 
 ```
 Matmul M=512, N=4096, K=4096:
   FLOPS = 2 × 512 × 4096 × 4096 = 17.2 GFLOP
-  Bytes = 33.5 MB (weights) + 512 × 4096 × 2 (A) + 512 × 4096 × 2 (C) ≈ 41.5 MB
+  Bytes ≈ 41.5 MB
   Arithmetic intensity = 414 FLOP/byte
-  At 150 TFLOP/s: 115 us
-  At 500 GB/s: 83 us
-  → Compute bound. Tensor core efficiency matters.
+  Compute bound. Tensor core efficiency matters.
 ```
+
+Here CUTLASS multi-config and tensor cores matter.
 
 ### L2 Cache Budget
 
@@ -541,19 +626,32 @@ L2 ≈ 12.5 MB. For decode intermediates:
 SmolLM2-135M hidden=576:
   Activation buffer: 576 × 2 = 1.15 KB
   MLP intermediate: 1536 × 2 = 3.07 KB
-  → ALL intermediates fit in L2. Megakernel L2 reuse advantage: ~1 us total.
+  ALL intermediates fit in L2.
 ```
 
 For larger models (LLaMA-7B hidden=4096):
 ```
   Activation: 4096 × 2 = 8 KB
   MLP intermediate: 11008 × 2 = 22 KB
-  → Still trivially fits L2. Megakernel advantage remains minimal for batch-1.
+  Still trivially fits L2.
 ```
 
-L2 reuse matters more for batch>1 where intermediates are `batch × hidden × 2` bytes. At batch=64, hidden=4096: 512 KB per intermediate, ~6 intermediates per layer = 3 MB, still fits L2.
+**[REVISED] Bottom line:** L2 reuse for activation data is worth almost nothing on decode. BUT: the original analysis missed that L2 round-trip latency (~200 cycles) accumulates over 60+ inter-task transfers. SMEM handoff (30 cycles) saves ~7 us total. More importantly, weight prefetch overlap (cp.async during compute) is the primary bandwidth advantage — not activation L2 reuse.
 
-**Bottom line:** For decode, L2 reuse from megakernels is worth almost nothing. The advantage is purely in launch overhead elimination.
+### SMEM Budget for Paged Design
+
+```
+H200 SMEM per SM: 228 KB
+Page size: 14 KB (matching Hazy's H100 design)
+Pages per SM: 16
+Reserve for matmul compute: 4-6 pages (56-84 KB)
+Available for prefetch: 10-12 pages (140-168 KB)
+```
+
+14 KB per page fits:
+- One weight tile chunk: 4096 × 2 bytes / 32 SMs × K_split ≈ 8-16 KB
+- One activation buffer: hidden=4096 × 2 = 8 KB
+- RMSNorm intermediate: hidden × 2 = 8 KB
 
 ---
 
@@ -561,48 +659,49 @@ L2 reuse matters more for batch>1 where intermediates are `batch × hidden × 2`
 
 ### Critical (directly cause benchmark losses)
 
-1. **Single CUTLASS tile config (128×128).** Megabake already uses CuTe/CUTLASS with the same tensor core instructions as cuBLAS (WGMMA on SM90, mma.sync on SM80). The gap is tuning: cuBLAS has ~50 tile configs per arch, megabake has 1. Calling cuBLAS from device code is impossible (host-side API, CDP forbidden in cooperative kernels, closed-source). The fix is CUTLASS multi-config autotuning: compile 5 tile variants, select best per shape at compile time. See Section 0c for full analysis.
+1. **[REVISED] Skinny matmul bandwidth waste.** The M<=4 path uses all SMs (correct) but loads weights inefficiently. Fix: `float4` loads, `cp.async` prefetch, coalesced access. Do NOT add CUTLASS tile configs — this is not a tiling problem.
 
-2. **No matmul bias fusion.** Every biased linear emits MATMUL + ELEMENTWISE_ADD + 2 barriers. cuBLAS epilogue handles this in-register.
+2. **No weight prefetch overlap.** [NEW] Current: compute task, THEN load weights for next task. Serial. Fix: paged SMEM + `cp.async`. Start loading task N+1's weights while computing task N. Requires static per-SM task assignment (compiler must know task order per SM).
 
-3. **No matmul residual-add fusion.** `y = linear(x) + x` could fuse the add into matmul epilogue.
+3. **No cross-task SMEM handoff.** [REVISED — promoted from Tier 4] RMSNorm output goes registers → HBM → next matmul SMEM. With paged SMEM: registers → SMEM page → next matmul reads SMEM directly. Saves HBM round-trip latency per norm.
 
-4. **No cross-task register/SMEM forwarding.** If RMSNorm output feeds matmul input, the data goes: RMSNorm registers → global memory → matmul shared memory. Could go: RMSNorm registers → shared memory → matmul directly.
+4. **Single CUTLASS tile config (128×128) for prefill.** Fix: 3 tile variants (64x128, 128x128, 128x256), compile-time selection per shape.
 
-5. **No persistent-thread reduction.** RMSNorm/LayerNorm read input 2-3x from global memory. Single-pass with online Welford algorithm reads once.
+5. **No matmul epilogue fusion.** Every biased linear emits MATMUL + ELEMENTWISE_ADD + barrier. Fix: runtime epilogue flags (not template explosion). `if (flags & HAS_BIAS) acc += bias[col];` — branch prediction makes this free.
 
-6. **No split-K for matmul.** When M is small but K is large, splitting K across SMs and reducing is faster than the current N-splitting approach. cuBLAS does this.
+6. **BSP serialization.** Fix: counter-based sync with static per-SM assignment (Section 11).
 
 ### Important (would help but not critical)
 
-7. **No vectorized loads in reduce/rope/index.** Easy 2-4x bandwidth improvement on these kernels.
+7. **No vectorized loads in reduce/rope/index.** Easy 2-4x bandwidth improvement. Keep data as `float4` through entire pipeline, not just load/store.
 
-8. **No operator reordering.** Tasks execute in graph order. Reordering to improve L2 locality (e.g., keep Q*K^T close to softmax) is possible within dependency constraints.
+8. **Multi-pass reductions.** RMSNorm 2x, LayerNorm 3x. Fix: single-pass with online Welford, cache row in registers (feasible up to hidden=4096 with 256 threads).
 
-9. **No recomputation.** Sometimes recomputing a value is cheaper than storing it (saves memory bandwidth). Particularly useful for activations in deep networks.
+9. **No layout propagation.** All tensors assumed row-major. Column-major for matmul B would eliminate transposes.
 
-10. **No layout propagation.** All tensors assumed row-major. Column-major for matmul B operand would eliminate transposes.
+10. **Weight pre-transposition.** For decode M=1, weight access is column-by-column. Row-major storage means non-coalesced reads. Pre-transposing to column-major improves bandwidth.
+
+11. **No operator reordering.** Tasks execute in graph order. Reordering for L2 locality possible within dependency constraints.
 
 ---
 
 ## 6. Proposed New Architecture
 
-### Core Principle: Hybrid Megakernel
+### [REVISED] Core Principle: Pure Megakernel with Memory-First Design
 
-Don't put matmul inside the persistent kernel. Instead:
+The original analysis recommended a hybrid approach (cuBLAS for matmul, megakernel for glue). This was based on the assumption that the megakernel advantage is only launch overhead elimination.
 
-```
-Phase A: Large matmuls → cuBLAS (separate kernels or CUDA Graphs)
-Phase B: Everything between matmuls → megakernel (fused norm+activation+residual)
-```
+State-of-the-art research proves otherwise. Megakernel advantages include:
+1. **Continuous memory streaming** — no bubbles between tasks
+2. **Cross-task weight prefetch** — overlap load with compute
+3. **SMEM handoff** — avoid HBM round-trips for inter-task data
+4. **Static SM scheduling** — zero idle SMs
 
-This keeps cuBLAS quality for the 80-95% of compute that is matmul, while megakernel handles the memory-bound "glue" operations.
+These advantages are LOST in a hybrid approach (cuBLAS kernels break the persistent kernel, creating memory bubbles at every split point).
 
-### Alternative: Pure Megakernel (if cuBLAS quality is achievable)
+**Recommendation: pure megakernel.** Sacrifice ~5-15% on individual GEMM quality to gain continuous execution advantages. The math works: even at 0.85x cuBLAS GEMM quality, the bandwidth utilization gain (78% vs 50%) more than compensates.
 
-If GEMM quality can match cuBLAS within 5%, the pure megakernel is strictly better because it eliminates ALL launch overhead and enables cross-task fusion.
-
-**Recommendation: pursue both in parallel.** Hybrid is the safe path. Pure megakernel is the moonshot that could hit 2x.
+Hybrid cuBLAS path is the fallback for prefill only (M>=32, compute-bound).
 
 ### IR Design
 
@@ -617,14 +716,10 @@ Two-level IR:
 
 **Low-Level IR (Schedule IR):**
 ```
-- Fused regions: sets of ops that execute in one kernel tile
-- Per-region: thread mapping, register allocation, shared memory layout
-- Cross-region: dependency edges, synchronization points
+- Per-SM task queues: ordered list of tasks assigned to each SM
+- Per-task: dep_count, successor_list, smem_page_assignment, prefetch_plan
+- Cross-SM sync points: only where data dependencies require it
 ```
-
-The current flat `TaskDesc` array conflates both levels. Separating them enables:
-- Graph-level optimization (fusion decisions, reordering, recomputation)
-- Schedule-level optimization (tiling, register allocation, vectorization)
 
 ### Compilation Pipeline
 
@@ -645,49 +740,81 @@ torch.export FX graph
     │
     ▼
 [3] Fusion Planning (cost-model driven)
-    - Matmul epilogue fusion (bias, activation, residual add)
+    - Matmul epilogue fusion (bias, activation, residual add) — runtime flags
     - Elementwise chain fusion
-    - Reduction + elementwise fusion (norm + scale)
-    - Producer-consumer fusion (when intermediate fits in SMEM/registers)
+    - Norm + elementwise fusion (single-pass norm + scale)
+    - SMEM handoff decisions: which producer-consumer pairs use SMEM pages
     Decision: fuse vs. split based on cost model, not fixed rules
     │
     ▼
-[4] Memory Planning
-    - Liveness analysis
-    - Arena allocation with alignment
-    - Layout propagation (row-major vs. column-major)
-    - Recomputation decisions (recompute vs. store)
+[4] Matmul Strategy Selection
+    - M <= 4: skinny matvec (CUDA cores, float4, cp.async)
+    - M >= 16: CUTLASS config selection (3 tile variants, score per shape)
+    - Store strategy in TaskDesc
     │
     ▼
-[5] Scheduling
-    - Topological sort with memory-locality heuristic
-    - Tile assignment per fused region
-    - Synchronization insertion (minimize barriers)
+[5] Static Per-SM Task Assignment
+    - Build dependency DAG from buffer producers/consumers
+    - Topological sort, critical-path priority
+    - Bin-pack tasks onto SMs (load-balanced)
+    - Independent tasks (Q/K/V projections) assigned to different SMs
+    - Single-tile tasks (norms) assigned to 1 SM, others work on own queues
     │
     ▼
-[6] Code Generation
-    Option A (near-term): Enhanced TaskDesc with fused epilogues
-    Option B (long-term): PTX/SASS code generation for fused regions
+[6] SMEM Page Planning
+    - Assign SMEM pages per task per SM
+    - Plan prefetch schedule: which pages to cp.async while computing
+    - Plan handoff pages: which inter-task transfers use SMEM vs HBM
+    - Chunked dependency assignment for large tasks
     │
     ▼
-[7] Runtime
+[7] Memory Planning
+    - DAG-based liveness analysis
+    - Layout propagation (row-major vs column-major)
+    - Weight pre-transposition for decode
+    - Arena allocation (128-byte alignment)
+    │
+    ▼
+[8] Serialization
+    - Per-SM task queue arrays
+    - dep_count[] array
+    - successor_list[] arrays
+    - SMEM page assignments per task
+    - Prefetch plans per task
+    - Enhanced TaskDesc with strategy + epilogue flags
+    │
+    ▼
+[9] CUDA Compilation
+    - Skinny matvec kernel (CUDA core, float4, cp.async)
+    - 3 CUTLASS GEMM variants (64x128, 128x128, 128x256)
+    - FlashAttention kernel (tensor cores, K-tiled, online softmax)
+    - Vectorized task kernels (reduce, rope, index — all float4)
+    - Counter-based scheduler loop
+    - __noinline__ on cold paths
+    │
+    ▼
+[10] Runtime
     - Cooperative kernel launch
-    - Event-driven scheduler (replace BSP)
-    - Autotuned tile sizes
+    - Counter-based scheduler with per-SM queues
+    - Paged SMEM with weight prefetch overlap
 ```
 
 ### Key Differences from Current Architecture
 
 | Aspect | Current | Proposed |
 |--------|---------|----------|
-| Matmul | Custom CuTe, fixed 128×128 | CUTLASS multi-config (5 tile variants, compile-time autotuned per shape) |
-| Attention | Naive materialized scores | FlashAttention with tensor cores |
-| Scheduling | BSP grid.sync() every task | Event-driven with dependency DAG |
-| Fusion | 3 fixed peephole passes | Cost-model-driven fusion planner |
-| Reductions | Multi-pass global reads | Single-pass online algorithms |
-| Vectorization | Matmul/elementwise only | All kernels vectorized |
+| Decode matmul | CuTe GEMM, fixed 128×128 | CUDA-core matvec, float4, cp.async prefetch |
+| Prefill matmul | Same CuTe GEMM | CUTLASS 3-config, compile-time selection |
+| Epilogue fusion | None (separate bias/act tasks) | Runtime flags: bias+act+residual, same kernel |
+| Attention | Naive materialized scores | FlashAttention with tensor cores, KV prefetch |
+| Scheduling | BSP grid.sync() every task | Counter-based sync, static per-SM assignment |
+| Weight loading | Serial: compute then load | Overlapped: cp.async next while computing current |
+| Inter-task data | All through HBM/L2 | SMEM handoff via paged SMEM where profitable |
+| Reductions | Multi-pass, element-by-element | Single-pass, float4, register-cached |
+| Vectorization | Matmul/elementwise only | All kernels: float4 pipeline end-to-end |
+| I-cache | All 12 op_types inline | 9 types, cold paths __noinline__ |
 | IR | Flat TaskDesc array | Two-level Graph IR + Schedule IR |
-| Code gen | Interpreted uber-kernel | JIT per fused region (long-term) |
+| SM utilization | 50-97% idle on small tasks | Zero idle — every SM always has queued work |
 
 ---
 
@@ -697,23 +824,35 @@ torch.export FX graph
 
 ```
 cost_fused = max(compute_time_fused, memory_time_fused) + register_pressure_penalty
-cost_split = cost_task_A + cost_task_B + barrier_cost + intermediate_memory_traffic
+cost_split = cost_task_A + cost_task_B + sync_cost + intermediate_memory_traffic
 
 fuse when: cost_fused < cost_split
 ```
 
+**[REVISED] Sync cost:** With counter-based sync, cost per sync point is ~0.1-0.3 us (atomicSub + poll), down from ~2.5 us (grid.sync). Fusion saves less per eliminated task, but still worth it for epilogue fusion.
+
 **Intermediate memory traffic:**
 ```
 intermediate_bytes = numel × dtype_size
-if intermediate_bytes <= L2_capacity:
+if using SMEM handoff:
+    traffic_cost = intermediate_bytes / SMEM_bandwidth  (~100 TB/s effective)
+elif intermediate_bytes <= L2_capacity:
     traffic_cost = intermediate_bytes / L2_bandwidth  (~3-5 TB/s)
 else:
     traffic_cost = intermediate_bytes / HBM_bandwidth  (~500 GB/s)
 ```
 
-For decode (hidden=4096, batch=1): intermediate = 8 KB → always in L2 → traffic_cost ≈ 0.002 us. Fusion saves almost nothing for decode intermediates.
+**[REVISED] SMEM handoff decision:**
+```
+if intermediate fits in 1-2 SMEM pages (<=28 KB)
+   AND producer and consumer on same SM
+   AND both are memory-bound:
+    use SMEM handoff (save ~170 cycles per access)
+else:
+    use HBM/L2 (standard path)
+```
 
-**Barrier cost:** ~2.5 us per grid.sync(). This is the dominant savings from fusion.
+For decode (hidden=4096, batch=1): intermediate = 8 KB → fits 1 SMEM page → SMEM handoff profitable for latency (not bandwidth). 60 norms × 170 cycles = ~7 us saved.
 
 **Register pressure penalty:**
 ```
@@ -724,45 +863,37 @@ if regs_per_thread > 255:
     penalty = INFINITY  (cannot compile)
 ```
 
-### Recomputation vs. Storage
+### Prefetch Overlap Model
+
+[NEW] Weight prefetch overlap benefit:
+```
+without_prefetch: time = Σ (load_time_i + compute_time_i)
+with_prefetch:    time = load_time_0 + Σ max(load_time_{i+1}, compute_time_i) + compute_time_last
+
+For bandwidth-bound decode (load >> compute):
+  without: ~2x load_time (compute hidden inside load)
+  with:    ~1x load_time (fully overlapped after warmup)
+  Speedup: ~1.5-1.8x on decode
+```
+
+This is why Hazy achieves 78% bandwidth utilization vs typical 50%.
+
+### Tile Size Selection (prefill only)
 
 ```
-cost_store = write_bytes / bandwidth + read_bytes / bandwidth
-cost_recompute = compute_flops / throughput
-
-recompute when: cost_recompute < cost_store AND recomputation doesn't extend critical path
-```
-
-For activations (SiLU, GELU): ~5 FLOPS per element, ~2-4 bytes per element. At 150 TFLOPS/s and 500 GB/s:
-```
-cost_store = 4B / 500 GB/s = 0.008 ns/element
-cost_recompute = 5 / 150 TFLOP/s = 0.033 ns/element
-```
-Storage wins for inference (no backward pass). Don't recompute.
-
-### Tile Size Selection
-
-```
-For matmul (M, N, K):
-  tile_candidates = [(64,64), (64,128), (128,64), (128,128), (128,256), (256,128)]
+For matmul (M >= 16, N, K):
+  tile_candidates = [(64,128), (128,128), (128,256)]
   for each (TM, TN):
     num_tiles = ceil(M/TM) × ceil(N/TN)
     sm_utilization = min(num_tiles, num_sms) / num_sms
     waves = ceil(num_tiles / num_sms)
     wave_efficiency = num_tiles / (waves × num_sms)
-    smem_usage = (TM × BK + TN × BK) × stages × 2  # bytes
-    occupancy = f(smem_usage, register_count)
-    
-    score = sm_utilization × wave_efficiency × occupancy
+    smem_usage = (TM × BK + TN × BK) × stages × 2
+    score = sm_utilization × wave_efficiency
   pick tile with best score
 ```
 
-Current fixed 128x128 gives wave_efficiency of:
-```
-M=256, N=512: 2 × 4 = 8 tiles / 32 SMs = 25% utilization
-M=1, N=4096: skinny path uses all 32 SMs = 100% utilization (good)
-M=128, N=11008: 1 × 86 = 86 tiles / 32 SMs = 2.69 waves, 84% efficiency
-```
+For M <= 4: always use skinny matvec (all SMs, N-split, CUDA cores).
 
 ---
 
@@ -770,24 +901,33 @@ M=128, N=11008: 1 × 86 = 86 tiles / 32 SMs = 2.69 waves, 84% efficiency
 
 ### Tier 1: Matmul Epilogue Fusion (highest ROI)
 
-Fuse into matmul writeback:
-- Bias add: `y = Wx + b` (save 1 task + 1 barrier)
+Fuse into matmul writeback using runtime flags:
+- Bias add: `y = Wx + b` (save 1 task + 1 sync)
 - Activation: `y = SiLU(Wx)` (already done for some)
-- Residual add: `y = Wx + residual` (save 1 task + 1 barrier)
-- Combined: `y = SiLU(Wx + b) + residual` (save 3 tasks + 3 barriers)
+- Residual add: `y = Wx + residual` (save 1 task + 1 sync)
+- Combined: `y = SiLU(Wx + b) + residual` (save 3 tasks + 3 syncs)
 
-Implementation: add epilogue lambda to CuTe GEMM. Accumulator stays in registers, apply bias/activation/residual before writing to global memory.
+Implementation: runtime flag dispatch, NOT template explosion:
+```cuda
+float v = acc;
+if (task.flags & HAS_BIAS)     v += __half2float(bias[col]);
+if (task.flags & HAS_SILU)     v *= 1.0f / (1.0f + expf(-v));
+if (task.flags & HAS_GELU)     v *= 0.5f * (1.0f + erff(v * 0.7071f));
+if (task.flags & HAS_RESIDUAL) v += __half2float(residual[row * N + col]);
+out[row * N + col] = __float2half(v);
+```
 
-Expected savings per transformer layer: 3-6 eliminated tasks × 7.5 us = 22-45 us.
+Branch prediction handles this at zero cost — same branch taken for entire tile. Avoids compiling 40 template variants.
 
-### Tier 2: Norm + Scale Fusion
+Expected savings per transformer layer: 3-6 eliminated tasks × ~5 us = 15-30 us.
+
+### Tier 2: Norm + Scale Fusion (single-pass)
 
 Fuse RMSNorm into single pass:
 ```
 // Current: pass1 reads X for sum_sq, pass2 reads X again for normalize
-// Proposed: single pass, accumulate sum_sq with warp shuffles,
-//           then normalize in same pass
-// Requires the row to fit in register file or SMEM
+// Proposed: single pass, cache entire row in registers,
+//           accumulate sum_sq with warp shuffles, normalize in-place
 ```
 
 For hidden=4096: 4096 × 2 = 8 KB per row. With 256 threads: 16 elements per thread = 32 bytes = 8 registers. Feasible to cache entire row in registers, do single-pass norm.
@@ -796,96 +936,92 @@ Expected savings: 50% bandwidth reduction on every norm operation.
 
 ### Tier 3: Elementwise Chain Fusion (already implemented)
 
-Current implementation is reasonable. The micro-op interpreter avoids code generation complexity. Cap of 8 uops per chain is sufficient for most patterns.
+Current implementation is reasonable. The micro-op interpreter avoids code generation complexity.
 
-Improvement: raise to 16 uops, add float constant loads as uops instead of encoding in dimensions.
+Improvement: raise cap from 8 to 16 uops. Consolidate ELEMENTWISE + FUSED_ELEMENTWISE + COPY into single op_type with subtype flag.
 
-### Tier 4: Producer-Consumer SMEM Handoff (long-term)
+### Tier 4: [REVISED] Producer-Consumer SMEM Handoff (paged SMEM)
 
-When op A's output is op B's input and both run on the same SMs:
+**Previous verdict: "not worthwhile." This was wrong.**
+
+When op A's output is op B's input and both run on the same SM, with paged SMEM:
 ```
-Op A writes to shared memory instead of global
-grid.sync() or tile-level signal
-Op B reads from shared memory
+Op A writes output to SMEM page (instead of HBM)
+Op A decrements successor counter
+Op B sees counter hit 0, reads from SMEM page
 ```
 
-This only helps when:
-- Both ops use the same number of tiles (or multiples)
-- Intermediate is small enough for SMEM (~100 KB per SM)
-- Both ops are memory-bound (compute-bound ops don't benefit)
+The original analysis only considered bandwidth: "intermediates are 1-8 KB, L2 latency is ~0.002 us." But it measured the wrong thing — the issue is **access latency**, not bandwidth:
+- L2: ~200 cycles per access
+- SMEM: ~30 cycles per access
+- Delta: 170 cycles per access
 
-For decode: intermediates are 1-8 KB, L2 latency is ~0.002 us. SMEM handoff saves ~0.001 us. Not worth the complexity.
+Over a forward pass with 60+ norm-to-matmul handoffs: 60 × 170 = 10,200 cycles ≈ 7 us. This compounds with weight prefetch overlap — if SMEM handoff eliminates an HBM write+read, that's 2 fewer HBM transactions competing for bandwidth with weight prefetch.
 
-For prefill (batch=64, hidden=4096): intermediates are 512 KB, exceeds SMEM. Not feasible.
+Additionally: paged SMEM infrastructure is REQUIRED for weight prefetch overlap (Tier 0 optimization). Once paged SMEM exists, inter-task handoff comes nearly free.
 
-**Verdict: SMEM handoff is not worthwhile for transformer inference.** L2 handles it.
+**Revised verdict: SMEM handoff IS worthwhile.** Not for bandwidth savings, but for latency savings and because the infrastructure (paged SMEM) is already needed for weight prefetch.
+
+### Tier 0: [NEW] Weight Prefetch Overlap (highest total impact)
+
+Not a fusion optimization per se, but the single biggest performance unlock:
+
+```
+Current execution model:
+  Task 1: [  LOAD WEIGHTS  ][  COMPUTE  ][STORE]
+  Task 2:                                        [  LOAD WEIGHTS  ][  COMPUTE  ][STORE]
+
+Prefetched execution model:
+  Task 1: [  LOAD WEIGHTS  ][  COMPUTE  ][STORE]
+  Task 2:         [ PREFETCH (cp.async) ][  COMPUTE  ][STORE]
+  Task 3:                       [ PREFETCH (cp.async) ][  COMPUTE  ][STORE]
+```
+
+After warmup (task 1), every subsequent task has weights pre-loaded in SMEM pages. Load time fully overlapped with previous task's compute.
+
+For bandwidth-bound decode: this is the difference between 50% and 78% bandwidth utilization.
 
 ---
 
 ## 9. Megakernel Strategy
 
-### When Megakernels Win
+### [REVISED] When Megakernels Win
 
-Quantitative model:
+The original model only considered launch overhead:
 ```
-megakernel_time = Σ task_time_i + N_barriers × barrier_cost + launch_overhead
-separate_time  = Σ (task_time_i + launch_overhead_i) + intermediate_traffic
-```
-
-Megakernel wins when:
-```
-N_tasks × launch_overhead > N_barriers × barrier_cost + cooperative_launch_overhead
+megakernel wins when: N_tasks × launch_overhead > N_barriers × barrier_cost
 ```
 
-Plugging in H200 MIG numbers:
+This was incomplete. The correct model includes three additional advantages:
+
 ```
-N × 5 us > N × 2.5 us + 48 us
-2.5N > 48
-N > 19.2
+megakernel_advantage =
+    launch_savings                          // N × 5 us
+    + bandwidth_utilization_gain            // 78% vs 50% → ~1.5x on decode
+    + prefetch_overlap_savings              // weight loads hidden behind compute
+    + smem_handoff_savings                  // skip HBM round-trips for intermediates
+    - gemm_quality_penalty                  // 0.85-0.95x cuBLAS
+    - sync_overhead                         // counter-based: ~0.2 us per sync
 ```
 
-With >=20 tasks, megakernel saves on launch overhead. Transformer layers have ~10-15 tasks each, so >=2 layers makes megakernel worthwhile.
+**Evidence:**
+- Hazy Research: 2.5x over vLLM on Llama-1B decode. vLLM uses CUDA Graphs.
+- MPK: 1.0-1.7x over SGLang on decode. SGLang uses CUDA Graphs.
+- Both systems beat CUDA Graph-optimized baselines because of prefetch overlap and bandwidth utilization, NOT launch overhead alone.
 
 ### When Megakernels Lose
 
-1. **GEMM quality gap exceeds launch savings:**
-   ```
-   If custom GEMM is 2x slower than cuBLAS:
-   Per matmul penalty = cuBLAS_time × 1.0 (100% overhead)
-   With 7 matmuls/layer × 16 layers = 112 matmuls
-   Need: 112 × cuBLAS_time < launch_savings
-   ```
-   This is why GEMM quality is the make-or-break issue.
+1. **Compute-bound regime (M>=32, prefill):** Custom GEMM cannot match cuBLAS tensor core utilization. Hybrid cuBLAS path needed.
 
-2. **Register explosion:** The uber-kernel compiles all task types into one binary. NVCC must allocate registers for the worst case. `__launch_bounds__(256, 1)` helps (tells compiler max 1 block per SM), but the matmul's 96 KB SMEM still limits occupancy to 1 block regardless.
+2. **Very long sequences:** PagedAttention integration needed for KV cache management. Not addressed yet.
 
-3. **Instruction cache pressure:** Combined kernel binary is large. I-cache on H200 is 64 KB per SM. If the hot path (matmul inner loop) doesn't fit in I-cache because attention code is also loaded, performance suffers.
+3. **Multi-GPU:** Megakernel is single-GPU only. Tensor parallelism requires inter-GPU communication.
 
-### Optimal Megakernel Size
+### Optimal Megakernel Scope
 
-Based on the cost model:
-```
-Optimal = all tasks between two large matmuls
+**For decode (target regime):** Entire model. Pure megakernel. All advantages (prefetch, SMEM handoff, zero bubbles) require continuous persistent execution.
 
-Pattern:  [cuBLAS GEMM] → [megakernel: norm + activation + residual + small ops] → [cuBLAS GEMM]
-```
-
-This is the hybrid approach: large matmuls as separate kernels, everything else fused into megakernels.
-
-For pure megakernel approach: entire model. The cost is GEMM quality; the benefit is zero inter-kernel overhead.
-
-### Partitioning Heuristic
-
-```
-partition_score(region) = 
-    barrier_savings × 2.5us
-    + launch_savings × 5us  
-    - gemm_quality_penalty
-    - register_pressure_penalty
-    - icache_pressure_penalty
-
-Split region when partition_score < 0
-```
+**For prefill:** Hybrid. cuBLAS for large matmuls (CUDA Graph wrapped), megakernel for glue ops.
 
 ---
 
@@ -897,99 +1033,161 @@ Adequate. O(n^2) in buffer count, but buffer count is typically <200. Not a bott
 
 ### Improvements
 
-1. **Layout propagation:** Matmul B expects column-major (transposed). Currently, transpose is encoded as `strides[0]=1` flag. Better: propagate layout preferences backward from consumers. If matmul B wants column-major, store the preceding op's output as column-major. Eliminates implicit transposes.
+1. **Layout propagation:** Matmul B expects column-major (transposed). Propagate layout preferences backward from consumers. If matmul B wants column-major, store the preceding op's output as column-major.
 
-2. **Alignment to 128 bytes** (not current 256): 128 bytes = one cache line = one vectorized load. 256 is over-aligned.
+2. **Alignment to 128 bytes** (not current 256): 128 bytes = one cache line = one vectorized load.
 
-3. **Weight packing:** Weights are currently stored as-is from the state dict. For decode M=1 matmuls, weight access pattern is column-by-column. Row-major storage means non-coalesced reads. Pre-transposing weights to column-major would improve memory bandwidth.
+3. **Weight pre-transposition:** For decode M=1, weight access is column-by-column. Pre-transpose to column-major for coalesced reads.
 
-4. **Buffer aliasing across independent ops:** Current liveness analysis is task-index-based. With an event-driven scheduler, liveness becomes DAG-based. Two independent branches can share buffers if they don't execute simultaneously — but this requires knowing the schedule at compile time.
+4. **[NEW] SMEM page allocation:** Compiler assigns SMEM pages per task per SM. Pages are the unit of prefetch and handoff. Allocation considers:
+   - Weight chunk size for prefetch (typically 1-2 pages per weight tile)
+   - Activation buffer size for handoff (typically 1 page for hidden=4096)
+   - Compute scratch space for current task (matmul needs 4-6 pages)
+   - Double-buffering: current compute pages + prefetch pages must fit simultaneously
+
+5. **[NEW] Chunked buffer allocation:** For large tasks split into chunks (chunked dependencies), each chunk gets its own buffer region and dependency counter. Consumer can start processing chunk 0's buffer while producer fills chunk 1's.
 
 ---
 
 ## 11. Scheduling Strategy
 
-### Replace BSP with Event-Driven
+### [REVISED] Replace BSP with Counter-Based Sync + Static Per-SM Assignment
 
-Current BSP:
+**Why not an atomic ready queue (original proposal):**
+The original analysis proposed a global ready queue with `atomicAdd`/`atomicSub`. This creates a serialization point: 32 SMs all competing for the same atomic address = 32-way contention = ~5 us per pop. Worse than grid.sync on high-SM-count GPUs.
+
+Both Hazy Research and MPK independently converge on the same better approach:
+
+**Counter-based synchronization:**
 ```cuda
-for task in tasks:
-    if blockIdx.x < task.num_tiles:
-        dispatch(task)
-    grid.sync()  // ALL SMs barrier, even idle ones
+// Global memory arrays, uploaded by host:
+__device__ int dep_count[MAX_TASKS];       // initialized to # of predecessor tasks
+__device__ int successor_list[MAX_EDGES];  // flat list: successors of task 0, then task 1, ...
+__device__ int successor_offset[MAX_TASKS]; // index into successor_list for each task
+
+// After task completes (thread 0 only):
+for (int i = successor_offset[task_id]; i < successor_offset[task_id + 1]; i++) {
+    atomicSub(&dep_count[successor_list[i]], 1);
+}
+
+// Before task starts:
+while (atomicAdd(&dep_count[task_id], 0) != 0) {}  // spin until all deps satisfied
+__syncthreads();  // ensure all threads see the ready state
 ```
 
-Proposed event-driven:
-```cuda
-while (task = ready_queue.pop()):
-    execute(task)
-    for downstream in task.dependents:
-        if atomic_decrement(downstream.remaining_deps) == 0:
-            ready_queue.push(downstream)
+No global queue. No cross-SM contention. Each SM only polls counters for its own queued tasks.
+
+**Static per-SM task assignment (compiler decides):**
+```python
+# In schedule_compiler, after building dependency DAG:
+sm_queues = [[] for _ in range(num_sms)]
+
+# Topological sort with critical-path priority
+for task in topo_sorted_tasks:
+    if task.num_tiles == 1:
+        # Single-tile task: assign to least-loaded SM
+        sm = argmin(sm_load)
+        sm_queues[sm].append(task)
+    elif task.num_tiles <= num_sms:
+        # Multi-tile task: assign tiles to consecutive SMs
+        for tile in range(task.num_tiles):
+            sm = tile % num_sms
+            sm_queues[sm].append((task, tile))
+    else:
+        # Large task: all SMs participate, multiple tiles each
+        tiles_per_sm = ceil(task.num_tiles / num_sms)
+        for sm in range(num_sms):
+            for t in range(tiles_per_sm):
+                tile = sm * tiles_per_sm + t
+                if tile < task.num_tiles:
+                    sm_queues[sm].append((task, tile))
 ```
 
-**Expected savings:**
-- Eliminate barriers for independent tasks (Q/K/V projections can run in parallel)
-- No idle SM overhead (SMs that finish early pick up next ready task)
-- Straggler tolerance
+Benefits over BSP:
+- Single-tile tasks (norms): 1 SM works, 31 SMs work on their own tasks. Zero idle time.
+- Independent tasks (Q/K/V projections): different SMs work simultaneously.
+- Compiler knows each SM's full task order → can plan prefetch schedule.
 
-**Costs:**
-- Atomic contention on ready queue (~0.1-0.5 us per pop)
-- Non-determinism (harder to profile)
-- Register overhead for scheduler state
-
-**Net estimate for SmolLM2-135M:** Save 500-1000 us (per PLAN.md analysis). Brings megabake from 8844 us to ~7800-8300 us.
+Benefits over dynamic work-stealing:
+- Prefetch planning: compiler knows next task at compile time → can start `cp.async` for task N+1 while computing task N. Dynamic scheduling can't prefetch because next task is unknown.
+- No atomic contention on shared work queue.
+- Deterministic execution (easier profiling/debugging).
 
 ### Task Ordering Heuristic
 
-Within the ready set, prioritize:
+Within per-SM assignment, prioritize:
 1. Tasks on the critical path (longest remaining chain)
-2. Tasks whose outputs are consumed by the most dependents
-3. Tasks with the most tiles (maximize SM utilization)
+2. Tasks whose outputs are consumed by many dependents
+3. Tasks with most tiles (maximize utilization on that SM)
 
 ---
 
 ## 12. Runtime Architecture
 
-### Near-Term (keep cooperative kernel)
+### Device Execution Loop (revised)
+
+```cuda
+__global__ void megakernel(__launch_bounds__(256, 1)) {
+    int sm_id = blockIdx.x;
+
+    // Each SM walks its own task queue
+    for (int q = 0; q < sm_queue_len[sm_id]; q++) {
+        TaskEntry entry = sm_queue[sm_id][q];
+        int task_id = entry.task_id;
+        int tile_id = entry.tile_id;
+
+        // Wait for dependencies (spin on this task's counter)
+        if (threadIdx.x == 0) {
+            while (atomicAdd(&dep_count[task_id], 0) != 0) {}
+        }
+        __syncthreads();
+
+        // Execute task tile
+        dispatch_task(tasks[task_id], tile_id);
+        __syncthreads();
+
+        // Signal dependents (thread 0 only, after all tiles of this task)
+        if (threadIdx.x == 0 && is_last_tile_of_task(entry)) {
+            for (int i = succ_offset[task_id]; i < succ_offset[task_id+1]; i++) {
+                atomicSub(&dep_count[succ_list[i]], 1);
+            }
+        }
+
+        // Start prefetch for next task's weights
+        if (q + 1 < sm_queue_len[sm_id]) {
+            TaskEntry next = sm_queue[sm_id][q + 1];
+            prefetch_weights_to_smem(next, smem_pages);
+        }
+    }
+}
+```
+
+Key differences from current:
+- No `grid.sync()` anywhere
+- Each SM walks its own private queue — no shared state except dep_count[]
+- Weight prefetch for next task starts before next iteration
+- `dispatch_task` unchanged (same kernels, just invoked differently)
+
+### Host Side
 
 ```
-Host:
-  1. Parse schedule, upload TaskDescs to GPU
-  2. Compute dependency DAG edges, upload dep_counts[] and successor_lists[]
-  3. Allocate arena + pointer array
-  4. Copy weights (first call only, cached)
-  5. Copy inputs to arena (fast path: fp16+contiguous+CUDA → write data_ptr directly)
-  6. cuLaunchCooperativeKernel(megakernel, num_sms, 256, args, smem, stream)
-  7. Read output from arena, clone
-
-Device:
-  Event-driven loop:
-    Pop task from ready queue
-    Dispatch based on op_type
-    Signal dependents via atomics
+1. Parse schedule, build dependency DAG
+2. Run static per-SM assignment (bin-packing)
+3. Plan SMEM page allocation per task per SM
+4. Upload: TaskDescs, sm_queue[], dep_count[], successor_list[], page_plans[]
+5. Allocate arena + pointer array
+6. Copy weights (first call only, cached; pre-transposed for decode)
+7. Copy inputs to arena
+8. cuLaunchCooperativeKernel(megakernel, num_sms, 256, args, smem, stream)
+9. Read output from arena, clone
 ```
-
-### Long-Term (CUDA Graphs integration)
-
-```
-For hybrid architecture:
-  Build CUDA Graph:
-    cuBLAS node → megakernel node → cuBLAS node → megakernel node → ...
-  
-  cuGraphLaunch(graph, stream)
-```
-
-This eliminates ALL launch overhead while using cuBLAS for matmuls.
 
 ### Memory Management
 
-Keep the single-arena approach. It works well:
-- One `cudaMalloc` for all workspace
-- Liveness-based buffer sharing
-- Weight tensors separate (pinned, cached)
-
-Add: pre-transposed weight format for decode (column-major for N-major access).
+Keep single-arena approach for HBM workspace. Add:
+- Pre-transposed weight format for decode (column-major, cached)
+- SMEM page tracking (compile-time assigned, no runtime allocation)
+- Chunked buffer regions for chunked dependencies
 
 ---
 
@@ -999,7 +1197,7 @@ Add: pre-transposed weight format for decode (column-major for N-major access).
 
 1. **No CUDA Graphs baseline.** torch.compile + CUDA Graphs is the real competition.
 2. **No per-task profiling.** Can't identify which tasks are slow.
-3. **No roofline analysis.** Don't know if kernels are compute or memory bound.
+3. **No bandwidth utilization measurement.** Key metric for decode.
 4. **No nsight profiling integration.** Manual CUDA event timing only.
 5. **Benchmark shapes don't match production.** Tests use tiny configs (hidden=64, heads=2).
 
@@ -1007,22 +1205,25 @@ Add: pre-transposed weight format for decode (column-major for N-major access).
 
 ```
 Tier 1: Microbenchmarks (per-kernel)
-  - matmul: M={1,4,16,128,512}, N={1024,4096,11008}, K={1024,4096}
-    Compare: megabake vs cuBLAS vs Triton
+  - skinny matvec: M=1, N={1024,4096,11008}, K={1024,4096}
+    Compare: megabake vs cuBLAS. Measure: bandwidth utilization %.
+  - prefill matmul: M={16,128,512}, N={1024,4096,11008}, K={1024,4096}
+    Compare: each CUTLASS config vs cuBLAS. Measure: TFLOPS achieved.
   - attention: H={8,32}, S_q={1,32,128}, S_k={128,2048,8192}, D={64,128}
-    Compare: megabake vs FlashAttention vs cuDNN
+    Compare: megabake vs FlashAttention-2 vs cuDNN
   - reduce/norm: hidden={768,1024,4096,8192}
     Compare: megabake vs Triton vs apex
 
 Tier 2: Layer benchmarks
-  - Full transformer layer, realistic configs
+  - Full transformer layer, realistic configs (LLaMA-style)
   - Compare: megabake vs torch.compile vs torch.compile+CUDA Graphs
+  - Measure: bandwidth utilization across the layer
 
 Tier 3: Model benchmarks
   - SmolLM2-135M, LLaMA-3.2-1B, LLaMA-3.1-8B, Gemma-2B
-  - Batch sizes: 1, 4, 16, 64
-  - Seq lengths: 1 (decode), 32, 128, 512, 2048
-  - Compare: all backends
+  - Batch sizes: 1, 4
+  - Seq lengths: 1 (decode), 32, 128
+  - Compare: all backends including CUDA Graphs
 
 Tier 4: Production benchmarks
   - Tokens/second throughput
@@ -1032,18 +1233,27 @@ Tier 4: Production benchmarks
 
 ### Per-Kernel Profiling
 
-Add optional timing mode:
 ```cuda
-// In megakernel dispatch loop:
-if (ENABLE_PROFILING && threadIdx.x == 0 && blockIdx.x == 0) {
+if (ENABLE_PROFILING && threadIdx.x == 0) {
     clock_t start = clock64();
-    dispatch_task(task, ...);
+    dispatch_task(task, tile_id);
+    __syncthreads();
     clock_t end = clock64();
-    task_timings[i] = end - start;
+    task_timings[sm_id][q] = end - start;  // per-SM, per-queue-position
 }
 ```
 
-This identifies which tasks are bottlenecks without external profiler overhead.
+### [NEW] Bandwidth Utilization Measurement
+
+```
+For each skinny matmul microbenchmark:
+  bytes_transferred = weight_bytes + input_bytes + output_bytes
+  actual_time = measured latency
+  achieved_bandwidth = bytes_transferred / actual_time
+  utilization = achieved_bandwidth / peak_bandwidth
+  
+  Target: >= 75% utilization
+```
 
 ---
 
@@ -1051,96 +1261,274 @@ This identifies which tasks are bottlenecks without external profiler overhead.
 
 ### For each proposed optimization:
 
-**Optimization 1: Matmul epilogue fusion (bias)**
-- Bottleneck: extra ELEMENTWISE_ADD + barrier per biased linear
-- Hypothesis: fusing bias into matmul epilogue eliminates 1 task + 1 barrier
-- Expected effect: save ~7.5 us per biased linear
-- Predicted speedup: GPT-2 (144 biased linears): 1080 us saved → ~12% improvement
-- Benchmark: compare SmolLM2-135M and GPT-2 before/after
-- Falsification: if latency doesn't decrease by >5 us per eliminated task, the barrier cost assumption is wrong
+**Optimization 1: Skinny matvec fix (float4 + cp.async)**
+- Bottleneck: ~25% bandwidth utilization on M=1 matmul
+- Hypothesis: float4 loads + cp.async prefetch → 70-85% bandwidth utilization
+- Expected effect: M=1 matmul 2-3x faster
+- Predicted speedup: matmul is ~50% of decode time → ~1.5-2x overall
+- Benchmark: standalone matvec M=1, N={1024,4096,11008}, K={1024,4096}. Measure bandwidth utilization %.
+- Falsification: if bandwidth utilization doesn't exceed 60%, the bottleneck is elsewhere (possibly non-coalesced access patterns or bank conflicts)
 
-**Optimization 2: Event-driven scheduler**
-- Bottleneck: ~100 grid.sync() barriers × 2.5 us = 250 us
-- Hypothesis: event-driven eliminates most barriers, enables task overlap
-- Expected effect: save 200-500 us on SmolLM2-135M
-- Predicted speedup: 8844 → ~8300-8600 us (3-6%)
-- Benchmark: A/B test BSP vs event-driven on same schedule
-- Falsification: if atomic contention exceeds barrier savings, net negative
+**Optimization 2: Counter-based sync + static per-SM assignment**
+- Bottleneck: ~250 us barrier cost + ~2000 us SM idle time
+- Hypothesis: per-SM queues eliminate both
+- Expected effect: save 1500-2250 us on SmolLM2-135M
+- Predicted speedup: 8844 → ~6500-7300 us (17-27%)
+- Benchmark: A/B test BSP vs counter-based on same model
+- Falsification: if counter polling creates cache-line bouncing across SMs, net savings < 500 us. Mitigate: pad dep_count[] to cache-line boundaries.
 
-**Optimization 3: Vectorized reductions**
-- Bottleneck: element-by-element fp16 loads → 12.5% of peak bandwidth
-- Hypothesis: float4 loads → 100% bandwidth utilization
-- Expected effect: reduce/norm kernels 2-4x faster
-- Predicted speedup: norms are ~5% of total → overall ~2-4% improvement
-- Benchmark: standalone RMSNorm benchmark, hidden=4096
-- Falsification: if kernel is compute-bound (not bandwidth-bound), vectorization won't help
+**Optimization 3: Weight prefetch overlap (paged SMEM)**
+- Bottleneck: serial load-then-compute execution
+- Hypothesis: cp.async overlap brings bandwidth utilization from 50% to 78%
+- Expected effect: ~1.5x improvement on decode
+- Predicted speedup: stacks with optimization 1-2
+- Benchmark: standalone matmul chain (10 consecutive matmuls) with/without prefetch
+- Falsification: if SMEM pages are too small for weight chunks, or cp.async overhead exceeds savings on small weights
 
-**Optimization 4: Single-pass RMSNorm**
-- Bottleneck: 2 passes over input → 2x bandwidth
-- Hypothesis: cache row in registers, single-pass reduces bandwidth by 2x
-- Expected effect: RMSNorm 2x faster
-- Predicted speedup: norms ~5% of total → ~2.5% overall
-- Benchmark: standalone RMSNorm, row_size={1024,4096,8192}
-- Falsification: if row doesn't fit in registers (row_size > 256 threads × 16 elements = 4096), need SMEM buffer, reducing the gain
-
-**Optimization 5: FlashAttention-style tiled attention with tensor cores**
+**Optimization 4: FlashAttention with tensor cores**
 - Bottleneck: O(seq_k) SMEM, no tensor cores, serial over queries
 - Hypothesis: tiled attention with WGMMA matches FlashAttention performance
 - Expected effect: attention 5-10x faster
 - Predicted speedup: gemma-2b attention is ~40% of runtime → ~2-3x overall improvement
 - Benchmark: standalone attention, H=32, D=128, S_k={128,2048,8192}
-- Falsification: if WGMMA utilization is low due to persistent kernel constraints, gap remains
+- Falsification: if WGMMA utilization is low due to persistent kernel SMEM constraints
+
+**Optimization 5: Vectorized reduce/rope/index + single-pass norm**
+- Bottleneck: element-by-element fp16 loads, multi-pass reductions
+- Hypothesis: float4 loads + single-pass → 2-4x faster on these kernels
+- Expected effect: ~5-8% overall improvement
+- Benchmark: standalone RMSNorm, hidden={1024,4096,8192}
+- Falsification: if these kernels are <3% of total runtime, ROI too low
+
+**Optimization 6: Matmul epilogue fusion (runtime flags)**
+- Bottleneck: extra tasks + syncs per biased linear
+- Hypothesis: fusing bias+act+residual into matmul epilogue eliminates tasks
+- Expected effect: save ~5 us per biased linear (down from ~7.5 us with BSP barriers)
+- Benchmark: models with bias (GPT-2) before/after
+- Falsification: if branch misprediction penalty on epilogue flags exceeds sync savings
 
 ---
 
 ## 15. Progressive Implementation Roadmap
 
-### Stage 1: Quick Wins + CUTLASS Foundation (Weeks 1-3)
+### Stage 1: Quick Wins (Weeks 1-2)
 
 **Changes:**
-- Vectorize reduce/rope/index kernels (float4 loads) — 1 day each
+- Vectorize reduce/rope/index kernels (float4 loads, keep float4 through compute pipeline) — 1 day each
 - Single-pass RMSNorm (cache row in registers, one global memory read) — 2 days
-- Matmul bias epilogue fusion (add bias in-register before store) — 3 days
-- CUTLASS multi-config: compile 5 tile variants into cubin — 1 week
-  - `gemm_64x64_bk32` (small M×N, high SM utilization)
-  - `gemm_64x128_bk32` (rectangular, common MLP shapes)
-  - `gemm_128x128_bk64` (current default, large shapes)
-  - `gemm_128x256_bk64` (very large N)
-  - `gemm_splitk` (M<=4 decode, split K across all SMs with atomic reduction)
-- Compile-time tile selector: score each config per (M,N,K), store config_id in TaskDesc
+- Matmul epilogue fusion (runtime flags: bias+act+residual) — 3 days
+- `__noinline__` on cold task paths (embedding, index, copy) — 0.5 days
+- Consolidate op_types from 12 to 9 — 1 day
 
-**Implementation detail — CUTLASS multi-config:**
+**Expected gain:** SmolLM2-135M from 0.88x to ~0.95-1.0x vs torch.compile
+
+**Risk:** Near-zero. All are isolated kernel improvements.
+
+**Success criteria:**
+- RMSNorm 1.5x+ faster in standalone benchmark
+- reduce/rope/index 2-4x faster
+- Models with bias show measurable improvement
+
+### Stage 2: Skinny Matvec Fix (Weeks 2-3)
+
+**Changes:**
+- Rewrite skinny matmul (M<=4) path:
+  - CUDA-core FMA (no tensor cores)
+  - `float4` vectorized weight loads
+  - `cp.async` prefetch of next weight chunk while computing current
+  - Coalesced access patterns (all warps read consecutive cache lines)
+  - All SMs participate (N-split, as current)
+- Weight pre-transposition to column-major for decode (host-side, cached)
+
+**Implementation sketch:**
 ```cuda
-// In matmul.cu, replace single gemm path with:
-__device__ void dispatch_matmul(const TaskDesc& task, ...) {
-    uint8_t config = task.strides[1];  // tile config ID, set by compiler
-    switch (config) {
-        case 0: gemm_64x64(A, B, C, M, N, K, ...); break;
-        case 1: gemm_64x128(A, B, C, M, N, K, ...); break;
-        case 2: gemm_128x128(A, B, C, M, N, K, ...); break;  // current
-        case 3: gemm_128x256(A, B, C, M, N, K, ...); break;
-        case 4: gemm_splitk(A, B, C, M, N, K, ...); break;
+__device__ void skinny_matvec(const half* A, const half* B, half* C,
+                               int N, int K) {
+    // Each SM processes a chunk of N columns
+    int col_start = blockIdx.x * cols_per_sm;
+    int col_end = min(col_start + cols_per_sm, N);
+
+    for (int col = col_start + threadIdx.x; col < col_end; col += blockDim.x) {
+        float acc = 0.0f;
+
+        // Vectorized weight loading
+        const float4* B_vec = reinterpret_cast<const float4*>(&B[col * K]);
+        const float4* A_vec = reinterpret_cast<const float4*>(A);
+
+        for (int k = 0; k < K / 8; k++) {
+            // cp.async would prefetch next chunk here
+            float4 b = B_vec[k];
+            float4 a = A_vec[k];
+            // FMA on unpacked halves
+            acc += dot8(a, b);
+        }
+
+        C[col] = __float2half(acc);
     }
 }
-// Each gemm_* is a CuTe template instantiation with different BM,BN,BK,STAGES.
-// Same WGMMA/mma.sync instructions. Different tiling.
 ```
+
+**Expected gain:** M=1 matmul from 0.27x to ~0.7-0.85x vs cuBLAS. SmolLM2-135M from ~1.0x to ~1.1-1.2x vs torch.compile.
+
+**Benchmark:** Standalone matvec M=1, N={1024,4096,11008}, K={1024,4096}. Measure bandwidth utilization %.
+
+**Success criteria:**
+- Bandwidth utilization >= 65% on decode shapes
+- `linear_256x512` within 50% of cuBLAS (up from 27%)
+
+### Stage 3: Counter-Based Scheduler (Weeks 4-5)
+
+**Changes:**
+- Build dependency DAG at compile time (graph_walker emits edges)
+- Static per-SM task assignment (bin-packing)
+- Counter-based sync: dep_count[] + successor_list[] in global memory
+- Per-SM task queue arrays uploaded to GPU
+- Remove all grid.sync() calls
+- Keep BSP as `--scheduler=bsp` fallback flag
+
+**Implementation detail — static per-SM assignment:**
+```python
+def assign_tasks_to_sms(tasks, dep_dag, num_sms):
+    sm_queues = [[] for _ in range(num_sms)]
+    sm_load = [0.0] * num_sms  # estimated cycles
+
+    for task in topological_sort(tasks, dep_dag, priority='critical_path'):
+        if task.num_tiles == 1:
+            sm = min(range(num_sms), key=lambda s: sm_load[s])
+            sm_queues[sm].append(task)
+            sm_load[sm] += task.estimated_cycles
+        else:
+            assigned_sms = list(range(min(task.num_tiles, num_sms)))
+            for i, sm in enumerate(assigned_sms):
+                sm_queues[sm].append((task, tile_id=i))
+                sm_load[sm] += task.estimated_cycles / len(assigned_sms)
+
+    return sm_queues
+```
+
+**Expected gain:** Eliminate ~250 us barriers + ~2000 us SM idle time. SmolLM2-135M from ~1.1x to ~1.3-1.5x vs torch.compile.
+
+**Risk:** Counter polling cache-line bouncing. Mitigate: pad dep_count[] entries to 128 bytes (one cache line per counter).
+
+**Success criteria:**
+- >= 500 us saved vs BSP on SmolLM2-135M
+- No numerical regression
+- No deadlocks (validated by comparing output against BSP mode)
+
+### Stage 4: FlashAttention (Weeks 6-8)
+
+**Changes:**
+- Implement FlashAttention-style tiled attention inside megakernel
+- Tensor cores for Q*K^T and Attn*V:
+  - SM90: WGMMA (same atoms as matmul)
+  - SM80: mma.sync (same atoms as matmul)
+- Tile over K in blocks of 64-128 (configurable)
+- Online softmax: maintain running max and sum, rescale on new max
+- `cp.async` prefetch next K/V block during compute
+- GQA-aware tiling: group queries sharing same KV head on same SM
+- O(1) extra SMEM per head (accumulator in registers, K-block in SMEM)
+
+**Implementation sketch:**
+```
+for each query block (Bq):
+    load Q block to SMEM
+    acc = 0, max_old = -inf, sum_old = 0
+    for each key block (Bk):
+        cp.async: prefetch K[Bk+1] to SMEM     ← overlap with compute
+        load K[Bk] from SMEM (already prefetched)
+        S = Q @ K^T   (tensor cores: WGMMA/mma.sync)
+        if causal: mask S
+        max_new = max(max_old, rowmax(S))
+        P = exp(S - max_new)
+        sum_new = sum_old * exp(max_old - max_new) + rowsum(P)
+        load V[Bk] from SMEM
+        acc = acc * exp(max_old - max_new) + P @ V   (tensor cores)
+        max_old, sum_old = max_new, sum_new
+    O = acc / sum_new
+    store O to global memory
+```
+
+**Expected gain:** gemma-2b from 0.49x to ~0.8-1.0x vs torch.compile
+
+**Risk:** FlashAttention inside persistent kernel shares SMEM with matmul. With `__launch_bounds__(256, 1)`, full 228 KB available. FlashAttention needs ~64-96 KB. Fits.
+
+**Success criteria:**
+- attention within 30% of cuDNN FlashAttention at S_k=2048
+- gemma-2b >= 0.8x vs torch.compile
+
+### Stage 5: Paged SMEM + Weight Prefetch (Weeks 9-11)
+
+**Changes:**
+- Divide SMEM into 16 pages of 14 KB each
+- Compiler assigns pages per task per SM
+- Implement weight prefetch overlap:
+  - While computing task N, cp.async loads task N+1's weights into SMEM pages
+  - Released pages immediately available for next task's prefetch
+  - Double-buffering scheme: compute pages + prefetch pages
+- Implement inter-task SMEM handoff:
+  - RMSNorm output written to SMEM page instead of HBM
+  - Next matmul reads from SMEM page (30 cycles vs L2's 200 cycles)
+  - Compiler decides handoff eligibility based on SM assignment + data size
+
+**Implementation detail — paged SMEM lifecycle:**
+```cuda
+// SMEM page management (compile-time assigned, no runtime alloc)
+__shared__ char smem_pool[228 * 1024];  // full SMEM budget
+#define PAGE_SIZE (14 * 1024)
+#define NUM_PAGES 16
+#define PAGE_PTR(p) (&smem_pool[(p) * PAGE_SIZE])
+
+// In main loop:
+for (int q = 0; q < sm_queue_len[sm_id]; q++) {
+    TaskEntry entry = sm_queue[sm_id][q];
+
+    // Weights for THIS task already in pages (prefetched last iteration)
+    wait_for_deps(entry.task_id);
+
+    // Compute using current pages
+    dispatch_task_with_pages(tasks[entry.task_id], entry.tile_id,
+                             entry.compute_pages, entry.handoff_pages);
+
+    signal_dependents(entry.task_id);
+
+    // Prefetch next task's weights into freed pages
+    if (q + 1 < sm_queue_len[sm_id]) {
+        TaskEntry next = sm_queue[sm_id][q + 1];
+        cp_async_prefetch(next.weight_ptr, PAGE_PTR(next.prefetch_pages[0]),
+                          next.weight_bytes);
+    }
+}
+```
+
+**Expected gain:** Decode bandwidth utilization from ~65% (after stage 2) to ~78%. SmolLM2-135M from ~1.3x to ~1.5-1.8x vs torch.compile.
+
+**Risk:** Complexity. SMEM page planning at compile time requires knowing exact data sizes per task per SM. Mitigate: start with weight prefetch only (simpler — always know weight size at compile time). Add inter-task handoff as second step.
+
+**Success criteria:**
+- Bandwidth utilization >= 75% in standalone matvec chain benchmark
+- >= 15% E2E improvement over stage 4
+
+### Stage 6: CUTLASS Prefill Path + Refinements (Weeks 12-14)
+
+**Changes:**
+- CUTLASS multi-config for prefill (M>=16): 3 tile variants (64x128, 128x128, 128x256)
+- Compile-time tile selector (score per shape)
+- Layout propagation (column-major for matmul B)
+- Chunked dependencies for large tasks (from MPK)
 
 **Implementation detail — compile-time tile selector:**
 ```python
-# In tiling.py, replace fixed 128x128:
 TILE_CONFIGS = [
-    (0, 64, 64, 32, 2),    # config_id, BM, BN, BK, stages
-    (1, 64, 128, 32, 2),
-    (2, 128, 128, 64, 3),
-    (3, 128, 256, 64, 3),
+    (0, 64, 128, 32, 2),    # config_id, BM, BN, BK, stages
+    (1, 128, 128, 64, 3),
+    (2, 128, 256, 64, 3),
 ]
 
 def select_matmul_config(M, N, K, num_sms):
     if M <= 4:
-        return SPLITK_CONFIG_ID  # always split-K for decode
-    
-    best_score, best_id = 0, 2  # default to 128x128
+        return SKINNY_MATVEC_ID
+
+    best_score, best_id = 0, 1  # default to 128x128
     for (config_id, BM, BN, BK, stages) in TILE_CONFIGS:
         tiles = math.ceil(M/BM) * math.ceil(N/BN)
         sm_util = min(tiles, num_sms) / num_sms
@@ -1152,158 +1540,33 @@ def select_matmul_config(M, N, K, num_sms):
     return best_id
 ```
 
-**Expected gain:** SmolLM2-135M from 0.88x to ~1.05-1.15x vs torch.compile
-
-**Benchmark:**
-- Matmul microbenchmarks: each config vs cuBLAS across M={1,4,16,128,512}, N={1024,4096,11008}, K={1024,4096}
-- SmolLM2-135M + gemma-2b E2E before/after
-
-**Risk:** Multiple CUTLASS instantiations increase cubin size (~2-3 KB per variant) and compile time (~30s extra). Mitigate: compile once, cache cubin.
-
-**Success criteria:**
-- matmul within 20% of cuBLAS on decode shapes (M<=4)
-- matmul within 30% of cuBLAS on prefill shapes (M=128+)
-- RMSNorm 1.5x+ faster in standalone benchmark
-- Overall SmolLM2-135M >= 1.0x vs torch.compile
-
-### Stage 2: FlashAttention (Weeks 4-6)
-
-**Changes:**
-- Implement FlashAttention-style tiled attention inside megakernel
-- Tensor cores for Q*K^T and Attn*V:
-  - SM90: WGMMA (same atoms as matmul)
-  - SM80: mma.sync (same atoms as matmul)
-- Tile over K in blocks of 64-128 (configurable)
-- Online softmax: maintain running max and sum, rescale on new max
-- O(1) extra SMEM per head (accumulator in registers, K-block in SMEM)
-- GQA support preserved (kv_head = h * num_kv_heads / num_heads)
-
-**Implementation sketch:**
-```
-for each query block (Bq):
-    load Q block to SMEM
-    acc = 0, max_old = -inf, sum_old = 0
-    for each key block (Bk):
-        load K block to SMEM
-        S = Q @ K^T   (tensor cores)     ← WGMMA/mma.sync
-        if causal: mask S
-        max_new = max(max_old, rowmax(S))
-        P = exp(S - max_new)
-        sum_new = sum_old * exp(max_old - max_new) + rowsum(P)
-        acc = acc * exp(max_old - max_new) + P @ V   (tensor cores)
-        max_old, sum_old = max_new, sum_new
-    O = acc / sum_new
-    store O to global memory
-```
-
-**Expected gain:** gemma-2b from 0.49x to ~0.8-1.0x vs torch.compile
-
-**Benchmark:**
-- Standalone attention: H={8,32}, D={64,128}, S_q={1,32}, S_k={128,2048,8192}
-  Compare: megabake vs FlashAttention-2 vs cuDNN
-- gemma-2b E2E
-
-**Risk:** FlashAttention inside persistent kernel shares SMEM with matmul (both need ~64-96 KB). With `__launch_bounds__(256, 1)`, only 1 block/SM, so full SMEM budget available (228 KB on H200). Should fit. If not: dynamically partition SMEM per task type.
-
-**Success criteria:**
-- attention within 30% of cuDNN FlashAttention at S_k=2048
-- gemma-2b >= 0.8x vs torch.compile
-- No regression on SmolLM2-135M
-
-### Stage 3: Event-Driven Scheduler (Weeks 7-9)
-
-**Changes:**
-- Replace BSP grid.sync() with atomic dependency counters + ready queue
-- Build dependency DAG at compile time (graph_walker emits edges)
-- Device-side lock-free FIFO queue in global memory
-- Intra-task barrier only (participating SMs, not full grid)
-- Keep BSP as fallback (compile-time flag)
-
-**Implementation detail — dependency DAG:**
+**Implementation detail — chunked dependencies:**
 ```python
-# In graph_walker.py, after fusion passes:
-# Build adjacency list from buffer producers/consumers
-dep_edges = []
-for i, task in enumerate(tasks):
-    for j, later_task in enumerate(tasks[i+1:], i+1):
-        if buffers_overlap(task.outputs, later_task.inputs):
-            dep_edges.append((i, j))
-
-dep_counts = [0] * num_tasks
-successors = [[] for _ in range(num_tasks)]
-for (src, dst) in dep_edges:
-    dep_counts[dst] += 1
-    successors[src].append(dst)
+# For tasks producing large output (e.g., matmul with many output tiles):
+if task.output_bytes > CHUNK_THRESHOLD:
+    num_chunks = ceil(task.num_tiles / CHUNK_SIZE)
+    for chunk in range(num_chunks):
+        dep_count[(task_id, chunk)] = task.predecessor_count
+        # Successor can start on chunk 0 while producer still on chunk 1+
 ```
 
-**Expected gain:** ~500-1000 us saved on SmolLM2-135M (6-11%)
+**Expected gain:** Prefill matmul within 10-15% of cuBLAS. Chunked deps save ~10-20% on inter-layer transitions.
 
-**Benchmark:** A/B test BSP vs event-driven on same schedule. Both SmolLM2-135M and gemma-2b.
+**Success criteria:**
+- Prefill matmul within 15% of cuBLAS on M=128, N=4096, K=4096
+- No decode regression
 
-**Risk:** Atomic contention, non-determinism, harder debugging. Mitigate: keep BSP as `--scheduler=bsp` flag, add deterministic mode that forces BSP ordering on event-driven queue.
+### Stage 7: Extensions (Weeks 15+)
 
-**Success criteria:** >=200 us saved with no numerical regression, no deadlocks
-
-### Stage 4: CUTLASS Parity Push + Epilogue Fusion (Weeks 10-14)
-
-**Changes:**
-- CUTLASS epilogue fusion: bias + activation + residual add, all in-register
-  - Eliminates 2-6 tasks + barriers per transformer layer
-  - Uses CUTLASS `EpilogueWithVisitor` or custom epilogue functor
-- Split-K with atomic reduction for bandwidth-bound shapes
-- Stream-K for better load balancing across SMs on uneven tile counts
-- Weight pre-transposition: store weights as column-major for decode N-major access
-- Per-shape tuning database: run each config once at compile time, store winner
-
-**Implementation detail — epilogue fusion:**
-```cuda
-// After CUTLASS GEMM accumulation, before store:
-template<bool HasBias, bool HasSiLU, bool HasResidual>
-__device__ void fused_epilogue(float* acc, const __half* bias, 
-                                const __half* residual, __half* out,
-                                int row, int col, int N) {
-    float v = *acc;
-    if constexpr (HasBias)     v += __half2float(bias[col]);
-    if constexpr (HasSiLU)     v *= 1.0f / (1.0f + expf(-v));
-    if constexpr (HasResidual) v += __half2float(residual[row * N + col]);
-    *out = __float2half(v);
-}
-```
-
-Epilogue variant selected by `op_type` + flags in TaskDesc.
-
-**Expected gain:** matmul within 5-10% of cuBLAS → overall ~1.2-1.5x vs torch.compile
-
-**Benchmark:** full matmul shape sweep vs cuBLAS, E2E on all models
-
-**Risk:** Many template instantiations (5 tiles × 8 epilogue combos = 40 kernels). Mitigate: only compile epilogue combos that appear in the model's schedule. Binary size ~100-200 KB extra.
-
-**Success criteria:** matmul within 10% of cuBLAS across all shapes. Models with bias (GPT-2) show >10% E2E improvement from epilogue fusion.
-
-### Stage 5: Advanced Optimizations (Weeks 15-18)
-
-**Changes:**
-- Matmul + residual add fusion (common in transformer: `x = proj(x) + residual`)
-- Cross-task register forwarding for small intermediates (decode only, <8 KB)
-- Layout propagation: column-major output when next consumer is matmul B
-- Cost model integration: all fusion decisions gated by quantitative model
-- CUTLASS 3.x persistent kernel integration (multiple output tiles per CTA)
-
-**Expected gain:** ~1.3-1.6x vs torch.compile on decode workloads
-
-**Risk:** Complexity. Mitigate: cost model prevents unprofitable fusions. Each optimization must show standalone microbenchmark win before integration.
-
-### Stage 6: Production Hardening (Weeks 19-24)
-
-**Changes:**
-- CUDA Graphs integration for hybrid path (prefill/large batch fallback)
-- Shape bucketing for dynamic shapes (compile per bucket, dispatch by shape)
-- BF16 support (CUTLASS already supports, wire through dtype propagation)
-- Comprehensive test coverage (all tile configs, all epilogue combos)
-- Per-task profiling infrastructure (clock64 timing per task, exportable)
-- nsight Systems/Compute integration guide
-
-**Expected gain:** Reliability and production readiness. No raw performance change.
+**Changes (prioritized):**
+1. INT8 weight-only quantization (from Ada-MK) — 1-2 weeks
+   - INT8 weights + FP16 scale per group
+   - Dequant in registers during matmul (free — compute is idle on decode)
+   - Halves weight memory traffic = ~2x decode speedup
+2. Hybrid cuBLAS + CUDA Graphs for prefill — 3-4 weeks
+3. BF16 support — 1 week
+4. Shape bucketing for dynamic shapes — 1-2 weeks
+5. Multi-GPU tensor parallelism — long-term
 
 ---
 
@@ -1311,40 +1574,47 @@ Epilogue variant selected by `op_type` + flags in TaskDesc.
 
 | Priority | Change | Effort | Expected Impact | ROI | Stage |
 |----------|--------|--------|----------------|-----|-------|
-| 1 | Vectorize reduce/rope/index (float4 loads) | 1 day | 2-4% overall | Very high | 1 |
+| 1 | Vectorize reduce/rope/index (float4 pipeline) | 3 days | 5-8% overall | Very high | 1 |
 | 2 | Single-pass RMSNorm | 2 days | 2-3% overall | Very high | 1 |
-| 3 | Matmul bias epilogue fusion | 3 days | 5-12% on biased models | High | 1 |
-| 4 | CUTLASS multi-config autotuning (5 tile variants) | 1 week | 10-30% on matmul | High | 1 |
-| 5 | Compile-time tile selector (score per shape) | 2 days | Enables #4 | High | 1 |
-| 6 | FlashAttention with tensor cores | 2-3 weeks | 2-5x on attention | High | 2 |
-| 7 | Event-driven scheduler | 2 weeks | 6-11% overall | Medium | 3 |
-| 8 | CUTLASS epilogue fusion (bias+act+residual) | 1-2 weeks | 5-12% on transformers | High | 4 |
-| 9 | Split-K matmul with atomic reduction | 1 week | 10-20% on decode | Medium | 4 |
-| 10 | Weight pre-transposition (col-major for decode) | 2 days | 5-10% on decode | Medium | 4 |
-| 11 | Stream-K load balancing | 1 week | 5-10% on uneven tile counts | Medium | 4 |
-| 12 | Matmul residual-add epilogue | 1 week | 3-5% overall | Medium | 5 |
-| 13 | Hybrid cuBLAS + CUDA Graphs (prefill fallback) | 3-4 weeks | 1.0x cuBLAS on prefill | Strategic | 6 |
+| 3 | Matmul epilogue fusion (runtime flags) | 3 days | 5-12% on biased models | High | 1 |
+| 4 | __noinline__ cold paths + consolidate op_types | 1.5 days | 2-5% I-cache improvement | High | 1 |
+| 5 | Fix skinny matvec (float4 + cp.async) | 1 week | 2-3x on M=1 matmul, biggest single unlock | Very high | 2 |
+| 6 | Weight pre-transposition (col-major for decode) | 2 days | 10-20% on decode matvec | High | 2 |
+| 7 | Counter-based sync (replace grid.sync) | 1 week | Eliminate ~250 us barriers | High | 3 |
+| 8 | Static per-SM task assignment | 1 week | Eliminate ~2000 us SM idle | Very high | 3 |
+| 9 | FlashAttention with tensor cores + KV prefetch | 2-3 weeks | 2-5x on attention | High | 4 |
+| 10 | Paged SMEM + weight prefetch overlap | 2 weeks | 50% to 78% BW utilization | Very high | 5 |
+| 11 | Inter-task SMEM handoff | 1 week | ~7 us latency savings | Medium | 5 |
+| 12 | CUTLASS multi-config (prefill, 3 tiles) | 2 weeks | 1.5-3x on prefill matmul | High | 6 |
+| 13 | Chunked dependencies | 1 week | 10-20% on inter-layer transitions | Medium | 6 |
+| 14 | INT8 weight-only quantization | 1-2 weeks | ~2x decode (halve weight traffic) | Very high | 7 |
+| 15 | Hybrid cuBLAS + CUDA Graphs (prefill) | 3-4 weeks | 1.0x cuBLAS on prefill | Strategic | 7 |
 
 **Execution order:**
-- **This week:** #1, #2, #3 (easy wins, near-zero risk, compound with everything later)
-- **Weeks 2-3:** #4, #5 (CUTLASS multi-config — the single biggest unlock for GEMM quality inside the megakernel. Uses the same WGMMA/mma.sync instructions as cuBLAS. Closes 70-80% of the GEMM gap without leaving the pure megakernel architecture.)
-- **Weeks 4-6:** #6 (FlashAttention — biggest single-item impact for real models)
-- **Weeks 7-9:** #7 (event-driven scheduler — multiplicative with all GEMM improvements)
-- **Weeks 10-14:** #8-11 (CUTLASS parity push — the long tail to match cuBLAS within 5-10%)
-- **Weeks 15+:** #12-13 (advanced fusion, hybrid path for prefill)
+- **Weeks 1-2:** #1-4 (quick wins, near-zero risk, compound with everything later)
+- **Weeks 2-3:** #5-6 (skinny matvec fix — single biggest decode unlock)
+- **Weeks 4-5:** #7-8 (counter-based scheduler — multiplicative with all other gains)
+- **Weeks 6-8:** #9 (FlashAttention — biggest single-item impact for multi-head models)
+- **Weeks 9-11:** #10-11 (paged SMEM + prefetch — pushes bandwidth utilization to Hazy levels)
+- **Weeks 12-14:** #12-13 (CUTLASS prefill path + chunked dependencies)
+- **Weeks 15+:** #14-15 (quantization, hybrid prefill)
 
 ---
 
 ## Key Conclusions
 
-1. **GEMM quality is the bottleneck.** Not fusion, not scheduling, not the megakernel concept. Your matmul is 3-5x slower than cuBLAS on many shapes. Fix this first or the megakernel concept can never win.
+1. **[REVISED] Bandwidth utilization is the bottleneck, not GEMM compute.** For M=1 decode, tensor cores are irrelevant (arithmetic intensity = 1 FLOP/byte). The gap is megabake achieving ~25% of peak HBM bandwidth vs cuBLAS at ~85%. Fix: vectorized loads + prefetch overlap.
 
-2. **2x over torch.compile is achievable** on batch-1 decode without CUDA Graphs, IF matmul quality reaches parity with cuBLAS. The math: eliminate 433 kernel launches × 5 us = 2165 us saved, minus ~298 us megakernel overhead = ~1867 us net advantage on a 7802 us baseline = 1.31x from launch savings alone. Add fusion savings and the number climbs to 1.5-2x.
+2. **[REVISED] The megakernel advantage is NOT just launch overhead.** It is continuous memory streaming (no bubbles), cross-task weight prefetch (cp.async overlap), and SMEM handoff (skip HBM round-trips). Evidence: Hazy achieves 2.5x over vLLM (which uses CUDA Graphs). MPK achieves 1.0-1.7x over SGLang (which uses CUDA Graphs).
 
-3. **2x over torch.compile + CUDA Graphs is very unlikely.** CUDA Graphs eliminates the launch overhead advantage. What remains is L2 reuse (worth ~1 us for decode) and fusion savings (~100-200 us). Not enough.
+3. **[REVISED] 2x over torch.compile + CUDA Graphs IS achievable.** The original analysis said "very unlikely." This was wrong because it only considered launch overhead elimination. With prefetch overlap and SMEM handoff, the persistent megakernel has advantages that CUDA Graphs cannot replicate.
 
-4. **The attention kernel must be rewritten.** No tensor cores + materialized scores + serial query loop = 5-10x slower than FlashAttention. This is the single biggest gap on real models.
+4. **[REVISED] Pure megakernel over hybrid for decode.** The original analysis recommended hybrid (cuBLAS for matmul). This breaks the persistent execution model and loses prefetch/SMEM advantages. Pure megakernel with fixed skinny matvec is better. Hybrid is only for compute-bound prefill (M>=32).
 
-5. **The megakernel concept is sound for decode.** Batch-1, single-token decode is the sweet spot: all operations are memory-bound, intermediates trivially fit in L2, and launch overhead is a significant fraction of total time. This is the right market to target.
+5. **The attention kernel must be rewritten.** No tensor cores + materialized scores + serial query loop = 5-10x slower than FlashAttention. This is the single biggest gap on real models. Unchanged from original analysis.
 
-6. **Don't fight cuBLAS on prefill.** For batch>=32 or seq>=512, the matmul is compute-bound and cuBLAS's autotuned tensor core utilization is unbeatable without years of engineering. Use hybrid architecture for prefill.
+6. **[REVISED] SMEM handoff IS worthwhile.** The original Tier 4 verdict ("L2 handles it") was wrong. It measured bandwidth (minimal savings) but missed latency accumulation (170 cycles × 60 norms = ~7 us). More importantly, paged SMEM is REQUIRED for weight prefetch overlap — handoff comes free once the infrastructure exists.
+
+7. **[REVISED] Counter-based sync, not atomic ready queue.** The original event-driven proposal with global atomic queue creates 32-way contention. Both Hazy and MPK use per-dependency counters with static per-SM assignment. Zero cross-SM contention.
+
+8. **[NEW] The megakernel concept is validated by state-of-the-art research.** Hazy Research (Stanford), MPK/Mirage (CMU/Microsoft), and Ada-MK (ByteDance) all independently demonstrate megakernel advantages on transformer inference. Megabake's competitive advantage is developer experience: `pip install megabake`, seconds compilation, torch.export integration, HuggingFace Hub distribution. Not raw performance vs hand-tuned Llama-only systems.
