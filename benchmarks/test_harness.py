@@ -18,29 +18,12 @@ import torch
 import torch.nn as nn
 import torch.profiler
 
-
-# ---------------------------------------------------------------------------
-# Model wrapper for HF causal LMs (returns logits tensor only)
-# ---------------------------------------------------------------------------
-
-class _CausalLMWrapper(nn.Module):
-    """Wrap a CausalLM so forward() returns a plain logits tensor.
-
-    Calls the base model + lm_head directly to avoid graph breaks
-    in transformers v5's CausalLM.forward (slice_indices issue).
-    """
-    def __init__(self, hf_model):
-        super().__init__()
-        self.base_model = hf_model.model
-        self.lm_head = hf_model.lm_head
-
-    def forward(self, input_ids):
-        hidden = self.base_model(input_ids, use_cache=False).last_hidden_state
-        return self.lm_head(hidden)
+from megabake.integrations.transformers import _CausalLMWrapper
+from megabake.schedule_compiler.graph_walker import _decompose
 
 
 # ---------------------------------------------------------------------------
-# Built-in models (self-contained, no imports from models.py)
+# Built-in smoke-test models
 # ---------------------------------------------------------------------------
 
 def _cuda_half(shape):
@@ -57,112 +40,10 @@ class _MLPSiLU(nn.Module):
         return self.fc2(torch.nn.functional.silu(self.fc1(x)))
 
 
-class _MLPGeLU(nn.Module):
-    def __init__(self, dim=128, hidden=256):
-        super().__init__()
-        self.fc1 = nn.Linear(dim, hidden, bias=False)
-        self.fc2 = nn.Linear(hidden, dim, bias=False)
-
-    def forward(self, x):
-        return self.fc2(torch.nn.functional.gelu(self.fc1(x)))
-
-
-class _ThreeLayerMLP(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc1 = nn.Linear(64, 128, bias=False)
-        self.fc2 = nn.Linear(128, 128, bias=False)
-        self.fc3 = nn.Linear(128, 64, bias=False)
-
-    def forward(self, x):
-        x = torch.nn.functional.relu(self.fc1(x))
-        x = torch.nn.functional.silu(self.fc2(x))
-        return self.fc3(x)
-
-
-class _RMSNormMLP(nn.Module):
-    def __init__(self, dim=256, hidden=512):
-        super().__init__()
-        self.norm = nn.RMSNorm(dim)
-        self.fc1 = nn.Linear(dim, hidden, bias=False)
-        self.fc2 = nn.Linear(hidden, dim, bias=False)
-
-    def forward(self, x):
-        x = self.norm(x)
-        return self.fc2(torch.nn.functional.silu(self.fc1(x)))
-
-
-class _LNBlock(nn.Module):
-    def __init__(self, dim=128, hidden=256):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.fc1 = nn.Linear(dim, hidden, bias=False)
-        self.fc2 = nn.Linear(hidden, dim, bias=False)
-
-    def forward(self, x):
-        x = self.norm(x)
-        return self.fc2(torch.nn.functional.gelu(self.fc1(x)))
-
-
-class _LlamaLayerWrapper(nn.Module):
-    def __init__(self, layer):
-        super().__init__()
-        self.layer = layer
-
-    def forward(self, hidden_states, cos, sin):
-        return self.layer(hidden_states, position_embeddings=(cos, sin))
-
-
-def _make_llama_decoder():
-    from transformers import LlamaConfig
-    from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-
-    config = LlamaConfig(
-        hidden_size=64, intermediate_size=128, num_hidden_layers=1,
-        num_attention_heads=2, num_key_value_heads=2,
-        max_position_embeddings=32, vocab_size=256, rms_norm_eps=1e-5,
-        attn_implementation="sdpa",
-    )
-    layer = LlamaDecoderLayer(config, layer_idx=0).cuda().half().eval()
-    return _LlamaLayerWrapper(layer)
-
-
 BUILT_IN = {
-    "linear_256x512": (
-        lambda: nn.Linear(256, 512, bias=False).cuda().half().eval(),
-        lambda: (_cuda_half((1, 256)),),
-    ),
-    "linear_512x1024": (
-        lambda: nn.Linear(512, 1024, bias=False).cuda().half().eval(),
-        lambda: (_cuda_half((4, 512)),),
-    ),
     "mlp_silu": (
         lambda: _MLPSiLU().cuda().half().eval(),
         lambda: (_cuda_half((1, 256)),),
-    ),
-    "mlp_gelu": (
-        lambda: _MLPGeLU().cuda().half().eval(),
-        lambda: (_cuda_half((2, 128)),),
-    ),
-    "mlp_3layer": (
-        lambda: _ThreeLayerMLP().cuda().half().eval(),
-        lambda: (_cuda_half((1, 64)),),
-    ),
-    "rmsnorm_mlp": (
-        lambda: _RMSNormMLP().cuda().half().eval(),
-        lambda: (_cuda_half((1, 256)),),
-    ),
-    "layernorm_mlp": (
-        lambda: _LNBlock().cuda().half().eval(),
-        lambda: (_cuda_half((2, 128)),),
-    ),
-    "llama_decoder": (
-        _make_llama_decoder,
-        lambda: (
-            _cuda_half((1, 8, 64)),
-            torch.ones(1, 8, 32, device="cuda", dtype=torch.float16),
-            torch.zeros(1, 8, 32, device="cuda", dtype=torch.float16),
-        ),
     ),
 }
 
@@ -335,18 +216,10 @@ def run_eager(model, inputs, warmup, iters, **_) -> Result:
 
 
 def _compile_via_export(model, inputs):
-    """Export the model then compile via inductor — avoids dynamo graph breaks
-    on HF transformers v5 output classes."""
+    """Export then compile via inductor — avoids dynamo graph breaks on HF v5."""
     from torch.export import export
-    decomp_table = torch._decomp.core_aten_decompositions()
-    for op in [
-        torch.ops.aten.scaled_dot_product_attention.default,
-        torch.ops.aten.silu.default,
-        torch.ops.aten.gelu.default,
-    ]:
-        decomp_table.pop(op, None)
     ep = export(model, inputs, strict=False)
-    ep = ep.run_decompositions(decomp_table)
+    ep = _decompose(ep)
     return torch.compile(ep.module(), backend="inductor")
 
 
