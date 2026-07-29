@@ -392,7 +392,7 @@ def _eliminate_redundant_copies(
     return result
 
 
-def _constant_fold(ep, model):
+def _constant_fold(ep, model=None):
     """Evaluate graph nodes that don't depend on user inputs.
 
     Returns a dict mapping node name → Tensor for every constant node
@@ -403,9 +403,12 @@ def _constant_fold(ep, model):
     graph = ep.graph_module.graph
     sig = ep.graph_signature
 
-    # Gather actual parameter/buffer values
-    sd = model.state_dict()
-    named_bufs = dict(model.named_buffers())
+    if model is not None:
+        sd = model.state_dict()
+        named_bufs = dict(model.named_buffers())
+    else:
+        sd = dict(ep.state_dict)
+        named_bufs = dict(ep.named_buffers())
 
     user_inputs: set[str] = set()
     node_values: dict[str, object] = {}
@@ -764,6 +767,18 @@ def _find_rope_patterns(graph):
     return patterns
 
 
+def _decompose(ep):
+    decomp_table = torch._decomp.core_aten_decompositions()
+    preserve_ops = [
+        torch.ops.aten.scaled_dot_product_attention.default,
+        torch.ops.aten.silu.default,
+        torch.ops.aten.gelu.default,
+    ]
+    for op in preserve_ops:
+        decomp_table.pop(op, None)
+    return ep.run_decompositions(decomp_table)
+
+
 def compile_model(
     model: torch.nn.Module,
     example_input,
@@ -778,18 +793,25 @@ def compile_model(
     else:
         example_args = tuple(example_input)
 
-    decomp_table = torch._decomp.core_aten_decompositions()
-    preserve_ops = [
-        torch.ops.aten.scaled_dot_product_attention.default,
-        torch.ops.aten.silu.default,
-        torch.ops.aten.gelu.default,
-    ]
-    for op in preserve_ops:
-        decomp_table.pop(op, None)
-
     ep = export(model, example_args, strict=False)
-    ep = ep.run_decompositions(decomp_table)
+    ep = _decompose(ep)
 
+    return compile_from_ep(
+        ep, sm_version,
+        dtype=dtype, batch_range=batch_range, seq_range=seq_range,
+        num_sms=num_sms, model=model,
+    )
+
+
+def compile_from_ep(
+    ep,
+    sm_version: int,
+    dtype: torch.dtype = torch.float16,
+    batch_range: tuple[int, int] = (1, 1),
+    seq_range: tuple[int, int] = (1, 2048),
+    num_sms: int = 0,
+    model: torch.nn.Module | None = None,
+) -> CompiledModel:
     folded_constants = _constant_fold(ep, model)
 
     graph = ep.graph_module.graph
