@@ -93,6 +93,29 @@ python benchmarks/bench_compare.py --models mlp_silu,llama_decoder
 python benchmarks/bench_compare.py --backend megabake
 ```
 
+## Per-task profiling
+
+Profile cycle-level timing for every task inside the megakernel — see which ops dominate, SM utilization per task, and barrier overhead:
+
+```bash
+python benchmarks/test_harness.py mlp_silu --task-profile
+python benchmarks/test_harness.py llama_decoder --task-profile
+python benchmarks/test_harness.py HuggingFaceTB/SmolLM2-135M --mode decode --task-profile
+```
+
+Output shows per-task breakdown (median/max cycles, active/idle SMs, barrier wait) and a summary grouped by op type. Results auto-save to `benchmarks/baselines/<model>_profile.json`.
+
+Profiling can also be used from Python directly:
+
+```python
+import megabake
+from megabake.runtime.profiler import profile_model, analyze, print_report
+
+compiled = megabake.compile(model, x)
+tasks, cycles = profile_model(compiled, model, x)
+print_report(analyze(tasks, cycles), num_sms=32)
+```
+
 ## Run tests
 
 ```bash
@@ -131,6 +154,7 @@ src/
       cuda_compiler.py         # nvcc compilation pipeline
       launcher.py              # cuLaunchCooperativeKernel
       loader.py                # Schedule loading + cached execution
+      profiler.py              # Per-task cycle-level profiling
 benchmarks/
   bench_compare.py             # megabake vs torch.compile harness
   models.py                    # Benchmark workload definitions

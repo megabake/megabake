@@ -75,6 +75,7 @@ class _CachedRunner:
         compiled: CompiledModel,
         state_dict: dict[str, torch.Tensor],
         inputs: list[torch.Tensor],
+        task_timings_ptr: int = 0,
     ) -> torch.Tensor:
         if self._compiled_id != id(compiled):
             self._setup(compiled, state_dict)
@@ -103,6 +104,7 @@ class _CachedRunner:
             self._ptr_tensor.data_ptr(),
             self._d_dyn_dims.data_ptr(),
             self._num_sms,
+            task_timings_ptr=task_timings_ptr,
         )
 
         numel = 1
@@ -121,5 +123,6 @@ def execute_model(
     state_dict: dict[str, torch.Tensor],
     inputs: list[torch.Tensor],
     num_sms: int | None = None,  # noqa: ARG001
+    task_timings_ptr: int = 0,
 ) -> torch.Tensor:
-    return _runner.run(compiled, state_dict, inputs)
+    return _runner.run(compiled, state_dict, inputs, task_timings_ptr=task_timings_ptr)

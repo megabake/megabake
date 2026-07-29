@@ -77,6 +77,7 @@ def run(
     compiled: CompiledModel,
     model_or_state_dict,
     *inputs: torch.Tensor,
+    task_timings_ptr: int = 0,
 ) -> torch.Tensor:
     if isinstance(model_or_state_dict, dict):
         sd = model_or_state_dict
@@ -90,4 +91,4 @@ def run(
                     sd[name] = buf
             _cached_state_dict[model_id] = sd
         sd = _cached_state_dict[model_id]
-    return execute_model(compiled, sd, list(inputs))
+    return execute_model(compiled, sd, list(inputs), task_timings_ptr=task_timings_ptr)

@@ -5,3 +5,4 @@ __pycache__/
 .agents/
 .pytest_cache/
 skills-lock.json
+benchmarks/baselines/
