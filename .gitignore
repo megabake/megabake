@@ -4,5 +4,4 @@ __pycache__/
 *.egg-info/
 .agents/
 .pytest_cache/
-PLAN.md
 skills-lock.json
