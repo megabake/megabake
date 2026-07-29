@@ -135,6 +135,7 @@ def _launch_cooperative(
     d_buffers_ptr: int,
     d_dyn_dims_ptr: int,
     num_sms: int,
+    task_timings_ptr: int = 0,
 ):
     """Launch megakernel via cuLaunchCooperativeKernel."""
     _load_module()
@@ -154,12 +155,14 @@ def _launch_cooperative(
     arg_num_tasks = ctypes.c_int(num_tasks)
     arg_buffers = ctypes.c_void_p(d_buffers_ptr)
     arg_dyn_dims = ctypes.c_void_p(d_dyn_dims_ptr)
+    arg_timings = ctypes.c_void_p(task_timings_ptr)
 
-    args = (ctypes.c_void_p * 4)(
+    args = (ctypes.c_void_p * 5)(
         ctypes.cast(ctypes.pointer(arg_tasks), ctypes.c_void_p),
         ctypes.cast(ctypes.pointer(arg_num_tasks), ctypes.c_void_p),
         ctypes.cast(ctypes.pointer(arg_buffers), ctypes.c_void_p),
         ctypes.cast(ctypes.pointer(arg_dyn_dims), ctypes.c_void_p),
+        ctypes.cast(ctypes.pointer(arg_timings), ctypes.c_void_p),
     )
 
     stream = torch.cuda.current_stream().cuda_stream

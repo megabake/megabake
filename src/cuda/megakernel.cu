@@ -1,6 +1,14 @@
 #include <cooperative_groups.h>
 #include "data_types.cuh"
 
+#define PROFILE_TASK_BEGIN(timings) \
+    long long _prof_t0 = 0; \
+    if ((timings) && threadIdx.x == 0) _prof_t0 = clock64();
+
+#define PROFILE_TASK_END(task_idx, sm_id, timings, grid_dim) \
+    if ((timings) && threadIdx.x == 0) \
+        (timings)[(task_idx) * (grid_dim) + (sm_id)] = clock64() - _prof_t0;
+
 // Task function declarations
 __device__ void task_matmul(const TaskDesc& task, void** buffers,
                             const int* dyn_dims, int tile_id);
@@ -45,7 +53,8 @@ __global__ void __launch_bounds__(256, 1) megakernel(
     const TaskDesc* __restrict__ tasks,
     int num_tasks,
     void** __restrict__ buffers,
-    const int* __restrict__ dyn_dims
+    const int* __restrict__ dyn_dims,
+    long long* task_timings
 ) {
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
@@ -55,9 +64,13 @@ __global__ void __launch_bounds__(256, 1) megakernel(
     for (int i = 0; i < num_tasks; i++) {
         const TaskDesc& task = tasks[i];
 
+        PROFILE_TASK_BEGIN(task_timings);
+
         if (sm_id < static_cast<int>(task.num_tiles)) {
             dispatch_task(task, buffers, dyn_dims, sm_id);
         }
+
+        PROFILE_TASK_END(i, sm_id, task_timings, gridDim.x);
 
         grid.sync();
     }

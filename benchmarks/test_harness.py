@@ -432,6 +432,22 @@ def print_results(results: list[Result], display_name: str, model: nn.Module,
 # Main
 # ---------------------------------------------------------------------------
 
+def _run_task_profile(model, inputs, model_name):
+    import megabake
+    from megabake.runtime.profiler import profile_model, analyze, print_report, save_json
+
+    example = inputs[0] if len(inputs) == 1 else tuple(inputs)
+    compiled = megabake.compile(model, example)
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+
+    tasks, cycles = profile_model(compiled, model, *inputs)
+    stats = analyze(tasks, cycles)
+    print_report(stats, num_sms)
+
+    name = model_name.replace("/", "_")
+    save_json(stats, f"benchmarks/baselines/{name}_profile.json")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Megabake test harness: benchmark any model",
@@ -453,6 +469,10 @@ def main():
     parser.add_argument(
         "--backends", type=str, default="eager,torch.compile,megabake",
         help="Comma-separated backends (default: eager,torch.compile,megabake)",
+    )
+    parser.add_argument(
+        "--task-profile", action="store_true",
+        help="Per-task cycle-level profiling inside the megakernel",
     )
     args = parser.parse_args()
 
@@ -483,6 +503,10 @@ def main():
 
     print(f"Loading model: {args.model} ...")
     model, inputs, display_name = load_model(args.model, batch_size, seq_len)
+
+    if args.task_profile:
+        _run_task_profile(model, inputs, args.model)
+        return
 
     eager_ref = None
     results: list[Result] = []
