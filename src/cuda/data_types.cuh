@@ -120,3 +120,45 @@ struct ScheduleHeader {
     uint16_t compute_dtype;
     uint16_t _padding;
 };
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    return val;
+}
+
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+    return val;
+}
+
+__device__ __forceinline__ float block_reduce_sum(float val, float* smem) {
+    const int lane = threadIdx.x & 31;
+    const int wid  = threadIdx.x >> 5;
+    val = warp_reduce_sum(val);
+    if (lane == 0) smem[wid] = val;
+    __syncthreads();
+    if (wid == 0) {
+        val = (threadIdx.x < (blockDim.x >> 5)) ? smem[threadIdx.x] : 0.0f;
+        val = warp_reduce_sum(val);
+        if (lane == 0) smem[0] = val;
+    }
+    __syncthreads();
+    return smem[0];
+}
+
+__device__ __forceinline__ float block_reduce_max(float val, float* smem) {
+    const int lane = threadIdx.x & 31;
+    const int wid  = threadIdx.x >> 5;
+    val = warp_reduce_max(val);
+    if (lane == 0) smem[wid] = val;
+    __syncthreads();
+    if (wid == 0) {
+        val = (threadIdx.x < (blockDim.x >> 5)) ? smem[threadIdx.x] : -1e30f;
+        val = warp_reduce_max(val);
+        if (lane == 0) smem[0] = val;
+    }
+    __syncthreads();
+    return smem[0];
+}

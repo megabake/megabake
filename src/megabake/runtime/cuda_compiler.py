@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-import torch
+from megabake.runtime import get_sm_version
 
 _CUDA_SRC_DIR = Path(__file__).resolve().parent.parent.parent / "cuda"
 _COMPILED_CACHE: dict[str, str] = {}
@@ -15,11 +15,6 @@ if not _CUTLASS_INCLUDE.exists():
     _env = os.environ.get("CUTLASS_PATH")
     if _env:
         _CUTLASS_INCLUDE = Path(_env) / "include"
-
-
-def _get_sm_version() -> int:
-    props = torch.cuda.get_device_properties(0)
-    return props.major * 10 + props.minor
 
 
 def _compile_megakernel(force: bool = False, portable: bool = False) -> str:
@@ -80,7 +75,7 @@ def _compile_megakernel(force: bool = False, portable: bool = False) -> str:
 
     combined_src.write_text(combined)
 
-    sm = _get_sm_version()
+    sm = get_sm_version()
 
     if portable:
         out_path = str(build_dir / "megakernel.fatbin")

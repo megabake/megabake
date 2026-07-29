@@ -6,6 +6,7 @@ import ctypes.util
 import torch
 
 from megabake.data_types import TaskDesc
+from megabake.runtime import get_sm_version
 from megabake.runtime.cuda_compiler import get_megakernel_cubin
 
 
@@ -28,11 +29,6 @@ def _init_driver():
         raise RuntimeError(f"cuInit failed with error {err}")
 
 
-def _get_sm_version() -> int:
-    props = torch.cuda.get_device_properties(0)
-    return props.major * 10 + props.minor
-
-
 def _load_module():
     global _module, _kernel
     if _module is not None:
@@ -53,7 +49,7 @@ def _load_module():
     if err != 0:
         raise RuntimeError(f"cuModuleGetFunction failed with error {err}")
 
-    if _get_sm_version() >= 90:
+    if get_sm_version() >= 90:
         CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8
         err = _cuda_driver.cuFuncSetAttribute(
             _kernel,
@@ -143,7 +139,7 @@ def _launch_cooperative(
     """Launch megakernel via cuLaunchCooperativeKernel."""
     _load_module()
 
-    if _get_sm_version() >= 90:
+    if get_sm_version() >= 90:
         smem_bytes = 102400
     else:
         default_smem = ctypes.c_int()

@@ -71,5 +71,3 @@ ATEN_OP_MAP: dict[object, tuple[int, int] | str] = {
     torch.ops.aten.split.Tensor:           "STRIDE_CHANGE",
     torch.ops.aten.unbind.int:             "STRIDE_CHANGE",
 }
-
-SHAPE_OPS = {k for k, v in ATEN_OP_MAP.items() if v == "STRIDE_CHANGE"}

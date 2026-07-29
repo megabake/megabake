@@ -20,9 +20,6 @@ dev = [
     "transformers>=4.40",
 ]
 
-[project.scripts]
-megabake = "megabake.cli:main"
-
 [tool.setuptools.packages.find]
 where = ["src"]
 

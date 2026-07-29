@@ -1,48 +1,6 @@
 #include "../data_types.cuh"
 #include <cuda_fp16.h>
 
-__device__ __forceinline__ float attn_warp_reduce_sum(float val) {
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
-    return val;
-}
-
-__device__ __forceinline__ float attn_warp_reduce_max(float val) {
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
-    return val;
-}
-
-__device__ __forceinline__ float attn_block_reduce_sum(float val, float* smem) {
-    const int lane = threadIdx.x & 31;
-    const int wid  = threadIdx.x >> 5;
-    val = attn_warp_reduce_sum(val);
-    if (lane == 0) smem[wid] = val;
-    __syncthreads();
-    if (wid == 0) {
-        val = (threadIdx.x < (blockDim.x >> 5)) ? smem[threadIdx.x] : 0.0f;
-        val = attn_warp_reduce_sum(val);
-        if (lane == 0) smem[0] = val;
-    }
-    __syncthreads();
-    return smem[0];
-}
-
-__device__ __forceinline__ float attn_block_reduce_max(float val, float* smem) {
-    const int lane = threadIdx.x & 31;
-    const int wid  = threadIdx.x >> 5;
-    val = attn_warp_reduce_max(val);
-    if (lane == 0) smem[wid] = val;
-    __syncthreads();
-    if (wid == 0) {
-        val = (threadIdx.x < (blockDim.x >> 5)) ? smem[threadIdx.x] : -1e30f;
-        val = attn_warp_reduce_max(val);
-        if (lane == 0) smem[0] = val;
-    }
-    __syncthreads();
-    return smem[0];
-}
-
 __device__ void task_attention(const TaskDesc& task, void** buffers,
                                const int* dyn_dims, int tile_id) {
     __half* out = (__half*)buffers[task.buffer_indices[0]];
@@ -122,7 +80,7 @@ __device__ void task_attention(const TaskDesc& task, void** buffers,
             for (uint32_t sk = threadIdx.x; sk < seq_k; sk += blockDim.x) {
                 max_score = fmaxf(max_score, smem[sk]);
             }
-            float row_max = attn_block_reduce_max(max_score, warp_scratch);
+            float row_max = block_reduce_max(max_score, warp_scratch);
 
             // --- Softmax: exp and sum ---
             float sum_exp = 0.0f;
@@ -131,7 +89,7 @@ __device__ void task_attention(const TaskDesc& task, void** buffers,
                 smem[sk] = e;
                 sum_exp += e;
             }
-            float inv_sum = 1.0f / attn_block_reduce_sum(sum_exp, warp_scratch);
+            float inv_sum = 1.0f / block_reduce_sum(sum_exp, warp_scratch);
 
             // --- Normalize attention weights ---
             for (uint32_t sk = threadIdx.x; sk < seq_k; sk += blockDim.x) {

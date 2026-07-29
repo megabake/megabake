@@ -1,6 +1,5 @@
 """Load a compiled schedule and execute it through the megakernel."""
 
-import numpy as np
 import torch
 
 from megabake.schedule_compiler.graph_walker import CompiledModel
@@ -63,11 +62,8 @@ class _CachedRunner:
         for buf_id, tensor in self._weight_tensors.items():
             ptrs[buf_id] = tensor.data_ptr()
 
-        # Fast task bytes upload via numpy
         task_bytes = b"".join(t.to_bytes() for t in tasks)
-        self._d_tasks = torch.from_numpy(
-            np.frombuffer(task_bytes, dtype=np.uint8).copy()
-        ).cuda()
+        self._d_tasks = torch.frombuffer(bytearray(task_bytes), dtype=torch.uint8).cuda()
 
         self._ptr_tensor = torch.tensor(ptrs, dtype=torch.int64, device="cuda")
         self._d_dyn_dims = torch.zeros(8, dtype=torch.int32, device="cuda")

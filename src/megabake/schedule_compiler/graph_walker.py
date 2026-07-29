@@ -1,13 +1,14 @@
 """Walk FX graph from torch.export, map ATen ops to megakernel tasks."""
 
 from dataclasses import dataclass, field
+import math
 import operator
 import struct as _struct
 import torch
 from torch.export import export
 
 from megabake.data_types import TaskDesc, OpType, ElemCode, ReduceCode, UopCode, UNUSED_BUFFER, pack_uop
-from megabake.schedule_compiler.op_table import ATEN_OP_MAP, SHAPE_OPS
+from megabake.schedule_compiler.op_table import ATEN_OP_MAP
 from megabake.schedule_compiler.shape_ops import (
     StridedView, contiguous_strides,
     resolve_reshape, resolve_transpose, resolve_permute,
@@ -29,11 +30,10 @@ class CompiledModel:
     folded_constants: dict[int, torch.Tensor] = field(default_factory=dict)
 
 
-def _numel(shape: list[int]) -> int:
-    r = 1
-    for s in shape:
-        r *= s
-    return r
+_numel = math.prod
+
+_IDENTITY_VALS = {ElemCode.MUL: 1.0, ElemCode.DIV: 1.0,
+                  ElemCode.ADD: 0.0, ElemCode.SUB: 0.0}
 
 
 def _dtype_bytes(dt: torch.dtype) -> int:
@@ -151,15 +151,20 @@ _EPILOGUE_FUSE = {
 }
 
 
+def _read_counts(tasks: list[TaskDesc]) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for t in tasks:
+        for buf in t.buffer_indices[1:]:
+            if buf != UNUSED_BUFFER:
+                counts[buf] = counts.get(buf, 0) + 1
+    return counts
+
+
 def _fuse_tasks(
     tasks: list[TaskDesc], buffer_sizes: dict[int, int]
 ) -> list[TaskDesc]:
     """Fuse adjacent MATMUL + unary ELEMENTWISE into a single fused op."""
-    read_counts: dict[int, int] = {}
-    for t in tasks:
-        for buf in t.buffer_indices[1:]:
-            if buf != UNUSED_BUFFER:
-                read_counts[buf] = read_counts.get(buf, 0) + 1
+    read_counts = _read_counts(tasks)
 
     fused: list[TaskDesc] = []
     skip = False
@@ -229,11 +234,7 @@ def _fuse_elementwise_chains(
 ) -> list[TaskDesc]:
     """Fuse consecutive same-numel ELEMENTWISE tasks into a single FUSED_ELEMENTWISE
     with a micro-op program interpreted on-GPU."""
-    read_counts: dict[int, int] = {}
-    for t in tasks:
-        for buf in t.buffer_indices[1:]:
-            if buf != UNUSED_BUFFER:
-                read_counts[buf] = read_counts.get(buf, 0) + 1
+    read_counts = _read_counts(tasks)
 
     chains: list[list[int]] = []
     i = 0
@@ -350,11 +351,7 @@ def _eliminate_redundant_copies(
     only read by this single COPY, redirect all downstream consumers of
     the destination to use the source directly, and drop the COPY.
     """
-    read_counts: dict[int, int] = {}
-    for t in tasks:
-        for buf in t.buffer_indices[1:]:
-            if buf != UNUSED_BUFFER:
-                read_counts[buf] = read_counts.get(buf, 0) + 1
+    read_counts = _read_counts(tasks)
 
     remap: dict[int, int] = {}
     drop: set[int] = set()
@@ -499,17 +496,8 @@ def _constant_fold(ep, model=None):
     return folded
 
 
-def _find_rmsnorm_patterns(graph):
-    """Detect decomposed RMSNorm patterns.
-
-    Variant A (SmolLM2): _to_copy→pow(2)→mean→add(eps)→rsqrt→mul→_to_copy(fp16)→mul(weight)
-    Variant B (Gemma):   _to_copy→pow(2)→mean→add(eps)→rsqrt→mul→mul(weight+1)→_to_copy(fp16)
-
-    Returns dict mapping the final node name → (input_node, weight_node,
-    skip_nodes_set, eps_float, weight_plus_one_bool).
-    """
-    patterns = {}
-    users = {}
+def _build_users_map(graph) -> dict[str, list]:
+    users: dict[str, list] = {}
     for n in graph.nodes:
         for a in n.args:
             if hasattr(a, "name"):
@@ -518,6 +506,21 @@ def _find_rmsnorm_patterns(graph):
                 for aa in a:
                     if hasattr(aa, "name"):
                         users.setdefault(aa.name, []).append(n)
+    return users
+
+
+def _find_rmsnorm_patterns(graph, users=None):
+    """Detect decomposed RMSNorm patterns.
+
+    Variant A (SmolLM2): _to_copy→pow(2)→mean→add(eps)→rsqrt→mul→_to_copy(fp16)→mul(weight)
+    Variant B (Gemma):   _to_copy→pow(2)→mean→add(eps)→rsqrt→mul→mul(weight+1)→_to_copy(fp16)
+
+    Returns dict mapping the final node name → (input_node, weight_node,
+    skip_nodes_set, eps_float, weight_plus_one_bool).
+    """
+    if users is None:
+        users = _build_users_map(graph)
+    patterns = {}
 
     for node in graph.nodes:
         if node.op != "call_function":
@@ -660,30 +663,14 @@ def _find_rmsnorm_patterns(graph):
     return patterns
 
 
-def _find_rope_patterns(graph):
+def _find_rope_patterns(graph, users=None):
     """Detect decomposed RoPE patterns: x*cos + rotate_half(x)*sin.
-
-    The rotate_half pattern decomposes to:
-      slice(x, dim, 0, half) → x1
-      slice(x, dim, half, end) → x2
-      neg(x2)
-      cat([neg_x2, x1], dim) → rotated
-      mul(x, cos) → term1
-      mul(rotated, sin) → term2
-      add(term1, term2) → output
 
     Returns dict mapping the output add node name → (input_node, cos_node,
     sin_node, skip_nodes_set).
     """
-    users: dict[str, list] = {}
-    for n in graph.nodes:
-        for a in n.args:
-            if hasattr(a, "name"):
-                users.setdefault(a.name, []).append(n)
-            if isinstance(a, (list, tuple)):
-                for aa in a:
-                    if hasattr(aa, "name"):
-                        users.setdefault(aa.name, []).append(n)
+    if users is None:
+        users = _build_users_map(graph)
 
     patterns: dict = {}
     for node in graph.nodes:
@@ -815,12 +802,13 @@ def compile_from_ep(
     folded_constants = _constant_fold(ep, model)
 
     graph = ep.graph_module.graph
-    rmsnorm_patterns = _find_rmsnorm_patterns(graph)
+    users = _build_users_map(graph)
+    rmsnorm_patterns = _find_rmsnorm_patterns(graph, users)
     rmsnorm_skip: set[str] = set()
     for _, (_, _, skip_set, _, _) in rmsnorm_patterns.items():
         rmsnorm_skip.update(skip_set)
 
-    rope_patterns = _find_rope_patterns(graph)
+    rope_patterns = _find_rope_patterns(graph, users)
     rope_skip: set[str] = set()
     for _, (_, _, _, skip_set) in rope_patterns.items():
         rope_skip.update(skip_set)
@@ -1056,8 +1044,6 @@ def compile_from_ep(
                             continue
 
                 # Eliminate identity elementwise: MUL(1.0), ADD(0.0), SUB(0.0), DIV(1.0)
-                _IDENTITY_VALS = {ElemCode.MUL: 1.0, ElemCode.DIV: 1.0,
-                                  ElemCode.ADD: 0.0, ElemCode.SUB: 0.0}
                 if op_type == OpType.ELEMENTWISE and op_code in _IDENTITY_VALS:
                     identity_val = _IDENTITY_VALS[op_code]
                     scalar_arg = None
