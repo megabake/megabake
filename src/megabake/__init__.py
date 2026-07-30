@@ -5,8 +5,9 @@ __version__ = "0.1.0"
 import torch
 
 from megabake.schedule_compiler.graph_walker import (
-    compile_model, compile_from_ep, _decompose, CompiledModel,
+    compile_model, compile_from_ep, CompiledModel,
 )
+from megabake.schedule_compiler.inductor_passes import optimize_graph
 from megabake.runtime.loader import execute_model
 
 
@@ -30,7 +31,7 @@ def compile_fx(
     num_sms = props.multi_processor_count
 
     if isinstance(graph, ExportedProgram):
-        ep = _decompose(graph)
+        ep = optimize_graph(graph)
         return compile_from_ep(ep, sm_version, dtype=dtype, num_sms=num_sms)
 
     if isinstance(graph, torch.fx.GraphModule):
@@ -48,7 +49,7 @@ def compile_fx(
         ShapeProp(graph).propagate(*example_args)
 
         ep = torch.export.export(graph, example_args, strict=False)
-        ep = _decompose(ep)
+        ep = optimize_graph(ep)
         return compile_from_ep(ep, sm_version, dtype=dtype, num_sms=num_sms)
 
     raise TypeError(
