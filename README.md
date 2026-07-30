@@ -48,23 +48,44 @@ LDSM register fills. Runs on SM80+ (Ampere, Hopper).
 
 ## Benchmarks
 
-Megabake vs `torch.compile` (inductor) on NVIDIA H200 MIG 2g.35gb (32 SMs):
+Megabake vs `torch.compile` (inductor) on NVIDIA H200 MIG 2g.35gb (32 SMs).
+Source of truth: `benchmarks/results.json` (regenerate with `python benchmarks/bench_compare.py --output benchmarks/results.json`).
 
 ```
 Model                megabake     torch.compile   Speedup   Kernels
 -----------------------------------------------------------------
-linear_256x512         68.7us          62.0us       0.90x    1 vs 1
-linear_512x1024        81.7us          69.8us       0.85x    1 vs 1
-mlp_silu              104.7us          95.5us       0.91x    1 vs 3
-mlp_gelu               90.4us         101.5us       1.12x    1 vs 3
-mlp_3layer             94.2us         122.5us       1.30x    1 vs 5
-rmsnorm_mlp           116.4us         113.2us       0.97x    1 vs 4
-layernorm_mlp          95.3us         124.5us       1.31x    1 vs 4
-llama_decoder         272.6us         441.8us       1.62x    1 vs 13
+linear_256x512         61.1us          63.5us       1.04x    1 vs 1
+linear_512x1024        67.7us          68.8us       1.02x    1 vs 1
+mlp_silu                FAIL         101.8us         —       — vs 3
+mlp_gelu               62.5us          95.4us       1.53x    1 vs 3
+mlp_3layer             69.5us         119.6us       1.72x    1 vs 5
+rmsnorm_mlp             FAIL         111.8us         —       — vs 4
+layernorm_mlp           FAIL         114.9us         —       — vs 4
+llama_decoder         129.7us         437.9us       3.38x    1 vs 13
 ```
 
-Megabake's single-kernel advantage compounds with model complexity.
-The llama decoder layer (13 kernels in torch.compile) runs **1.6x faster**.
+Three models fail due to weight-loading bugs (`mlp_silu`: missing `fc1.weight`, `rmsnorm_mlp`/`layernorm_mlp`: missing `norm.weight`).
+On working models, megabake's single-kernel advantage compounds with complexity — the llama decoder layer runs **3.4x faster**.
+
+### Real Model Benchmarks (decode, batch=1, seq=1)
+
+```
+Model                   megabake     torch.compile   Speedup   Kernels
+----------------------------------------------------------------------
+SmolLM2-135M             7238us          6929us       0.96x    1 vs 424
+gemma-2b                28190us          7580us       0.27x    1 vs 256
+```
+
+SmolLM2-135M is near parity (0.96x). gemma-2b is 0.27x -- dominated by matmul (84.8% of megakernel time). Bandwidth utilization is 7.4% (SmolLM2) and 35.6% (gemma-2b) vs theoretical floor.
+
+Per-task profile breakdown (run with `--task-profile`):
+
+| Model | Tasks | MATMUL | MATMUL_SILU/GELU | ATTENTION | REDUCE | Other |
+|-------|-------|--------|-----------------|-----------|--------|-------|
+| SmolLM2-135M | 523 | 78.4% | 11.0% | 1.3% | 2.5% | 6.8% |
+| gemma-2b | 320 | 84.8% | 12.4% | 0.4% | 0.7% | 1.7% |
+
+Matmul dominates both models. Optimization priority: skinny matvec cp.async prefetch (bandwidth), then scheduler (barrier elimination), then attention (tensor cores).
 
 ## Quick start
 
