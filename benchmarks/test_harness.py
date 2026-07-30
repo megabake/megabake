@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.profiler
 
 from megabake.integrations.transformers import _CausalLMWrapper
-from megabake.schedule_compiler.graph_walker import _decompose
+from megabake.schedule_compiler.inductor_passes import optimize_graph
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +219,7 @@ def _compile_via_export(model, inputs):
     """Export then compile via inductor — avoids dynamo graph breaks on HF v5."""
     from torch.export import export
     ep = export(model, inputs, strict=False)
-    ep = _decompose(ep)
+    ep = optimize_graph(ep)
     return torch.compile(ep.module(), backend="inductor")
 
 

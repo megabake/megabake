@@ -18,6 +18,7 @@ from megabake.schedule_compiler.shape_ops import (
 from megabake.schedule_compiler.buffer_planner import plan_buffers
 from megabake.schedule_compiler.tiling import compute_tiles
 from megabake.schedule_compiler.serializer import write_schedule
+from megabake.schedule_compiler.inductor_passes import optimize_graph
 
 
 @dataclass
@@ -754,17 +755,6 @@ def _find_rope_patterns(graph, users=None):
     return patterns
 
 
-def _decompose(ep):
-    decomp_table = torch._decomp.core_aten_decompositions()
-    preserve_ops = [
-        torch.ops.aten.scaled_dot_product_attention.default,
-        torch.ops.aten.silu.default,
-        torch.ops.aten.gelu.default,
-    ]
-    for op in preserve_ops:
-        decomp_table.pop(op, None)
-    return ep.run_decompositions(decomp_table)
-
 
 def compile_model(
     model: torch.nn.Module,
@@ -781,7 +771,7 @@ def compile_model(
         example_args = tuple(example_input)
 
     ep = export(model, example_args, strict=False)
-    ep = _decompose(ep)
+    ep = optimize_graph(ep)
 
     return compile_from_ep(
         ep, sm_version,

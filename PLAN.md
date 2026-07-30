@@ -18,7 +18,7 @@
 
 ---
 
-### Task 1.2: Inductor pre_grad_passes integration
+### Task 1.2: Inductor pre_grad_passes integration ✅ DONE
 **Replace 345 lines of hand-written patterns with Inductor's battle-tested passes.**
 
 Create `src/megabake/schedule_compiler/inductor_passes.py`:
@@ -69,6 +69,8 @@ pytest tests/
 python benchmarks/bench_compare.py
 # All tests pass. max_diff < 1e-3 on all benchmarks. No regression.
 ```
+
+**Result**: Created `inductor_passes.py` with `optimize_graph()`. Uses `core_aten_decompositions()` + Inductor's `pre_grad_passes()` (CSE, DCE, constant folding, 100+ pattern matches). `select_decomp_table()` was NOT used — it corrupts global Inductor state, breaking subsequent `torch.compile` calls in same process. Hand-written pattern functions (`_find_rmsnorm_patterns`, `_find_rope_patterns`, `_constant_fold`, `_build_users_map`) are KEPT — `pre_grad_passes` does NOT fuse decomposed RMSNorm/RoPE back into higher-level ops in PyTorch 2.6, so deleting them would regress fused kernel usage. Net: `_decompose()` deleted (11 lines), `inductor_passes.py` created (29 lines), `__init__.py` updated. 73/73 tests pass. Benchmarks: 1.02-3.54x vs torch.compile, no regression.
 
 ---
 
