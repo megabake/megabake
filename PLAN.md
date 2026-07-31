@@ -153,19 +153,10 @@ python benchmarks/test_harness.py rmsnorm_mlp --task-profile
 
 ---
 
-### Task 1.7: Vectorize index.cu
+### Task 1.7: Vectorize index.cu ✅ DONE
 **float4 when inner_size aligned, scalar fallback otherwise.**
 
-In `index.cu` GATHER and INDEX_SELECT:
-- Check `inner_size % 8 == 0`
-- If yes: iterate in float4 chunks, copy 8 halves per load
-- If no: existing scalar path
-
-**Verify**:
-```bash
-pytest tests/test_tasks/test_embedding.py tests/test_tasks/test_copy.py
-# (index tests if they exist, otherwise add a basic one)
-```
+**Result**: GATHER and INDEX_SELECT collapsed into single code path (identical loop bodies). When `inner_size % 8 == 0`, iterates in float4 chunks (8 halves per load/store). Scalar fallback for unaligned inner_size. Also eliminated dead `num_selected` read and redundant switch structure. 74/74 tests pass, no benchmark regression (llama_decoder 3.02x vs torch.compile).
 
 ---
 
