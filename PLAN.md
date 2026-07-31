@@ -176,13 +176,15 @@ python benchmarks/test_harness.py rmsnorm_mlp --task-profile
 
 ---
 
-### Task 2.3: Matmul epilogue fusion — residual
+### Task 2.3: Matmul epilogue fusion — residual ✅ DONE
 **Fuse residual add into matmul writeback.**
 
 Same pattern as bias but for 2D operands:
 - Scan for MATMUL → consumer ELEMENTWISE(ADD) where ADD's other input is 2D (size matches M × N)
 - Set `task.strides[1] |= EPILOGUE_RESIDUAL`, move residual buffer to `buffer_indices[4]`, mark ADD task dead
 - In CUDA epilogue: `if (flags & EPILOGUE_RESIDUAL) v += __half2float(residual[row * N + col])`
+
+**Result**: `apply_epilogue()` in matmul.cu extended with `const __half* residual, int idx` params. Activations changed from early-return to assignment so residual applies after activation. All 3 matmul paths updated (skinny, SM90 WGMMA, SM80 mma.sync). `_fuse_tasks()` in graph_walker.py extended: after bias+activation fusion, scans for ADD where other input has same buffer size as matmul output (2D match, not 1D bias). Sets `EPILOGUE_RESIDUAL` flag + `buffer_indices[4]`. LLaMA decoder: 2 residual fusions (o_proj + down_proj), 17 tasks (was 19). Bias+SiLU+Residual triple fusion verified: 4 ops → 1 task. 74/74 tests pass. Benchmarks: no regression (llama_decoder 2.50x vs torch.compile).
 
 **Verify**:
 ```bash
