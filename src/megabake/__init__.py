@@ -80,6 +80,17 @@ def run(
     *inputs: torch.Tensor,
     task_timings_ptr: int = 0,
 ) -> torch.Tensor:
+    # ponytail: full eager fallback when unsupported ops exist.
+    # graph splitting with segments if partial acceleration matters.
+    if compiled.unsupported_ops:
+        if not isinstance(model_or_state_dict, torch.nn.Module):
+            raise RuntimeError(
+                f"Model has unsupported ops ({', '.join(compiled.unsupported_ops)}) "
+                f"and requires the original model (not a state_dict) for eager fallback."
+            )
+        with torch.no_grad():
+            return model_or_state_dict(*inputs)
+
     if isinstance(model_or_state_dict, dict):
         sd = model_or_state_dict
     else:

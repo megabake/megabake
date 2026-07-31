@@ -250,6 +250,29 @@ class TestTopLevelAPI:
         assert torch.allclose(result, ref, atol=5e-2, rtol=5e-2)
 
 
+class TestUnsupportedOpsFallback:
+    def test_batchnorm_eager_fallback(self):
+        """Model with unsupported op compiles and falls back to eager."""
+        import megabake
+
+        model = torch.nn.Sequential(
+            torch.nn.Linear(64, 64, bias=False),
+            torch.nn.BatchNorm1d(64),
+            torch.nn.Linear(64, 32, bias=False),
+        ).cuda().half().eval()
+        x = torch.randn(4, 64, device=DEVICE, dtype=torch.float16)
+
+        compiled = megabake.compile(model, x)
+        assert len(compiled.unsupported_ops) > 0
+        result = megabake.run(compiled, model, x)
+        ref = _reference(model, x)
+
+        assert result.shape == ref.shape
+        assert torch.allclose(result.float(), ref.float(), atol=1e-3, rtol=1e-3), (
+            f"Max diff: {(result.float() - ref.float()).abs().max().item():.6f}"
+        )
+
+
 class TestCompileModelMetadata:
     def test_input_output_buffer_ids(self):
         """compile_model tracks input and output buffer IDs."""
