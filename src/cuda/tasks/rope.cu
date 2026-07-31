@@ -23,6 +23,8 @@ __device__ void task_rope(const TaskDesc& task, void** buffers,
     const uint32_t pos_start = tile_id * pos_per_tile;
     const uint32_t pos_end = min(pos_start + pos_per_tile, total_positions);
 
+    const uint32_t half_dim_v = half_dim & ~7u;
+
     for (uint32_t pos = pos_start; pos < pos_end; pos++) {
         uint32_t b = pos / seq_len;
         uint32_t s = pos % seq_len;
@@ -34,13 +36,54 @@ __device__ void task_rope(const TaskDesc& task, void** buffers,
             } else {
                 base_offset = pos * num_heads * head_dim + h * head_dim;
             }
-            for (uint32_t d = threadIdx.x; d < half_dim; d += threads) {
-                float x0 = __half2float(in0[base_offset + d]);
-                float x1 = __half2float(in0[base_offset + d + half_dim]);
-                float c = __half2float(cos_cache[s * cos_stride + d]);
-                float sv = __half2float(sin_cache[s * cos_stride + d]);
-                out[base_offset + d] = __float2half(x0 * c - x1 * sv);
-                out[base_offset + d + half_dim] = __float2half(x1 * c + x0 * sv);
+
+            const __half* x0_ptr = in0 + base_offset;
+            const __half* x1_ptr = in0 + base_offset + half_dim;
+            __half* out0_ptr = out + base_offset;
+            __half* out1_ptr = out + base_offset + half_dim;
+            const __half* cos_ptr = cos_cache + s * cos_stride;
+            const __half* sin_ptr = sin_cache + s * cos_stride;
+
+            for (uint32_t d = threadIdx.x * 8; d < half_dim_v; d += threads * 8) {
+                float4 x0_4 = *((const float4*)(x0_ptr + d));
+                float4 x1_4 = *((const float4*)(x1_ptr + d));
+                float4 c_4  = *((const float4*)(cos_ptr + d));
+                float4 s_4  = *((const float4*)(sin_ptr + d));
+
+                __half2* x0h = (__half2*)&x0_4;
+                __half2* x1h = (__half2*)&x1_4;
+                __half2* ch  = (__half2*)&c_4;
+                __half2* sh  = (__half2*)&s_4;
+
+                float4 o0_4, o1_4;
+                __half2* o0h = (__half2*)&o0_4;
+                __half2* o1h = (__half2*)&o1_4;
+
+                for (int p = 0; p < 4; p++) {
+                    float2 v0 = __half22float2(x0h[p]);
+                    float2 v1 = __half22float2(x1h[p]);
+                    float2 cv = __half22float2(ch[p]);
+                    float2 sv = __half22float2(sh[p]);
+
+                    o0h[p] = __float22half2_rn(make_float2(
+                        v0.x * cv.x - v1.x * sv.x,
+                        v0.y * cv.y - v1.y * sv.y));
+                    o1h[p] = __float22half2_rn(make_float2(
+                        v1.x * cv.x + v0.x * sv.x,
+                        v1.y * cv.y + v0.y * sv.y));
+                }
+
+                *((float4*)(out0_ptr + d)) = o0_4;
+                *((float4*)(out1_ptr + d)) = o1_4;
+            }
+
+            for (uint32_t d = half_dim_v + threadIdx.x; d < half_dim; d += threads) {
+                float x0 = __half2float(x0_ptr[d]);
+                float x1 = __half2float(x1_ptr[d]);
+                float c = __half2float(cos_ptr[d]);
+                float sv = __half2float(sin_ptr[d]);
+                out0_ptr[d] = __float2half(x0 * c - x1 * sv);
+                out1_ptr[d] = __float2half(x1 * c + x0 * sv);
             }
         }
     }
