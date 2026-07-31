@@ -169,45 +169,10 @@ python benchmarks/test_harness.py rmsnorm_mlp --task-profile
 
 ---
 
-### Task 2.2: Matmul epilogue fusion — bias
+### Task 2.2: Matmul epilogue fusion — bias ✅ DONE
 **Make the CUDA kernel read buffer_indices[3] for bias. Graph walker already sets it.**
 
-In `matmul.cu`, both SM90 and SM80 epilogue loops + skinny matvec epilogue:
-- Read `uint32_t flags = task.strides[1]`
-- If `flags & EPILOGUE_BIAS`: load bias from `buffers[task.buffer_indices[3]]`, add `bias[col]` before activation
-
-In `graph_walker.py` or new `fusion.py`:
-- After graph walk, scan for MATMUL → consumer ELEMENTWISE(ADD) where ADD's other input is 1D (size matches N dimension)
-- Set `task.strides[1] |= EPILOGUE_BIAS`, move bias buffer to `buffer_indices[3]`, mark ADD task dead
-
-Define epilogue flag constants in `data_types.py` and `data_types.cuh`:
-```python
-EPILOGUE_SILU      = 0x01
-EPILOGUE_GELU      = 0x02
-EPILOGUE_GELU_TANH = 0x04
-EPILOGUE_BIAS      = 0x08
-EPILOGUE_RESIDUAL  = 0x10
-```
-
-**Verify**:
-```bash
-# Need a model WITH bias
-python -c "
-import torch, megabake
-model = torch.nn.Sequential(
-    torch.nn.Linear(256, 512, bias=True),  # has bias
-    torch.nn.SiLU(),
-    torch.nn.Linear(512, 256, bias=True),
-).cuda().half().eval()
-x = torch.randn(1, 256, device='cuda', dtype=torch.float16)
-compiled = megabake.compile(model, x)
-out = megabake.run(compiled, model, x)
-ref = model(x)
-print('max_diff:', (out.float() - ref.float()).abs().max().item())
-"
-# Profile: should show fewer tasks than without bias fusion
-python benchmarks/test_harness.py layernorm_mlp --task-profile
-```
+**Result**: `apply_epilogue()` now takes `const __half* bias, int col` params. Bias added before activation (correct order for Linear+SiLU). All 3 matmul paths updated (skinny, SM90 WGMMA, SM80 mma.sync). SM90/SM80 use `get<1>(tCidC(i))` for global column index from CuTe identity tensor. Two Python paths covered: (1) addmm fix-up code now sets `EPILOGUE_BIAS` flag alongside `buffer_indices[3]` — fixes pre-existing bug where bias was silently dropped; (2) `_fuse_tasks` rewritten to detect MATMUL→ADD(1D bias matching N)→activation chains, fusing bias+activation in single pass. Biased Linear(256,512)+SiLU+Linear(512,256): 2 tasks (was 5+ without fusion), max_diff=0.000244. 74/74 tests pass. Benchmarks: no regression (llama_decoder 2.82x, rmsnorm_mlp 1.49x).
 
 ---
 

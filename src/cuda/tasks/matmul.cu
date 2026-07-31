@@ -43,7 +43,10 @@ __device__ void matmul_scalar(
     }
 }
 
-__device__ __forceinline__ float apply_epilogue(float v, uint32_t flags) {
+__device__ __forceinline__ float apply_epilogue(float v, uint32_t flags,
+    const __half* bias, int col) {
+    if ((flags & EPILOGUE_BIAS) && bias)
+        v += __half2float(bias[col]);
     if (flags & EPILOGUE_SILU)
         return v / (1.0f + __expf(-v));
     if (flags & EPILOGUE_GELU)
@@ -61,7 +64,8 @@ __device__ __forceinline__ float apply_epilogue(float v, uint32_t flags) {
 __device__ void matmul_skinny(
     const __half* A, const __half* B, __half* C,
     int M, int N, int K,
-    int tile_id, int num_tiles, uint32_t epilogue_flags)
+    int tile_id, int num_tiles, uint32_t epilogue_flags,
+    const __half* bias)
 {
     int active_tiles = min(num_tiles, (int)gridDim.x);
     int cols_per_tile = (N + active_tiles - 1) / active_tiles;
@@ -128,7 +132,7 @@ __device__ void matmul_skinny(
 
         if (valid) {
             for (int m = 0; m < M && m < SKINNY_MAX_M; m++)
-                C[(int64_t)m * N + my_n] = __float2half(apply_epilogue(acc[m], epilogue_flags));
+                C[(int64_t)m * N + my_n] = __float2half(apply_epilogue(acc[m], epilogue_flags, bias, my_n));
         }
     }
 }
@@ -179,8 +183,10 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
     }
 
     if (M <= 4) {
+        const __half* bias = (task.strides[1] & EPILOGUE_BIAS) ?
+            (const __half*)buffers[task.buffer_indices[3]] : nullptr;
         matmul_skinny((const __half*)A, (const __half*)B, (__half*)C,
-                      M, N, K, tile_id, task.num_tiles, (uint32_t)task.strides[1]);
+                      M, N, K, tile_id, task.num_tiles, (uint32_t)task.strides[1], bias);
         return;
     }
 
@@ -325,11 +331,13 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
         // --- Epilogue ---
         Tensor tCidC = thr_mma_s.partition_C(idC);
         const uint32_t op = (uint32_t)task.strides[1];
+        const __half* epi_bias = (op & EPILOGUE_BIAS) ?
+            (const __half*)buffers[task.buffer_indices[3]] : nullptr;
 
         CUTE_UNROLL
         for (int i = 0; i < size(tCrC); ++i) {
             if (elem_less(tCidC(i), make_shape(M, N))) {
-                tCgC(i) = half_t(apply_epilogue(tCrC(i), op));
+                tCgC(i) = half_t(apply_epilogue(tCrC(i), op, epi_bias, get<1>(tCidC(i))));
             }
         }
 
@@ -392,8 +400,10 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
     }
 
     if (M <= 4) {
+        const __half* bias = (task.strides[1] & EPILOGUE_BIAS) ?
+            (const __half*)buffers[task.buffer_indices[3]] : nullptr;
         matmul_skinny((const __half*)A, (const __half*)B, (__half*)C,
-                      M, N, K, tile_id, task.num_tiles, (uint32_t)task.strides[1]);
+                      M, N, K, tile_id, task.num_tiles, (uint32_t)task.strides[1], bias);
         return;
     }
 
@@ -557,14 +567,16 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
             }
         }
 
-        // --- Epilogue: optional activation on fp32 accum, then convert to fp16 ---
+        // --- Epilogue: optional bias + activation on fp32 accum, then convert to fp16 ---
         Tensor tCidC = thr_mma_s.partition_C(idC);
         const uint32_t op = (uint32_t)task.strides[1];
+        const __half* epi_bias = (op & EPILOGUE_BIAS) ?
+            (const __half*)buffers[task.buffer_indices[3]] : nullptr;
 
         CUTE_UNROLL
         for (int i = 0; i < size(tCrC); ++i) {
             if (elem_less(tCidC(i), make_shape(M, N))) {
-                tCgC(i) = half_t(apply_epilogue(tCrC(i), op));
+                tCgC(i) = half_t(apply_epilogue(tCrC(i), op, epi_bias, get<1>(tCidC(i))));
             }
         }
 
