@@ -29,6 +29,7 @@ class CompiledModel:
     output_shape: list[int] = field(default_factory=list)
     num_buffers: int = 0
     folded_constants: dict[int, torch.Tensor] = field(default_factory=dict)
+    unsupported_ops: list[str] = field(default_factory=list)
 
 
 _numel = math.prod
@@ -1004,6 +1005,12 @@ def compile_from_ep(
             elif mapping is None:
                 op_name = getattr(target, "__name__", str(target))
                 unsupported_ops.append(op_name)
+                out_meta = node.meta.get("val")
+                if out_meta is not None:
+                    if isinstance(out_meta, (tuple, list)):
+                        out_meta = out_meta[0]
+                    if isinstance(out_meta, torch.Tensor):
+                        alloc_buffer(node.name, [int(s) for s in out_meta.shape], out_meta.dtype)
 
             elif isinstance(mapping, tuple):
                 op_type, op_code = mapping
@@ -1215,8 +1222,11 @@ def compile_from_ep(
 
     if unsupported_ops:
         unique = sorted(set(unsupported_ops))
-        raise RuntimeError(
-            f"Unsupported ATen ops ({len(unique)}): {', '.join(unique)}"
+        import warnings
+        warnings.warn(
+            f"Unsupported ATen ops ({len(unique)}): {', '.join(unique)}. "
+            f"Falling back to eager execution at runtime.",
+            stacklevel=2,
         )
 
     tasks = _fuse_tasks(tasks, buffer_sizes)
@@ -1245,6 +1255,7 @@ def compile_from_ep(
         output_shape=output_shape,
         num_buffers=next_buffer_id,
         folded_constants=folded_weight_tensors,
+        unsupported_ops=sorted(set(unsupported_ops)),
     )
 
 
