@@ -139,23 +139,10 @@ python benchmarks/test_harness.py rmsnorm_mlp --task-profile
 
 ---
 
-### Task 1.5: Single-pass RMSNorm
+### Task 1.5: Single-pass RMSNorm ✅ DONE
 **Cache row in registers. Read from global memory once, not twice.**
 
-In `reduce.cu` REDUCE_RMSNORM case:
-- Declare `float cached[MAX_ELEMS_PER_THREAD]` (MAX = hidden/threads, e.g., 16 for hidden=4096)
-- First loop: float4 load → cache in `cached[]` + accumulate `sum_sq`
-- `block_reduce_sum(sum_sq)` → compute `rms`
-- Second loop: read from `cached[]` (NOT global memory), apply rms + weight, float4 store
-
-Register budget: hidden=4096, 256 threads → 16 fp32 regs/thread. Fine.
-
-**Verify**:
-```bash
-pytest tests/test_tasks/test_reduce.py
-python benchmarks/test_harness.py rmsnorm_mlp --task-profile
-# RMSNorm task should show ~2x fewer cycles (one global read vs two).
-```
+**Result**: RMSNORM case in `reduce.cu` now caches row values in a `float cached[72]` register array during the sum_sq accumulation pass. Second pass reads from cache instead of re-reading global memory. Eliminates one full global memory read per RMSNorm row. Register budget: hidden=4096/256 threads = 16 fp32/thread, hidden=8192 = 32/thread, MAX=72 covers up to hidden=18432. 74/74 tests pass, no regressions.
 
 ---
 
