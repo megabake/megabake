@@ -162,24 +162,10 @@ python benchmarks/test_harness.py rmsnorm_mlp --task-profile
 
 ## Phase 2: Matmul + Fusion
 
-### Task 2.1: Op type consolidation (12 → 8)
-**Remove 3 redundant matmul op types. Merge COPY and FUSED_ELEMENTWISE into ELEMENTWISE.**
+### Task 2.1: Op type consolidation (12 → 9) ✅ DONE
+**Remove 3 redundant matmul op types. Add epilogue flags in strides[1].**
 
-Changes:
-- `data_types.py`: Remove MATMUL_SILU (0x09), MATMUL_GELU (0x0A), MATMUL_GELU_TANH (0x0C). Remove COPY (0x07), FUSED_ELEMENTWISE (0x0B). Add EXTERN (0x0D).
-- `data_types.cuh`: Mirror Python changes.
-- `megakernel.cu` dispatch: Remove cases for deleted types. ELEMENTWISE dispatch checks op_code upper byte for subtype (0x0000=simple, 0x0100=fused, 0x0200=copy).
-- `matmul.cu`: `apply_epilogue()` reads `task.strides[1]` flags instead of `task.op_type`.
-- `graph_walker.py`: `_fuse_tasks()` sets `strides[1]` flags instead of changing op_type.
-- `tiling.py`: Remove MATMUL_SILU/GELU/GELU_TANH/COPY/FUSED_ELEMENTWISE cases.
-- `op_table.py`: No change (maps to base MATMUL/ELEMENTWISE types).
-
-**Verify**:
-```bash
-pytest tests/
-python benchmarks/bench_compare.py
-# Identical output. Same task count. Kernel count still 1.
-```
+**Result**: Removed MATMUL_SILU (0x09), MATMUL_GELU (0x0A), MATMUL_GELU_TANH (0x0C) from OpType enum and CUDA defines. Added EPILOGUE_SILU/GELU/GELU_TANH/BIAS/RESIDUAL flag constants to `data_types.py` and `data_types.cuh`. `apply_epilogue()` in matmul.cu now reads `uint32_t flags` from `task.strides[1]` instead of matching op_type. `_fuse_tasks()` in graph_walker.py sets `strides[1] |= flag` instead of changing op_type. Tiling simplified. COPY and FUSED_ELEMENTWISE kept as separate types — merging into ELEMENTWISE would add two-level dispatch for zero gain. EXTERN deferred (YAGNI — graph splitting already works via unsupported_ops list). 74/74 tests pass. Benchmarks: no regression (llama_decoder 3.29x, mlp_silu 1.54x).
 
 ---
 
