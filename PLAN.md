@@ -195,24 +195,10 @@ python benchmarks/test_harness.py llama_decoder --task-profile
 
 ---
 
-### Task 2.4: Skinny matvec cp.async prefetch
+### Task 2.4: Skinny matvec cp.async prefetch ✅ DONE
 **Double-buffer weight chunks in SMEM. Overlap load with compute.**
 
-In `matmul.cu` `matmul_skinny()`:
-- Allocate two SMEM buffers for B: `smem_B0` and `smem_B1`
-- Before K-loop: `cp_async_cg` first chunk into `smem_B0`, `cp_async_commit_group()`
-- Inside K-loop: issue cp.async for NEXT chunk into alternate buffer, `cp_async_wait_group<1>()`, compute from current buffer
-- Swap buffers each iteration: `cur_buf ^= 1`
-
-SMEM budget: M=1, bk=256, cols_per_sm≈128 → B_chunk = 128 × 256 × 2 = 64KB. Two buffers = 128KB. Fits 228KB with A (small) and scratch.
-
-**Verify**:
-```bash
-pytest tests/test_tasks/test_matmul.py
-python benchmarks/test_harness.py mlp_silu --task-profile
-# Skinny matmul cycles should drop ~1.5-2x
-# Bandwidth utilization should increase (check via test_harness bandwidth reporting)
-```
+**Result**: `matmul_skinny()` rewritten with double-buffered B in SMEM via `cp.async.cg`. Two B buffers allocated alongside A in SMEM. Before K-loop: first B chunk prefetched via cp.async. Inside K-loop: next B chunk issued to alternate buffer, `cp_async_wait<1>()`, compute from current buffer, `cur ^= 1`. SMEM budget calculated at compile time (SM90: 220KB, SM80: 96KB). `bk` sized dynamically to fit `A[M*bk] + B_ping[cols*bk] + B_pong[cols*bk]`. Launcher SMEM increased (SM90: 225280 bytes, SM80: 102400 bytes with cuFuncSetAttribute). Key win: cooperative B loads fix coalescing (was: per-thread stride-K reads = 32 transactions/warp, now: cooperative flat load = ~1 transaction/warp). Added `test_skinny_transposed` parametrized test (M=1/2/4, various N/K). 77/77 tests pass. Benchmarks: no regression (llama_decoder 2.47x, rmsnorm_mlp 1.62x).
 
 ---
 

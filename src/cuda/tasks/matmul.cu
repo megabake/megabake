@@ -60,8 +60,39 @@ __device__ __forceinline__ float apply_epilogue(float v, uint32_t flags,
     return v;
 }
 
-// Skinny matmul for M < 128: tiles over N columns across all SMs,
-// caches A in shared memory, each thread processes one output column at a time.
+// cp.async helpers for skinny double-buffer
+__device__ __forceinline__ void skinny_cp_async_16(void* smem_dst, const void* gmem_src) {
+    uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(addr), "l"(gmem_src));
+}
+
+__device__ __forceinline__ void skinny_cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n");
+}
+
+template<int N>
+__device__ __forceinline__ void skinny_cp_async_wait() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
+// Load B tile [cols x kc] into SMEM via cp.async (coalesced cooperative load)
+__device__ __forceinline__ void skinny_load_b_async(
+    __half* b_smem, const __half* B, int n_base, int cols,
+    int K, int k_base, int kc, int bk)
+{
+    int kc8 = kc >> 3;
+    int total_chunks = cols * kc8;
+    for (int ci = (int)threadIdx.x; ci < total_chunks; ci += (int)blockDim.x) {
+        int c = ci / kc8;
+        int k = (ci - c * kc8) * 8;
+        skinny_cp_async_16(b_smem + c * bk + k,
+                           B + (int64_t)(n_base + c) * K + k_base + k);
+    }
+}
+
+// Skinny matmul for M <= 4: double-buffered B in SMEM with cp.async,
+// A cached in SMEM (small). Cooperative B loads fix coalescing
+// (was: per-thread stride-K reads = 32 transactions/warp).
 #define SKINNY_MAX_M 64
 __device__ void matmul_skinny(
     const __half* A, const __half* B, __half* C,
@@ -76,35 +107,76 @@ __device__ void matmul_skinny(
     if (n_start >= N) return;
 
     extern __shared__ char smem[];
-    __half* a_smem = (__half*)smem;
 
-    int bk = min(K, 51200 / max(M, 1));
+    // SMEM layout: A[M * bk] | B_ping[cols * bk] | B_pong[cols * bk]
+    // bk sized to fit double-buffered B in available SMEM
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    const int SMEM_BUDGET = 220 * 1024;
+#else
+    const int SMEM_BUDGET = 96 * 1024;
+#endif
+
+    int cols = (int)blockDim.x;
+    // bk * 2 * (M + 2*cols) <= SMEM_BUDGET
+    int bk = SMEM_BUDGET / (2 * (M + 2 * cols));
     bk = bk & ~7;
+    if (bk > K) bk = K;
     if (bk < 8) bk = 8;
+
+    __half* a_smem = (__half*)smem;
+    __half* b_buf[2];
+    b_buf[0] = a_smem + M * bk;
+    b_buf[1] = b_buf[0] + cols * bk;
 
     for (int n_base = n_start; n_base < n_end; n_base += (int)blockDim.x) {
         int my_n = n_base + (int)threadIdx.x;
         bool valid = (my_n < n_end);
+        int actual_cols = min(cols, n_end - n_base);
 
         float acc[SKINNY_MAX_M];
         #pragma unroll
         for (int m = 0; m < SKINNY_MAX_M; m++) acc[m] = 0.0f;
 
-        for (int k_base = 0; k_base < K; k_base += bk) {
+        int cur = 0;
+        int k_tiles = (K + bk - 1) / bk;
+
+        // Prefetch first B chunk
+        int kc0 = min(bk, K);
+        skinny_load_b_async(b_buf[0], B, n_base, actual_cols, K, 0, kc0, bk);
+        skinny_cp_async_commit();
+
+        for (int kt = 0; kt < k_tiles; kt++) {
+            int k_base = kt * bk;
             int kc = min(bk, K - k_base);
+
+            // Prefetch NEXT B chunk into other buffer
+            int next_kt = kt + 1;
+            if (next_kt < k_tiles) {
+                int next_k = next_kt * bk;
+                int next_kc = min(bk, K - next_k);
+                skinny_load_b_async(b_buf[1 - cur], B, n_base, actual_cols,
+                                    K, next_k, next_kc, bk);
+            }
+            skinny_cp_async_commit();
+
+            // Load A chunk cooperatively (regular loads — A is tiny for M<=4)
             int a_total = M * kc;
             for (int i = (int)threadIdx.x; i < a_total; i += (int)blockDim.x) {
                 int mr = i / kc;
                 int kr = i % kc;
                 a_smem[i] = A[(int64_t)mr * K + k_base + kr];
             }
+
+            // Wait for current B buffer
+            skinny_cp_async_wait<1>();
             __syncthreads();
 
+            // Compute: A from a_smem, B from b_buf[cur]
             if (valid) {
-                const __half* b_ptr = B + (int64_t)my_n * K + k_base;
+                const __half* my_b = b_buf[cur] + (int)threadIdx.x * bk;
                 int kv = kc & ~7;
                 for (int k = 0; k < kv; k += 8) {
-                    float4 bv = *(const float4*)(b_ptr + k);
+                    float4 bv = *(const float4*)(my_b + k);
                     const __half2* bh = (const __half2*)&bv;
                     float2 bf0 = __half22float2(bh[0]);
                     float2 bf1 = __half22float2(bh[1]);
@@ -124,18 +196,24 @@ __device__ void matmul_skinny(
                     }
                 }
                 for (int k = kv; k < kc; k++) {
-                    float bval = __half2float(b_ptr[k]);
+                    float bval = __half2float(my_b[k]);
                     for (int m = 0; m < M && m < SKINNY_MAX_M; m++)
                         acc[m] += __half2float(a_smem[m * kc + k]) * bval;
                 }
             }
+
+            cur ^= 1;
             __syncthreads();
         }
+
+        // Drain any outstanding cp.async
+        skinny_cp_async_wait<0>();
 
         if (valid) {
             for (int m = 0; m < M && m < SKINNY_MAX_M; m++)
                 C[(int64_t)m * N + my_n] = __float2half(apply_epilogue(acc[m], epilogue_flags, bias, residual, my_n, m * N + my_n));
         }
+        __syncthreads();
     }
 }
 
