@@ -43,12 +43,12 @@ __device__ void matmul_scalar(
     }
 }
 
-__device__ __forceinline__ float apply_epilogue(float v, uint16_t op_type) {
-    if (op_type == OP_MATMUL_SILU) {
+__device__ __forceinline__ float apply_epilogue(float v, uint32_t flags) {
+    if (flags & EPILOGUE_SILU)
         return v / (1.0f + __expf(-v));
-    } else if (op_type == OP_MATMUL_GELU) {
+    if (flags & EPILOGUE_GELU)
         return v * 0.5f * (1.0f + erff(v * 0.7071067811865476f));
-    } else if (op_type == OP_MATMUL_GELU_TANH) {
+    if (flags & EPILOGUE_GELU_TANH) {
         float c = 0.7978845608028654f * (v + 0.044715f * v * v * v);
         return v * 0.5f * (1.0f + tanhf(c));
     }
@@ -61,7 +61,7 @@ __device__ __forceinline__ float apply_epilogue(float v, uint16_t op_type) {
 __device__ void matmul_skinny(
     const __half* A, const __half* B, __half* C,
     int M, int N, int K,
-    int tile_id, int num_tiles, uint16_t op_type)
+    int tile_id, int num_tiles, uint32_t epilogue_flags)
 {
     int active_tiles = min(num_tiles, (int)gridDim.x);
     int cols_per_tile = (N + active_tiles - 1) / active_tiles;
@@ -128,7 +128,7 @@ __device__ void matmul_skinny(
 
         if (valid) {
             for (int m = 0; m < M && m < SKINNY_MAX_M; m++)
-                C[(int64_t)m * N + my_n] = __float2half(apply_epilogue(acc[m], op_type));
+                C[(int64_t)m * N + my_n] = __float2half(apply_epilogue(acc[m], epilogue_flags));
         }
     }
 }
@@ -180,7 +180,7 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
 
     if (M <= 4) {
         matmul_skinny((const __half*)A, (const __half*)B, (__half*)C,
-                      M, N, K, tile_id, task.num_tiles, task.op_type);
+                      M, N, K, tile_id, task.num_tiles, (uint32_t)task.strides[1]);
         return;
     }
 
@@ -324,7 +324,7 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
 
         // --- Epilogue ---
         Tensor tCidC = thr_mma_s.partition_C(idC);
-        const uint16_t op = task.op_type;
+        const uint32_t op = (uint32_t)task.strides[1];
 
         CUTE_UNROLL
         for (int i = 0; i < size(tCrC); ++i) {
@@ -393,7 +393,7 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
 
     if (M <= 4) {
         matmul_skinny((const __half*)A, (const __half*)B, (__half*)C,
-                      M, N, K, tile_id, task.num_tiles, task.op_type);
+                      M, N, K, tile_id, task.num_tiles, (uint32_t)task.strides[1]);
         return;
     }
 
@@ -559,7 +559,7 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
 
         // --- Epilogue: optional activation on fp32 accum, then convert to fp16 ---
         Tensor tCidC = thr_mma_s.partition_C(idC);
-        const uint16_t op = task.op_type;
+        const uint32_t op = (uint32_t)task.strides[1];
 
         CUTE_UNROLL
         for (int i = 0; i < size(tCrC); ++i) {

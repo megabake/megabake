@@ -9,10 +9,13 @@
 #define OP_INDEX        0x06
 #define OP_COPY         0x07
 #define OP_ROPE         0x08
-#define OP_MATMUL_SILU        0x09
-#define OP_MATMUL_GELU        0x0A
 #define OP_FUSED_ELEMENTWISE  0x0B
-#define OP_MATMUL_GELU_TANH   0x0C
+
+#define EPILOGUE_SILU      0x01
+#define EPILOGUE_GELU      0x02
+#define EPILOGUE_GELU_TANH 0x04
+#define EPILOGUE_BIAS      0x08
+#define EPILOGUE_RESIDUAL  0x10
 
 // Micro-op codes for fused elementwise interpreter
 #define UOP_LOAD    0x00

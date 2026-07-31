@@ -7,7 +7,10 @@ import struct as _struct
 import torch
 from torch.export import export
 
-from megabake.data_types import TaskDesc, OpType, ElemCode, ReduceCode, UopCode, UNUSED_BUFFER, pack_uop
+from megabake.data_types import (
+    TaskDesc, OpType, ElemCode, ReduceCode, UopCode, UNUSED_BUFFER, pack_uop,
+    EPILOGUE_SILU, EPILOGUE_GELU, EPILOGUE_GELU_TANH,
+)
 from megabake.schedule_compiler.op_table import ATEN_OP_MAP
 from megabake.schedule_compiler.shape_ops import (
     StridedView, contiguous_strides,
@@ -147,9 +150,9 @@ def _extract_dimensions(op_type: int, node, out_shape: list[int]) -> list[int]:
 
 
 _EPILOGUE_FUSE = {
-    ElemCode.SILU: OpType.MATMUL_SILU,
-    ElemCode.GELU: OpType.MATMUL_GELU,
-    ElemCode.GELU_TANH: OpType.MATMUL_GELU_TANH,
+    ElemCode.SILU: EPILOGUE_SILU,
+    ElemCode.GELU: EPILOGUE_GELU,
+    ElemCode.GELU_TANH: EPILOGUE_GELU_TANH,
 }
 
 
@@ -184,7 +187,7 @@ def _fuse_tasks(
             nxt = tasks[i + 1]
             mid_buf = task.buffer_indices[0]
             if nxt.buffer_indices[1] == mid_buf and read_counts.get(mid_buf, 0) == 1:
-                task.op_type = _EPILOGUE_FUSE[nxt.op_code]
+                task.strides[1] |= _EPILOGUE_FUSE[nxt.op_code]
                 task.buffer_indices[0] = nxt.buffer_indices[0]
                 buffer_sizes.pop(mid_buf, None)
                 skip = True

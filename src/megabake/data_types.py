@@ -12,10 +12,14 @@ class OpType(IntEnum):
     INDEX              = 0x06
     COPY               = 0x07
     ROPE               = 0x08
-    MATMUL_SILU        = 0x09
-    MATMUL_GELU        = 0x0A
     FUSED_ELEMENTWISE  = 0x0B
-    MATMUL_GELU_TANH   = 0x0C
+
+
+EPILOGUE_SILU      = 0x01
+EPILOGUE_GELU      = 0x02
+EPILOGUE_GELU_TANH = 0x04
+EPILOGUE_BIAS      = 0x08
+EPILOGUE_RESIDUAL  = 0x10
 
 
 class ElemCode(IntEnum):

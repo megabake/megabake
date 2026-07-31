@@ -6,7 +6,7 @@ from megabake.data_types import OpType
 def compute_tiles(op_type: int, dims: list[int], sm_version: int, num_sms: int = 0) -> int:
     max_sms = num_sms if num_sms > 0 else {80: 108, 90: 132, 100: 144}.get(sm_version, 132)
 
-    if op_type in (OpType.MATMUL, OpType.MATMUL_SILU, OpType.MATMUL_GELU, OpType.MATMUL_GELU_TANH):
+    if op_type == OpType.MATMUL:
         M, N = dims[0], dims[1]
         if M <= 4:
             return max_sms
