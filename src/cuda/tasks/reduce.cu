@@ -28,17 +28,25 @@ __device__ void task_reduce(const TaskDesc& task, void** buffers,
 
         switch (task.op_code) {
             case REDUCE_RMSNORM: {
+                // ponytail: single-pass — cache row in registers, one global read instead of two
+                constexpr int RMSNORM_MAX_CACHED = 72;
+                float cached[RMSNORM_MAX_CACHED];
+                int cc = 0;
                 float sum_sq = 0.0f;
+
                 for (uint32_t j = threadIdx.x * 8; j < row_size_v; j += threads * 8) {
                     float4 v4 = *((const float4*)(row_in + j));
                     __half2* vh = (__half2*)&v4;
                     for (int p = 0; p < 4; p++) {
                         float2 f = __half22float2(vh[p]);
+                        cached[cc++] = f.x;
+                        cached[cc++] = f.y;
                         sum_sq += f.x * f.x + f.y * f.y;
                     }
                 }
                 for (uint32_t j = row_size_v + threadIdx.x; j < row_size; j += threads) {
                     float v = __half2float(row_in[j]);
+                    cached[cc++] = v;
                     sum_sq += v * v;
                 }
                 sum_sq = block_reduce_sum(sum_sq, smem);
@@ -48,30 +56,29 @@ __device__ void task_reduce(const TaskDesc& task, void** buffers,
                 float rms = rsqrtf(sum_sq / (float)row_size + eps);
                 int weight_plus_one = task.strides[0];
 
+                cc = 0;
                 for (uint32_t j = threadIdx.x * 8; j < row_size_v; j += threads * 8) {
-                    float4 v4 = *((const float4*)(row_in + j));
-                    __half2* vh = (__half2*)&v4;
                     float4 o4;
                     __half2* oh = (__half2*)&o4;
                     if (weight) {
                         float4 w4 = *((const float4*)(weight + j));
                         __half2* wh = (__half2*)&w4;
                         for (int p = 0; p < 4; p++) {
-                            float2 f = __half22float2(vh[p]);
+                            float x = cached[cc++] * rms;
+                            float y = cached[cc++] * rms;
                             float2 wf = __half22float2(wh[p]);
                             if (weight_plus_one) { wf.x += 1.0f; wf.y += 1.0f; }
-                            oh[p] = __float22half2_rn(make_float2(f.x * rms * wf.x, f.y * rms * wf.y));
+                            oh[p] = __float22half2_rn(make_float2(x * wf.x, y * wf.y));
                         }
                     } else {
                         for (int p = 0; p < 4; p++) {
-                            float2 f = __half22float2(vh[p]);
-                            oh[p] = __float22half2_rn(make_float2(f.x * rms, f.y * rms));
+                            oh[p] = __float22half2_rn(make_float2(cached[cc++] * rms, cached[cc++] * rms));
                         }
                     }
                     *((float4*)(row_out + j)) = o4;
                 }
                 for (uint32_t j = row_size_v + threadIdx.x; j < row_size; j += threads) {
-                    float v = __half2float(row_in[j]) * rms;
+                    float v = cached[cc++] * rms;
                     if (weight) {
                         float w = __half2float(weight[j]);
                         if (weight_plus_one) w += 1.0f;
