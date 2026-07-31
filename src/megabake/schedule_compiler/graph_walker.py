@@ -9,7 +9,7 @@ from torch.export import export
 
 from megabake.data_types import (
     TaskDesc, OpType, ElemCode, ReduceCode, UopCode, UNUSED_BUFFER, pack_uop,
-    EPILOGUE_SILU, EPILOGUE_GELU, EPILOGUE_GELU_TANH, EPILOGUE_BIAS,
+    EPILOGUE_SILU, EPILOGUE_GELU, EPILOGUE_GELU_TANH, EPILOGUE_BIAS, EPILOGUE_RESIDUAL,
 )
 from megabake.schedule_compiler.op_table import ATEN_OP_MAP
 from megabake.schedule_compiler.shape_ops import (
@@ -218,6 +218,32 @@ def _fuse_tasks(
                     task.buffer_indices[0] = nxt.buffer_indices[0]
                     buffer_sizes.pop(mid_buf, None)
                     consumed += 1
+                    j += 1
+
+            # Fuse residual: MATMUL [+bias] [+act] → ADD where other input matches output size
+            if (j < len(tasks)
+                and tasks[j].op_type == OpType.ELEMENTWISE
+                and tasks[j].op_code == ElemCode.ADD
+                and tasks[j].buffer_indices[2] != UNUSED_BUFFER):
+                nxt = tasks[j]
+                mid_buf = task.buffer_indices[0]
+                if nxt.buffer_indices[1] == mid_buf:
+                    res_buf = nxt.buffer_indices[2]
+                elif nxt.buffer_indices[2] == mid_buf:
+                    res_buf = nxt.buffer_indices[1]
+                else:
+                    res_buf = UNUSED_BUFFER
+
+                if (res_buf != UNUSED_BUFFER
+                    and read_counts.get(mid_buf, 0) == 1):
+                    out_bytes = buffer_sizes.get(mid_buf, 0)
+                    res_bytes = buffer_sizes.get(res_buf, 0)
+                    if res_bytes == out_bytes and res_bytes > 0:
+                        task.strides[1] |= EPILOGUE_RESIDUAL
+                        task.buffer_indices[4] = res_buf
+                        task.buffer_indices[0] = nxt.buffer_indices[0]
+                        buffer_sizes.pop(mid_buf, None)
+                        consumed += 1
 
         fused.append(task)
         i += 1 + consumed

@@ -44,17 +44,19 @@ __device__ void matmul_scalar(
 }
 
 __device__ __forceinline__ float apply_epilogue(float v, uint32_t flags,
-    const __half* bias, int col) {
+    const __half* bias, const __half* residual, int col, int idx) {
     if ((flags & EPILOGUE_BIAS) && bias)
         v += __half2float(bias[col]);
     if (flags & EPILOGUE_SILU)
-        return v / (1.0f + __expf(-v));
-    if (flags & EPILOGUE_GELU)
-        return v * 0.5f * (1.0f + erff(v * 0.7071067811865476f));
-    if (flags & EPILOGUE_GELU_TANH) {
+        v = v / (1.0f + __expf(-v));
+    else if (flags & EPILOGUE_GELU)
+        v = v * 0.5f * (1.0f + erff(v * 0.7071067811865476f));
+    else if (flags & EPILOGUE_GELU_TANH) {
         float c = 0.7978845608028654f * (v + 0.044715f * v * v * v);
-        return v * 0.5f * (1.0f + tanhf(c));
+        v = v * 0.5f * (1.0f + tanhf(c));
     }
+    if ((flags & EPILOGUE_RESIDUAL) && residual)
+        v += __half2float(residual[idx]);
     return v;
 }
 
@@ -65,7 +67,7 @@ __device__ void matmul_skinny(
     const __half* A, const __half* B, __half* C,
     int M, int N, int K,
     int tile_id, int num_tiles, uint32_t epilogue_flags,
-    const __half* bias)
+    const __half* bias, const __half* residual)
 {
     int active_tiles = min(num_tiles, (int)gridDim.x);
     int cols_per_tile = (N + active_tiles - 1) / active_tiles;
@@ -132,7 +134,7 @@ __device__ void matmul_skinny(
 
         if (valid) {
             for (int m = 0; m < M && m < SKINNY_MAX_M; m++)
-                C[(int64_t)m * N + my_n] = __float2half(apply_epilogue(acc[m], epilogue_flags, bias, my_n));
+                C[(int64_t)m * N + my_n] = __float2half(apply_epilogue(acc[m], epilogue_flags, bias, residual, my_n, m * N + my_n));
         }
     }
 }
@@ -185,8 +187,10 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
     if (M <= 4) {
         const __half* bias = (task.strides[1] & EPILOGUE_BIAS) ?
             (const __half*)buffers[task.buffer_indices[3]] : nullptr;
+        const __half* residual = (task.strides[1] & EPILOGUE_RESIDUAL) ?
+            (const __half*)buffers[task.buffer_indices[4]] : nullptr;
         matmul_skinny((const __half*)A, (const __half*)B, (__half*)C,
-                      M, N, K, tile_id, task.num_tiles, (uint32_t)task.strides[1], bias);
+                      M, N, K, tile_id, task.num_tiles, (uint32_t)task.strides[1], bias, residual);
         return;
     }
 
@@ -333,11 +337,14 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
         const uint32_t op = (uint32_t)task.strides[1];
         const __half* epi_bias = (op & EPILOGUE_BIAS) ?
             (const __half*)buffers[task.buffer_indices[3]] : nullptr;
+        const __half* epi_residual = (op & EPILOGUE_RESIDUAL) ?
+            (const __half*)buffers[task.buffer_indices[4]] : nullptr;
 
         CUTE_UNROLL
         for (int i = 0; i < size(tCrC); ++i) {
             if (elem_less(tCidC(i), make_shape(M, N))) {
-                tCgC(i) = half_t(apply_epilogue(tCrC(i), op, epi_bias, get<1>(tCidC(i))));
+                int col = get<1>(tCidC(i));
+                tCgC(i) = half_t(apply_epilogue(tCrC(i), op, epi_bias, epi_residual, col, get<0>(tCidC(i)) * N + col));
             }
         }
 
@@ -402,8 +409,10 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
     if (M <= 4) {
         const __half* bias = (task.strides[1] & EPILOGUE_BIAS) ?
             (const __half*)buffers[task.buffer_indices[3]] : nullptr;
+        const __half* residual = (task.strides[1] & EPILOGUE_RESIDUAL) ?
+            (const __half*)buffers[task.buffer_indices[4]] : nullptr;
         matmul_skinny((const __half*)A, (const __half*)B, (__half*)C,
-                      M, N, K, tile_id, task.num_tiles, (uint32_t)task.strides[1], bias);
+                      M, N, K, tile_id, task.num_tiles, (uint32_t)task.strides[1], bias, residual);
         return;
     }
 
@@ -567,16 +576,19 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
             }
         }
 
-        // --- Epilogue: optional bias + activation on fp32 accum, then convert to fp16 ---
+        // --- Epilogue: optional bias + activation + residual on fp32 accum, then convert to fp16 ---
         Tensor tCidC = thr_mma_s.partition_C(idC);
         const uint32_t op = (uint32_t)task.strides[1];
         const __half* epi_bias = (op & EPILOGUE_BIAS) ?
             (const __half*)buffers[task.buffer_indices[3]] : nullptr;
+        const __half* epi_residual = (op & EPILOGUE_RESIDUAL) ?
+            (const __half*)buffers[task.buffer_indices[4]] : nullptr;
 
         CUTE_UNROLL
         for (int i = 0; i < size(tCrC); ++i) {
             if (elem_less(tCidC(i), make_shape(M, N))) {
-                tCgC(i) = half_t(apply_epilogue(tCrC(i), op, epi_bias, get<1>(tCidC(i))));
+                int col = get<1>(tCidC(i));
+                tCgC(i) = half_t(apply_epilogue(tCrC(i), op, epi_bias, epi_residual, col, get<0>(tCidC(i)) * N + col));
             }
         }
 
