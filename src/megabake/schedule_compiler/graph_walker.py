@@ -9,7 +9,7 @@ from torch.export import export
 
 from megabake.data_types import (
     TaskDesc, OpType, ElemCode, ReduceCode, UopCode, UNUSED_BUFFER, pack_uop,
-    EPILOGUE_SILU, EPILOGUE_GELU, EPILOGUE_GELU_TANH,
+    EPILOGUE_SILU, EPILOGUE_GELU, EPILOGUE_GELU_TANH, EPILOGUE_BIAS,
 )
 from megabake.schedule_compiler.op_table import ATEN_OP_MAP
 from megabake.schedule_compiler.shape_ops import (
@@ -168,31 +168,59 @@ def _read_counts(tasks: list[TaskDesc]) -> dict[int, int]:
 def _fuse_tasks(
     tasks: list[TaskDesc], buffer_sizes: dict[int, int]
 ) -> list[TaskDesc]:
-    """Fuse adjacent MATMUL + unary ELEMENTWISE into a single fused op."""
+    """Fuse MATMUL + bias ADD + unary activation into fewer tasks via epilogue flags."""
     read_counts = _read_counts(tasks)
 
     fused: list[TaskDesc] = []
-    skip = False
-    for i, task in enumerate(tasks):
-        if skip:
-            skip = False
-            continue
+    i = 0
+    while i < len(tasks):
+        task = tasks[i]
+        consumed = 0
 
-        if (
-            task.op_type == OpType.MATMUL
-            and i + 1 < len(tasks)
-            and tasks[i + 1].op_type == OpType.ELEMENTWISE
-            and tasks[i + 1].op_code in _EPILOGUE_FUSE
-        ):
-            nxt = tasks[i + 1]
-            mid_buf = task.buffer_indices[0]
-            if nxt.buffer_indices[1] == mid_buf and read_counts.get(mid_buf, 0) == 1:
-                task.strides[1] |= _EPILOGUE_FUSE[nxt.op_code]
-                task.buffer_indices[0] = nxt.buffer_indices[0]
-                buffer_sizes.pop(mid_buf, None)
-                skip = True
+        if task.op_type == OpType.MATMUL:
+            j = i + 1
+
+            # Fuse bias: MATMUL → ADD where other input is 1D bias matching N
+            if (j < len(tasks)
+                and tasks[j].op_type == OpType.ELEMENTWISE
+                and tasks[j].op_code == ElemCode.ADD
+                and tasks[j].buffer_indices[2] != UNUSED_BUFFER):
+                nxt = tasks[j]
+                mid_buf = task.buffer_indices[0]
+                if nxt.buffer_indices[1] == mid_buf:
+                    bias_buf = nxt.buffer_indices[2]
+                elif nxt.buffer_indices[2] == mid_buf:
+                    bias_buf = nxt.buffer_indices[1]
+                else:
+                    bias_buf = UNUSED_BUFFER
+
+                if (bias_buf != UNUSED_BUFFER
+                    and read_counts.get(mid_buf, 0) == 1):
+                    bias_bytes = buffer_sizes.get(bias_buf, 0)
+                    N = task.dimensions[1]
+                    if N > 0 and bias_bytes == N * 2:
+                        task.strides[1] |= EPILOGUE_BIAS
+                        task.buffer_indices[3] = bias_buf
+                        task.buffer_indices[0] = nxt.buffer_indices[0]
+                        buffer_sizes.pop(mid_buf, None)
+                        consumed += 1
+                        j += 1
+
+            # Fuse activation: MATMUL → SILU/GELU/GELU_TANH
+            if (j < len(tasks)
+                and tasks[j].op_type == OpType.ELEMENTWISE
+                and tasks[j].op_code in _EPILOGUE_FUSE):
+                nxt = tasks[j]
+                mid_buf = task.buffer_indices[0]
+                if (nxt.buffer_indices[1] == mid_buf
+                    and read_counts.get(mid_buf, 0) == 1):
+                    task.strides[1] |= _EPILOGUE_FUSE[nxt.op_code]
+                    task.buffer_indices[0] = nxt.buffer_indices[0]
+                    buffer_sizes.pop(mid_buf, None)
+                    consumed += 1
 
         fused.append(task)
+        i += 1 + consumed
 
     return fused
 
@@ -1138,6 +1166,7 @@ def compile_from_ep(
                                 bias_arg = node.args[0]
                                 if hasattr(bias_arg, "name") and bias_arg.name in buffer_map:
                                     task.buffer_indices[3] = buffer_map[bias_arg.name]
+                                    task.strides[1] |= EPILOGUE_BIAS
                     else:
                         b_arg = node.args[1] if len(node.args) > 1 else None
 
