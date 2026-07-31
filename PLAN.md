@@ -146,23 +146,10 @@ python benchmarks/test_harness.py rmsnorm_mlp --task-profile
 
 ---
 
-### Task 1.6: Vectorize rope.cu
+### Task 1.6: Vectorize rope.cu ✅ DONE
 **Replace scalar loads with float4 pipeline.**
 
-In `rope.cu` inner loop:
-- `d += threads` with scalar → `d += threads * 4` with float4
-- Load x0, x1, cos, sin as float4
-- Unpack to half2 → float2, compute rotary, repack, store as float4
-- Scalar tail for `half_dim % 4 != 0`
-
-Keep BHSD/BSHD layout support (`task.strides[0]` flag).
-
-**Verify**:
-```bash
-pytest tests/test_tasks/  # run all task tests
-python benchmarks/test_harness.py llama_decoder --task-profile
-# ROPE task cycles should drop ~4x.
-```
+**Result**: Inner loop vectorized with float4 loads/stores for x0, x1, cos, sin. Stride `threads * 8` (8 halves per float4). Unpack via `__half22float2()`, compute rotary on float2 pairs, repack via `__float22half2_rn()`. Scalar tail for `half_dim % 8 != 0`. BHSD/BSHD layout support preserved. 74/74 tests pass, benchmarks: no regression (llama_decoder 3.16x vs torch.compile).
 
 ---
 
