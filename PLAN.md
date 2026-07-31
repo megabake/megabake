@@ -74,7 +74,7 @@ python benchmarks/bench_compare.py
 
 ---
 
-### Task 1.3: Graph splitting for unsupported ops ✅ DONE
+w### Task 1.3: Graph splitting for unsupported ops ✅ DONE
 **Compilation never crashes. Unknown ops degrade gracefully.**
 
 **Result**: Implemented eager fallback approach instead of full segment-based graph splitting. When unsupported ops exist: (1) graph walker allocates output buffers and warns instead of crashing, (2) `unsupported_ops` list stored in CompiledModel, (3) `run()` detects unsupported ops and falls back to running original model eagerly. 73/73 tests pass. BatchNorm1d verification: compiles with warning, max_diff=0.0. Models without unsupported ops unchanged (still use megakernel). Full segment-based graph splitting deferred until partial acceleration is needed.
@@ -120,13 +120,15 @@ print('max_diff:', (out.float() - ref.float()).abs().max().item())
 
 ---
 
-### Task 1.4: Vectorize reduce.cu — float4 all paths
+### Task 1.4: Vectorize reduce.cu — float4 all paths ✅ DONE
 **Replace scalar `__half2float(row_in[j])` with float4 loads everywhere.**
 
 For each reduce op (RMSNORM, LAYERNORM, SOFTMAX, SUM, MEAN, MAX):
 - Inner loops: `j += threads` with scalar load → `j += threads * 8` with float4 load
 - Unpack via `__half2*` → `__half22float2()`
 - Scalar tail for unaligned remainder
+
+**Result**: All 6 reduce ops (RMSNORM, LAYERNORM, SOFTMAX, SUM, MEAN, MAX) vectorized with float4 loads/stores. Each loop uses `j += threads * 8` stride, unpacks via `__half22float2()`, repacks via `__float22half2_rn()`. Scalar tail handles `row_size % 8 != 0`. ARGMAX left scalar (index tracking per pack not worth complexity for rare op). 74/74 tests pass, no regressions.
 
 **Verify**:
 ```bash
