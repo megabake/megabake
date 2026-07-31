@@ -49,15 +49,15 @@ def _load_module():
     if err != 0:
         raise RuntimeError(f"cuModuleGetFunction failed with error {err}")
 
-    if get_sm_version() >= 90:
-        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8
-        err = _cuda_driver.cuFuncSetAttribute(
-            _kernel,
-            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            102400,
-        )
-        if err != 0:
-            raise RuntimeError(f"cuFuncSetAttribute failed with error {err}")
+    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8
+    smem_limit = 225280 if get_sm_version() >= 90 else 102400
+    err = _cuda_driver.cuFuncSetAttribute(
+        _kernel,
+        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        smem_limit,
+    )
+    if err != 0:
+        raise RuntimeError(f"cuFuncSetAttribute failed with error {err}")
 
 
 def run_single_task(
@@ -140,16 +140,7 @@ def _launch_cooperative(
     """Launch megakernel via cuLaunchCooperativeKernel."""
     _load_module()
 
-    if get_sm_version() >= 90:
-        smem_bytes = 102400
-    else:
-        default_smem = ctypes.c_int()
-        _cuda_driver.cuDeviceGetAttribute(
-            ctypes.byref(default_smem),
-            8,  # CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK
-            0,
-        )
-        smem_bytes = default_smem.value
+    smem_bytes = 225280 if get_sm_version() >= 90 else 102400
 
     arg_tasks = ctypes.c_void_p(d_tasks_ptr)
     arg_num_tasks = ctypes.c_int(num_tasks)
