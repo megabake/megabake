@@ -2,9 +2,11 @@
 
 import torch
 
-from megabake.data_types import OpType
+from megabake.data_types import OpType, CACHE_LINE_INTS
 from megabake.schedule_compiler.graph_walker import CompiledModel
 from megabake.schedule_compiler.serializer import load_schedule
+from megabake.schedule_compiler.dependency import build_dependency_dag
+from megabake.schedule_compiler.scheduler import assign_tasks_to_sms
 from megabake.runtime.launcher import _launch_cooperative
 
 
@@ -16,6 +18,9 @@ class _CachedRunner:
         "_num_tasks", "_num_sms", "_workspace", "_weight_tensors",
         "_input_buffer_ids", "_output_buffer_id", "_output_shape", "_num_buffers",
         "_arena", "_input_holders",
+        "_d_sm_queues", "_d_queue_lens", "_dep_count_template",
+        "_tile_remaining_template", "_d_succ_offset", "_d_succ_list",
+        "_max_queue_len", "_scheduler_type",
     )
 
     def __init__(self):
@@ -80,6 +85,57 @@ class _CachedRunner:
         self._ptr_tensor = torch.tensor(ptrs, dtype=torch.int64, device="cuda")
         self._d_dyn_dims = torch.zeros(8, dtype=torch.int32, device="cuda")
         self._input_holders = [None] * len(compiled.input_buffer_ids)
+
+        dep_counts, successors = build_dependency_dag(tasks)
+        sm_queues = assign_tasks_to_sms(
+            tasks, dep_counts, successors, self._num_sms
+        )
+
+        max_ql = max((len(q) for q in sm_queues), default=0)
+        self._max_queue_len = max_ql
+        self._scheduler_type = 1
+
+        sq_flat = torch.zeros(
+            self._num_sms * max_ql * 2, dtype=torch.int32, device="cuda"
+        )
+        for sm_id, queue in enumerate(sm_queues):
+            for j, (tid, tile) in enumerate(queue):
+                idx = (sm_id * max_ql + j) * 2
+                sq_flat[idx] = tid
+                sq_flat[idx + 1] = tile
+        self._d_sm_queues = sq_flat
+
+        self._d_queue_lens = torch.tensor(
+            [len(q) for q in sm_queues], dtype=torch.int32, device="cuda"
+        )
+
+        num_t = len(tasks)
+        dc_template = torch.zeros(
+            num_t * CACHE_LINE_INTS, dtype=torch.int32, device="cuda"
+        )
+        for i, dc in enumerate(dep_counts):
+            dc_template[i * CACHE_LINE_INTS] = dc
+        self._dep_count_template = dc_template
+
+        tr_template = torch.zeros(
+            num_t * CACHE_LINE_INTS, dtype=torch.int32, device="cuda"
+        )
+        for i, task in enumerate(tasks):
+            tr_template[i * CACHE_LINE_INTS] = max(task.num_tiles, 1)
+        self._tile_remaining_template = tr_template
+
+        succ_offset = [0]
+        succ_flat = []
+        for s in successors:
+            succ_flat.extend(s)
+            succ_offset.append(len(succ_flat))
+        self._d_succ_offset = torch.tensor(
+            succ_offset, dtype=torch.int32, device="cuda"
+        )
+        self._d_succ_list = torch.tensor(
+            succ_flat if succ_flat else [0], dtype=torch.int32, device="cuda"
+        )
+
         self._compiled_id = id(compiled)
 
     def run(
@@ -110,6 +166,9 @@ class _CachedRunner:
                 self._ptr_tensor[input_buf_id] = workspace.data_ptr()
                 self._input_holders[i] = None
 
+        dep_count_gpu = self._dep_count_template.clone()
+        tile_remaining_gpu = self._tile_remaining_template.clone()
+
         _launch_cooperative(
             self._d_tasks.data_ptr(),
             self._num_tasks,
@@ -117,6 +176,14 @@ class _CachedRunner:
             self._d_dyn_dims.data_ptr(),
             self._num_sms,
             task_timings_ptr=task_timings_ptr,
+            sm_queues_ptr=self._d_sm_queues.data_ptr(),
+            sm_queue_lens_ptr=self._d_queue_lens.data_ptr(),
+            dep_count_ptr=dep_count_gpu.data_ptr(),
+            tile_remaining_ptr=tile_remaining_gpu.data_ptr(),
+            succ_list_ptr=self._d_succ_list.data_ptr(),
+            succ_offset_ptr=self._d_succ_offset.data_ptr(),
+            max_queue_len=self._max_queue_len,
+            scheduler_type=self._scheduler_type,
         )
 
         numel = 1

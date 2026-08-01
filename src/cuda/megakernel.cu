@@ -51,24 +51,56 @@ __global__ void __launch_bounds__(256, 1) megakernel(
     int num_tasks,
     void** __restrict__ buffers,
     const int* __restrict__ dyn_dims,
-    long long* task_timings
+    long long* task_timings,
+    const SMQueueEntry* __restrict__ sm_queues,
+    const int* __restrict__ sm_queue_lens,
+    int* dep_count,
+    int* tile_remaining,
+    const int* __restrict__ succ_list,
+    const int* __restrict__ succ_offset,
+    int max_queue_len,
+    int scheduler_type
 ) {
-    namespace cg = cooperative_groups;
-    cg::grid_group grid = cg::this_grid();
-
     const int sm_id = blockIdx.x;
 
-    for (int i = 0; i < num_tasks; i++) {
-        const TaskDesc& task = tasks[i];
+    if (scheduler_type == 0) {
+        namespace cg = cooperative_groups;
+        cg::grid_group grid = cg::this_grid();
+
+        for (int i = 0; i < num_tasks; i++) {
+            const TaskDesc& task = tasks[i];
+            PROFILE_TASK_BEGIN(task_timings);
+            if (sm_id < static_cast<int>(task.num_tiles))
+                dispatch_task(task, buffers, dyn_dims, sm_id);
+            PROFILE_TASK_END(i, sm_id, task_timings, gridDim.x);
+            grid.sync();
+        }
+        return;
+    }
+
+    const int queue_len = sm_queue_lens[sm_id];
+
+    for (int q = 0; q < queue_len; q++) {
+        SMQueueEntry entry = sm_queues[sm_id * max_queue_len + q];
+        int tid = entry.task_id;
+
+        if (threadIdx.x == 0)
+            while (atomicAdd(&dep_count[tid * CACHE_LINE_INTS], 0) != 0) {}
+        __syncthreads();
 
         PROFILE_TASK_BEGIN(task_timings);
+        dispatch_task(tasks[tid], buffers, dyn_dims, entry.tile_id);
+        PROFILE_TASK_END(tid, sm_id, task_timings, gridDim.x);
 
-        if (sm_id < static_cast<int>(task.num_tiles)) {
-            dispatch_task(task, buffers, dyn_dims, sm_id);
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            __threadfence();
+            int rem = atomicSub(&tile_remaining[tid * CACHE_LINE_INTS], 1);
+            if (rem == 1) {
+                for (int s = succ_offset[tid]; s < succ_offset[tid + 1]; s++)
+                    atomicSub(&dep_count[succ_list[s] * CACHE_LINE_INTS], 1);
+            }
         }
-
-        PROFILE_TASK_END(i, sm_id, task_timings, gridDim.x);
-
-        grid.sync();
     }
 }
