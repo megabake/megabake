@@ -2,6 +2,7 @@
 
 import torch
 
+from megabake.data_types import OpType
 from megabake.schedule_compiler.graph_walker import CompiledModel
 from megabake.schedule_compiler.serializer import load_schedule
 from megabake.runtime.launcher import _launch_cooperative
@@ -42,6 +43,17 @@ class _CachedRunner:
                 self._weight_tensors[wm.buffer_index] = (
                     state_dict[name].contiguous().cuda().half()
                 )
+
+        # Pre-transpose non-transposed weights for skinny matmul (M<=4)
+        # so they route through the fast skinny path instead of matmul_scalar
+        for task in tasks:
+            if (task.op_type == OpType.MATMUL
+                    and task.dimensions[0] <= 4
+                    and task.strides[0] == 0):
+                wb = task.buffer_indices[2]
+                if wb in self._weight_tensors:
+                    self._weight_tensors[wb] = self._weight_tensors[wb].t().contiguous()
+                    task.strides[0] = 1
 
         # Arena allocation: single cudaMalloc, carve sub-regions
         total_arena = 0
