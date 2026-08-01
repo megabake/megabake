@@ -22,7 +22,7 @@ def profile_model(compiled, model_or_sd, *inputs):
     megabake.run(compiled, model_or_sd, *inputs)
     torch.cuda.synchronize()
 
-    _, tasks, _, _, _ = load_schedule(compiled.schedule_bytes)
+    _, tasks, *_ = load_schedule(compiled.schedule_bytes)
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
 
     buf = torch.zeros(len(tasks) * num_sms, dtype=torch.int64, device="cuda")

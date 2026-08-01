@@ -112,6 +112,13 @@ struct __align__(4) WeightMapping {
     uint16_t _pad;
 };
 
+#define CACHE_LINE_INTS 32
+
+struct __align__(8) SMQueueEntry {
+    uint32_t task_id;
+    uint32_t tile_id;
+};
+
 struct ScheduleHeader {
     uint32_t magic;
     uint32_t version;
@@ -126,6 +133,10 @@ struct ScheduleHeader {
     uint32_t sm_version;
     uint16_t compute_dtype;
     uint16_t _padding;
+    uint32_t num_sms;
+    uint32_t max_queue_len;
+    uint32_t num_edges;
+    uint32_t scheduler_type;
 };
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {

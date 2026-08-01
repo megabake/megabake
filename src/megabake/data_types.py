@@ -180,7 +180,26 @@ class WeightMapping:
 
 
 SCHEDULE_MAGIC = 0x4D454741  # "MEGA"
-SCHEDULE_VERSION = 1
+SCHEDULE_VERSION = 2
+
+CACHE_LINE_INTS = 32
+
+
+@dataclass
+class SMQueueEntry:
+    task_id: int = 0
+    tile_id: int = 0
+
+    STRUCT_FORMAT = "<II"
+    STRUCT_SIZE = 8
+
+    def to_bytes(self) -> bytes:
+        return struct.pack(self.STRUCT_FORMAT, self.task_id, self.tile_id)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "SMQueueEntry":
+        task_id, tile_id = struct.unpack(cls.STRUCT_FORMAT, data)
+        return cls(task_id=task_id, tile_id=tile_id)
 
 
 @dataclass
@@ -197,9 +216,13 @@ class ScheduleHeader:
     seq_max: int = 0
     sm_version: int = 0
     compute_dtype: int = 0
+    num_sms: int = 0
+    max_queue_len: int = 0
+    num_edges: int = 0
+    scheduler_type: int = 0
 
-    STRUCT_FORMAT = "<IIIIQ IIIII IHxx"
-    STRUCT_SIZE = struct.calcsize(STRUCT_FORMAT)  # 52
+    STRUCT_FORMAT = "<IIIIQ IIIII IHxx IIII"
+    STRUCT_SIZE = struct.calcsize(STRUCT_FORMAT)
 
     def to_bytes(self) -> bytes:
         return struct.pack(
@@ -208,6 +231,8 @@ class ScheduleHeader:
             self.workspace_bytes, self.num_weight_mappings,
             self.batch_min, self.batch_max, self.seq_min, self.seq_max,
             self.sm_version, self.compute_dtype,
+            self.num_sms, self.max_queue_len, self.num_edges,
+            self.scheduler_type,
         )
 
     @classmethod
@@ -220,4 +245,6 @@ class ScheduleHeader:
             batch_min=vals[6], batch_max=vals[7],
             seq_min=vals[8], seq_max=vals[9],
             sm_version=vals[10], compute_dtype=vals[11],
+            num_sms=vals[12], max_queue_len=vals[13],
+            num_edges=vals[14], scheduler_type=vals[15],
         )
