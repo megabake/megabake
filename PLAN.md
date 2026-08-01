@@ -335,8 +335,10 @@ pytest tests/test_schedule_compiler/test_serializer.py
 
 ---
 
-### Task 3.4: Counter-based device execution loop
+### Task 3.4: Counter-based device execution loop ✅ DONE
 **New megakernel loop. BSP fallback via scheduler_type flag.**
+
+**Result**: `megakernel.cu` extended with 8 new kernel params (sm_queues, sm_queue_lens, dep_count, tile_remaining, succ_list, succ_offset, max_queue_len, scheduler_type). `scheduler_type==0`: BSP fallback (existing grid.sync loop, unchanged). `scheduler_type==1`: counter-based per-SM queue walk — thread 0 spins on `atomicAdd(dep_count, 0)`, `__syncthreads()` broadcasts to block, dispatch_task runs, `__threadfence()` + `atomicSub(tile_remaining)` signals successors when last tile completes. `launcher.py` `_launch_cooperative()` extended with 8 new params (default 0 for BSP compatibility — `run_single_task`/`run_tasks` test helpers unchanged). `loader.py` `_CachedRunner._setup()` builds dependency DAG + assigns tasks to SMs at runtime via `build_dependency_dag()` + `assign_tasks_to_sms()`. Uploads sm_queues, queue_lens, dep_count (128-byte padded via CACHE_LINE_INTS=32), tile_remaining, succ_offset, succ_list to GPU. `run()` clones dep_count/tile_remaining templates per launch (atomics mutate them). 99/99 tests pass (1 pre-existing llama e2e failure excluded). Benchmarks: no regression (llama_decoder 2.61x vs torch.compile). 1000-iteration stress test: no deadlocks, deterministic output.
 
 In `megakernel.cu`:
 - Add `SMQueueEntry` struct
