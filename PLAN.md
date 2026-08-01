@@ -304,8 +304,10 @@ pytest tests/test_schedule_compiler/
 
 ---
 
-### Task 3.3: Extend serialization for scheduler data
+### Task 3.3: Extend serialization for scheduler data ✅ DONE
 **Serialize per-SM queues, dep_count[], successor_list[], tile_remaining[].**
+
+**Result**: `SMQueueEntry` dataclass added to `data_types.py` (task_id, tile_id as uint32 pair). `ScheduleHeader` extended with `num_sms`, `max_queue_len`, `num_edges`, `scheduler_type` (4 new uint32 fields). `SCHEDULE_VERSION` bumped to 2. `CACHE_LINE_INTS = 32` constant added. CUDA `data_types.cuh` mirrored: `SMQueueEntry` struct + `CACHE_LINE_INTS` define + extended `ScheduleHeader`. `write_schedule()` accepts optional `sm_queues`, `dep_count`, `successors`, `scheduler_type` — appends SM queue entries (padded to max_queue_len per SM), queue lengths, dep_count[], tile_remaining[], successor_offset[], successor_list[] after string table. `load_schedule()` returns 10-tuple (added sm_queues, dep_count, tile_remaining, succ_offset, succ_list — all None when scheduler_type==0). All callers updated to `*_` unpacking. 6 new tests: SMQueueEntry round-trip, header scheduler fields, full scheduler round-trip (3 SMs, dependency chain), scheduler+weights combo, no-scheduler backward compat, no-edges case. 53/53 schedule_compiler tests pass. No regressions (54 pre-existing CUDA batch failures unchanged).
 
 In `data_types.py`:
 - Add `SMQueueEntry` dataclass (task_id: uint32, tile_id: uint32)

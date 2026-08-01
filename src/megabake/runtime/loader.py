@@ -22,7 +22,7 @@ class _CachedRunner:
         self._compiled_id = None
 
     def _setup(self, compiled: CompiledModel, state_dict: dict[str, torch.Tensor]):
-        _, tasks, buffer_descs, weight_maps, weight_names = load_schedule(
+        _, tasks, buffer_descs, weight_maps, weight_names, *_ = load_schedule(
             compiled.schedule_bytes
         )
         self._num_sms = torch.cuda.get_device_properties(0).multi_processor_count

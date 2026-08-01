@@ -167,8 +167,9 @@ __device__ void task_fused_elementwise(const TaskDesc& task, void** buffers,
                 partial += regs[rd_src];
         }
 
-        // Block reduce
-        __shared__ float _rs[8];
+        // Block reduce — use dynamic SMEM to avoid shifting extern __shared__ base
+        extern __shared__ char smem_fe[];
+        float* _rs = (float*)smem_fe;
         if (rd_op == UOP_REDUCE_MAX)
             partial = block_reduce_max(partial, _rs);
         else
