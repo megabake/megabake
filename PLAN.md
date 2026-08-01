@@ -202,22 +202,10 @@ python benchmarks/test_harness.py llama_decoder --task-profile
 
 ---
 
-### Task 2.5: Weight pre-transposition for decode
+### Task 2.5: Weight pre-transposition for decode ✅ DONE
 **Pre-transpose weights to column-major for coalesced reads. Cache on first call.**
 
-In `loader.py` `_CachedRunner._setup()`:
-- After loading weight tensors, check if any matmul task has M<=4 (decode shape)
-- If yes, transpose weight tensor: `weight = weight.t().contiguous()`
-- Cache transposed version — don't re-transpose on repeated runs
-
-Also update `graph_walker.py`: when M<=4 and B is already transposed (strides[0]=1), the pre-transposition means B is now in column-major for coalesced warp reads.
-
-**Verify**:
-```bash
-pytest tests/
-python benchmarks/bench_compare.py --models linear_256x512,linear_512x1024
-# Linear benchmarks should show improvement
-```
+**Result**: Reduced scope after analysis — Task 2.4's cooperative cp.async loading already solved coalescing for the common case (nn.Linear, strides[0]=1, B is (N,K)). Transposing (N,K) to (K,N) would break cp.async 16-byte contiguous loads along K. Instead: runtime pre-transposition in `loader.py` for the uncommon strides[0]==0 case (raw `torch.mm` with contiguous B). Loader detects M<=4 matmul tasks with non-transposed B, transposes weight to (N,K) layout, and flips strides[0] to 1, routing through fast skinny path instead of terrible matmul_scalar fallback. Cached via `_CachedRunner` (setup runs once per compiled model). No CUDA or graph_walker changes. 77/77 tests pass. Benchmarks: no regression (llama_decoder 2.67x, rmsnorm_mlp 1.52x).
 
 ---
 
