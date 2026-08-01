@@ -93,9 +93,9 @@ __global__ void __launch_bounds__(256, 1) megakernel(
         PROFILE_TASK_END(tid, sm_id, task_timings, gridDim.x);
 
         __syncthreads();
+        __threadfence();
 
         if (threadIdx.x == 0) {
-            __threadfence();
             int rem = atomicSub(&tile_remaining[tid * CACHE_LINE_INTS], 1);
             if (rem == 1) {
                 for (int s = succ_offset[tid]; s < succ_offset[tid + 1]; s++)

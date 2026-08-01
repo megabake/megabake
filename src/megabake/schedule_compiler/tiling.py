@@ -14,8 +14,8 @@ def compute_tiles(op_type: int, dims: list[int], sm_version: int, num_sms: int =
         tiles_n = (N + 127) // 128
         return min(tiles_m * tiles_n, max_sms)
     elif op_type == OpType.ATTENTION:
-        batch, num_heads = dims[0], dims[1]
-        return min(batch * num_heads, max_sms)
+        batch, num_heads, seq_q = dims[0], dims[1], dims[2]
+        return min(batch * num_heads * seq_q, max_sms)
     elif op_type in (OpType.ELEMENTWISE, OpType.FUSED_ELEMENTWISE):
         total = dims[0]
         return min((total + 4095) // 4096, max_sms)

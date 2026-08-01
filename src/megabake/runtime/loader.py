@@ -5,7 +5,7 @@ import torch
 from megabake.data_types import OpType, CACHE_LINE_INTS
 from megabake.schedule_compiler.graph_walker import CompiledModel
 from megabake.schedule_compiler.serializer import load_schedule
-from megabake.schedule_compiler.dependency import build_dependency_dag
+from megabake.schedule_compiler.dependency import build_dependency_dag, add_arena_anti_dependences
 from megabake.schedule_compiler.scheduler import assign_tasks_to_sms
 from megabake.runtime.launcher import _launch_cooperative
 
@@ -87,6 +87,7 @@ class _CachedRunner:
         self._input_holders = [None] * len(compiled.input_buffer_ids)
 
         dep_counts, successors = build_dependency_dag(tasks)
+        add_arena_anti_dependences(tasks, buffer_descs, dep_counts, successors)
         sm_queues = assign_tasks_to_sms(
             tasks, dep_counts, successors, self._num_sms
         )
