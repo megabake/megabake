@@ -8,7 +8,7 @@
 #define ATTN_BK 64
 
 __device__ void task_attention(const TaskDesc& task, void** buffers,
-                               const int* dyn_dims, int tile_id) {
+                               const int* dyn_dims, int tile_id, uint32_t dispatch_flags) {
     __half* out = (__half*)buffers[task.buffer_indices[0]];
     const __half* Q = (const __half*)buffers[task.buffer_indices[1]];
     const __half* K = (const __half*)buffers[task.buffer_indices[2]];

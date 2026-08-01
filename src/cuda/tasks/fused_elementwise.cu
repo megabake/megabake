@@ -52,7 +52,7 @@ __device__ __forceinline__ void exec_scalar_uop(
 }
 
 __device__ void task_fused_elementwise(const TaskDesc& task, void** buffers,
-                                       const int* dyn_dims, int tile_id) {
+                                       const int* dyn_dims, int tile_id, uint32_t dispatch_flags) {
     const int numel = task.dimensions[0];
     const int num_uops = task.dimensions[1];
     const int threads = blockDim.x;

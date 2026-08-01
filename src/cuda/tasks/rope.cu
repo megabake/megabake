@@ -2,7 +2,7 @@
 #include <cuda_fp16.h>
 
 __device__ void task_rope(const TaskDesc& task, void** buffers,
-                           const int* dyn_dims, int tile_id) {
+                           const int* dyn_dims, int tile_id, uint32_t dispatch_flags) {
     __half* out = (__half*)buffers[task.buffer_indices[0]];
     const __half* in0 = (const __half*)buffers[task.buffer_indices[1]];
     const __half* cos_cache = (const __half*)buffers[task.buffer_indices[2]];

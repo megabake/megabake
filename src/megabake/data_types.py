@@ -180,26 +180,38 @@ class WeightMapping:
 
 
 SCHEDULE_MAGIC = 0x4D454741  # "MEGA"
-SCHEDULE_VERSION = 2
+SCHEDULE_VERSION = 3
 
 CACHE_LINE_INTS = 32
+
+SMEM_PAGE_SIZE = 14 * 1024
+QFLAG_HANDOFF = 1 << 31
+TILE_ID_MASK = 0x7FFFFFFF
+DISPATCH_PREFETCHED = 0x01
+DISPATCH_HANDOFF = 0x02
 
 
 @dataclass
 class SMQueueEntry:
     task_id: int = 0
     tile_id: int = 0
+    prefetch_buf_idx: int = UNUSED_BUFFER
+    prefetch_bytes: int = 0
 
-    STRUCT_FORMAT = "<II"
-    STRUCT_SIZE = 8
+    STRUCT_FORMAT = "<IIII"
+    STRUCT_SIZE = 16
 
     def to_bytes(self) -> bytes:
-        return struct.pack(self.STRUCT_FORMAT, self.task_id, self.tile_id)
+        return struct.pack(self.STRUCT_FORMAT, self.task_id, self.tile_id,
+                           self.prefetch_buf_idx, self.prefetch_bytes)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "SMQueueEntry":
-        task_id, tile_id = struct.unpack(cls.STRUCT_FORMAT, data)
-        return cls(task_id=task_id, tile_id=tile_id)
+        task_id, tile_id, prefetch_buf_idx, prefetch_bytes = struct.unpack(
+            cls.STRUCT_FORMAT, data)
+        return cls(task_id=task_id, tile_id=tile_id,
+                   prefetch_buf_idx=prefetch_buf_idx,
+                   prefetch_bytes=prefetch_bytes)
 
 
 @dataclass

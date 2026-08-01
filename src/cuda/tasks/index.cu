@@ -2,7 +2,7 @@
 #include <cuda_fp16.h>
 
 __device__ void task_index(const TaskDesc& task, void** buffers,
-                            const int* dyn_dims, int tile_id) {
+                            const int* dyn_dims, int tile_id, uint32_t dispatch_flags) {
     const uint32_t total_elems = task.dimensions[0];
     const int threads = blockDim.x;
     const int num_tiles = task.num_tiles;

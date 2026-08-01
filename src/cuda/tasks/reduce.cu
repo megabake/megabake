@@ -2,7 +2,7 @@
 #include <cuda_fp16.h>
 
 __device__ void task_reduce(const TaskDesc& task, void** buffers,
-                             const int* dyn_dims, int tile_id) {
+                             const int* dyn_dims, int tile_id, uint32_t dispatch_flags) {
     __half* out = (__half*)buffers[task.buffer_indices[0]];
     const __half* in0 = (const __half*)buffers[task.buffer_indices[1]];
     const __half* weight = (task.buffer_indices[2] != 0xFFFFFFFF)
@@ -290,6 +290,16 @@ __device__ void task_reduce(const TaskDesc& task, void** buffers,
                 __syncthreads();
                 break;
             }
+        }
+
+        // SMEM handoff: copy output row to handoff page for next matmul
+        if (dispatch_flags & DISPATCH_HANDOFF) {
+            __half* handoff = (__half*)(smem_raw + HANDOFF_SMEM_OFFSET);
+            for (uint32_t j = threadIdx.x * 8; j < row_size_v; j += threads * 8)
+                *(float4*)(handoff + j) = *(const float4*)(row_out + j);
+            for (uint32_t j = row_size_v + threadIdx.x; j < row_size; j += threads)
+                handoff[j] = row_out[j];
+            __syncthreads();
         }
     }
 }
