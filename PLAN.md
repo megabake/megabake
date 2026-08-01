@@ -250,8 +250,10 @@ pytest tests/test_tasks/test_elementwise.py
 
 ## Phase 3: Scheduler
 
-### Task 3.1: Dependency DAG extraction
+### Task 3.1: Dependency DAG extraction ✅ DONE
 **Build producer/consumer graph from buffer_indices.**
+
+**Result**: Created `dependency.py` with `build_dependency_dag(tasks)`. Two-pass: first pass builds buffer→producer map, second pass scans inputs and builds edges. Deduplicates edges when a task reads same producer via multiple buffer slots. Self-references (output==input) ignored. 5 unit tests (linear chain, diamond, no deps, duplicate inputs, self-ref). 86/86 tests pass (1 pre-existing llama e2e failure excluded).
 
 Create `src/megabake/schedule_compiler/dependency.py`:
 
