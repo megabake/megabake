@@ -1,6 +1,29 @@
 """Compute tile counts for task types."""
 
+import math
 from megabake.data_types import OpType
+
+# ponytail: only config 0 (128x128) implemented in CUDA. Add 64x128, 128x256 when profiling shows benefit on real prefill workloads.
+MATMUL_CONFIGS = [
+    (0, 128, 128),
+    (1, 64, 128),
+    (2, 128, 256),
+]
+
+
+def select_matmul_config(M, N, K, num_sms):
+    if M <= 4:
+        return -1
+    best_score, best_id = 0.0, 0
+    for config_id, bm, bn in MATMUL_CONFIGS:
+        tiles = math.ceil(M / bm) * math.ceil(N / bn)
+        sm_util = min(tiles, num_sms) / num_sms
+        waves = math.ceil(tiles / num_sms)
+        wave_eff = tiles / (waves * num_sms)
+        score = sm_util * wave_eff
+        if score > best_score:
+            best_score, best_id = score, config_id
+    return best_id
 
 
 def compute_tiles(op_type: int, dims: list[int], sm_version: int, num_sms: int = 0) -> int:

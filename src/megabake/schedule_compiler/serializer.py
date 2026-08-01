@@ -18,7 +18,7 @@ def write_schedule(
     compute_dtype: int,
     batch_range: tuple[int, int],
     seq_range: tuple[int, int],
-    sm_queues: list[list[tuple[int, int]]] | None = None,
+    sm_queues: list[list] | None = None,
     dep_count: list[int] | None = None,
     successors: list[list[int]] | None = None,
     scheduler_type: int = 0,
@@ -77,13 +77,16 @@ def write_schedule(
 
     if num_sms > 0:
         assert sm_queues is not None and dep_count is not None and successors is not None
-        # SM queue entries: each SM padded to max_queue_len
+        # SM queue entries: each SM padded to max_queue_len (16 bytes each)
         for q in sm_queues:
-            for task_id, tile_id in q:
-                data += struct.pack("<II", task_id, tile_id)
-            # Pad remaining slots
+            for entry in q:
+                if isinstance(entry, SMQueueEntry):
+                    data += entry.to_bytes()
+                else:
+                    tid, tile = entry
+                    data += struct.pack("<IIII", tid, tile, 0xFFFFFFFF, 0)
             for _ in range(max_queue_len - len(q)):
-                data += struct.pack("<II", 0, 0)
+                data += struct.pack("<IIII", 0, 0, 0xFFFFFFFF, 0)
 
         # SM queue lengths
         for q in sm_queues:

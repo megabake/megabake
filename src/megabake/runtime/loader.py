@@ -6,7 +6,7 @@ from megabake.data_types import OpType, CACHE_LINE_INTS
 from megabake.schedule_compiler.graph_walker import CompiledModel
 from megabake.schedule_compiler.serializer import load_schedule
 from megabake.schedule_compiler.dependency import build_dependency_dag, add_arena_anti_dependences
-from megabake.schedule_compiler.scheduler import assign_tasks_to_sms
+from megabake.schedule_compiler.scheduler import assign_tasks_to_sms, plan_prefetch
 from megabake.runtime.launcher import _launch_cooperative
 
 
@@ -88,23 +88,26 @@ class _CachedRunner:
 
         dep_counts, successors = build_dependency_dag(tasks)
         add_arena_anti_dependences(tasks, buffer_descs, dep_counts, successors)
-        sm_queues = assign_tasks_to_sms(
+        sm_queues_raw = assign_tasks_to_sms(
             tasks, dep_counts, successors, self._num_sms
         )
+        sm_queues = plan_prefetch(sm_queues_raw, tasks, self._num_sms)
 
         max_ql = max((len(q) for q in sm_queues), default=0)
         self._max_queue_len = max_ql
         self._scheduler_type = 1
 
-        sq_flat = torch.zeros(
-            self._num_sms * max_ql * 2, dtype=torch.int32, device="cuda"
-        )
+        import struct as _struct
+        sq_bytes = bytearray(self._num_sms * max_ql * 16)
         for sm_id, queue in enumerate(sm_queues):
-            for j, (tid, tile) in enumerate(queue):
-                idx = (sm_id * max_ql + j) * 2
-                sq_flat[idx] = tid
-                sq_flat[idx + 1] = tile
-        self._d_sm_queues = sq_flat
+            for j, entry in enumerate(queue):
+                off = (sm_id * max_ql + j) * 16
+                _struct.pack_into("<IIII", sq_bytes, off,
+                                 entry.task_id, entry.tile_id,
+                                 entry.prefetch_buf_idx, entry.prefetch_bytes)
+        self._d_sm_queues = torch.frombuffer(
+            sq_bytes, dtype=torch.uint8
+        ).cuda()
 
         self._d_queue_lens = torch.tensor(
             [len(q) for q in sm_queues], dtype=torch.int32, device="cuda"

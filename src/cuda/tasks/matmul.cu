@@ -98,7 +98,8 @@ __device__ void matmul_skinny(
     const __half* A, const __half* B, __half* C,
     int M, int N, int K,
     int tile_id, int num_tiles, uint32_t epilogue_flags,
-    const __half* bias, const __half* residual)
+    const __half* bias, const __half* residual,
+    uint32_t dispatch_flags)
 {
     int active_tiles = min(num_tiles, (int)gridDim.x);
     int cols_per_tile = (N + active_tiles - 1) / active_tiles;
@@ -140,10 +141,13 @@ __device__ void matmul_skinny(
         int cur = 0;
         int k_tiles = (K + bk - 1) / bk;
 
-        // Prefetch first B chunk
+        // Prefetch first B chunk (skip if megakernel already prefetched it)
         int kc0 = min(bk, K);
-        skinny_load_b_async(b_buf[0], B, n_base, actual_cols, K, 0, kc0, bk);
-        skinny_cp_async_commit();
+        bool skip_first_b = (dispatch_flags & DISPATCH_PREFETCHED) && n_base == n_start;
+        if (!skip_first_b) {
+            skinny_load_b_async(b_buf[0], B, n_base, actual_cols, K, 0, kc0, bk);
+            skinny_cp_async_commit();
+        }
 
         for (int kt = 0; kt < k_tiles; kt++) {
             int k_base = kt * bk;
@@ -159,12 +163,18 @@ __device__ void matmul_skinny(
             }
             skinny_cp_async_commit();
 
-            // Load A chunk cooperatively (regular loads — A is tiny for M<=4)
+            // Load A chunk (from SMEM handoff if available, else from HBM)
             int a_total = M * kc;
-            for (int i = (int)threadIdx.x; i < a_total; i += (int)blockDim.x) {
-                int mr = i / kc;
-                int kr = i % kc;
-                a_smem[i] = A[(int64_t)mr * K + k_base + kr];
+            if ((dispatch_flags & DISPATCH_HANDOFF) && kt == 0) {
+                const __half* handoff = (const __half*)(smem + HANDOFF_SMEM_OFFSET);
+                for (int i = (int)threadIdx.x; i < a_total; i += (int)blockDim.x)
+                    a_smem[i] = handoff[i];
+            } else {
+                for (int i = (int)threadIdx.x; i < a_total; i += (int)blockDim.x) {
+                    int mr = i / kc;
+                    int kr = i % kc;
+                    a_smem[i] = A[(int64_t)mr * K + k_base + kr];
+                }
             }
 
             // Wait for current B buffer
@@ -246,7 +256,7 @@ using G2SCopy_t = decltype(make_tiled_copy(
     Layout<Shape<_1, _8>>{}));
 
 __device__ void task_matmul(const TaskDesc& task, void** buffers,
-                            const int* dyn_dims, int tile_id) {
+                            const int* dyn_dims, int tile_id, uint32_t dispatch_flags) {
     half_t*       C = (half_t*)buffers[task.buffer_indices[0]];
     const half_t* A = (const half_t*)buffers[task.buffer_indices[1]];
     const half_t* B = (const half_t*)buffers[task.buffer_indices[2]];
@@ -268,7 +278,8 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
         const __half* residual = (task.strides[1] & EPILOGUE_RESIDUAL) ?
             (const __half*)buffers[task.buffer_indices[4]] : nullptr;
         matmul_skinny((const __half*)A, (const __half*)B, (__half*)C,
-                      M, N, K, tile_id, task.num_tiles, (uint32_t)task.strides[1], bias, residual);
+                      M, N, K, tile_id, task.num_tiles, (uint32_t)task.strides[1], bias, residual,
+                      dispatch_flags);
         return;
     }
 
@@ -468,7 +479,7 @@ using S2RAtomA_t = Copy_Atom<SM75_U32x4_LDSM_N, half_t>;
 using S2RAtomB_t = Copy_Atom<SM75_U32x4_LDSM_N, half_t>;
 
 __device__ void task_matmul(const TaskDesc& task, void** buffers,
-                            const int* dyn_dims, int tile_id) {
+                            const int* dyn_dims, int tile_id, uint32_t dispatch_flags) {
     half_t*       C = (half_t*)buffers[task.buffer_indices[0]];
     const half_t* A = (const half_t*)buffers[task.buffer_indices[1]];
     const half_t* B = (const half_t*)buffers[task.buffer_indices[2]];
@@ -490,7 +501,8 @@ __device__ void task_matmul(const TaskDesc& task, void** buffers,
         const __half* residual = (task.strides[1] & EPILOGUE_RESIDUAL) ?
             (const __half*)buffers[task.buffer_indices[4]] : nullptr;
         matmul_skinny((const __half*)A, (const __half*)B, (__half*)C,
-                      M, N, K, tile_id, task.num_tiles, (uint32_t)task.strides[1], bias, residual);
+                      M, N, K, tile_id, task.num_tiles, (uint32_t)task.strides[1], bias, residual,
+                      dispatch_flags);
         return;
     }
 

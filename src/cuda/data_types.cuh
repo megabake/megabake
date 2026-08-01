@@ -17,6 +17,15 @@
 #define EPILOGUE_BIAS      0x08
 #define EPILOGUE_RESIDUAL  0x10
 
+#define SMEM_PAGE_SIZE   (14 * 1024)
+#define SMEM_NUM_PAGES   15
+#define QFLAG_HANDOFF    (1u << 31)
+#define TILE_ID_MASK     0x7FFFFFFFu
+#define DISPATCH_PREFETCHED 0x01
+#define DISPATCH_HANDOFF    0x02
+// Handoff: fixed 4KB region at offset 92KB (safe for both SM80 96KB and SM90 220KB SMEM)
+#define HANDOFF_SMEM_OFFSET (92 * 1024)
+
 // Micro-op codes for fused elementwise interpreter
 #define UOP_LOAD    0x00
 #define UOP_STORE   0x01
@@ -114,9 +123,11 @@ struct __align__(4) WeightMapping {
 
 #define CACHE_LINE_INTS 32
 
-struct __align__(8) SMQueueEntry {
+struct __align__(16) SMQueueEntry {
     uint32_t task_id;
     uint32_t tile_id;
+    uint32_t prefetch_buf_idx;
+    uint32_t prefetch_bytes;
 };
 
 struct ScheduleHeader {

@@ -2,7 +2,7 @@
 #include <cuda_fp16.h>
 
 __device__ void task_embedding(const TaskDesc& task, void** buffers,
-                                const int* dyn_dims, int tile_id) {
+                                const int* dyn_dims, int tile_id, uint32_t dispatch_flags) {
     __half* out = (__half*)buffers[task.buffer_indices[0]];
     const __half* table = (const __half*)buffers[task.buffer_indices[1]];
     const int64_t* indices = (const int64_t*)buffers[task.buffer_indices[2]];
