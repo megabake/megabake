@@ -287,14 +287,10 @@ pytest tests/test_schedule_compiler/
 
 ---
 
-### Task 3.2: Static per-SM assignment
+### Task 3.2: Static per-SM assignment ✅ DONE
 **Critical-path-priority topological sort + bin-packing onto SMs.**
 
-Create `src/megabake/schedule_compiler/scheduler.py` with:
-- `_critical_path_lengths(tasks, successors)`: longest-path-to-exit per task
-- `_topo_sort_by_priority(dep_count, successors, priority)`: Kahn's algorithm with max-heap
-- `assign_tasks_to_sms(tasks, dep_count, successors, num_sms)`: bin-pack tasks
-- `estimate_cycles(task)`: rough cost estimate for bin-packing
+**Result**: Created `src/megabake/schedule_compiler/scheduler.py` with `estimate_cycles(task)`, `_critical_path_lengths(tasks, successors)` (iterative DFS, longest-path-to-exit), `_topo_sort_by_priority(dep_count, successors, priority)` (Kahn's with max-heap on critical path length), `assign_tasks_to_sms(tasks, dep_count, successors, num_sms)` (single-tile tasks to least-loaded SM, multi-tile spread across min(tiles, num_sms) SMs). Output: `sm_queues[sm_id] = [(task_id, tile_id), ...]`. 7 unit tests: all tasks assigned, topo order respected, multi-tile spread, load balance, critical path priority, empty tasks, independent sort. 47/47 schedule_compiler tests pass.
 
 Output: `sm_queues[sm_id] = [(task_id, tile_id), ...]`
 
