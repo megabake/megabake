@@ -281,19 +281,23 @@ def _is_fusable_elem(task: TaskDesc) -> bool:
     if task.op_code in _FUSABLE_BINARY:
         if task.buffer_indices[2] == UNUSED_BUFFER:
             return False
-        if task.dimensions[2] != 0 or task.dimensions[3] != 0:
-            return False
         return True
     return False
 
 
 def _fuse_elementwise_chains(
     tasks: list[TaskDesc], buffer_sizes: dict[int, int], sm_version: int,
-    num_sms: int = 0,
-) -> list[TaskDesc]:
+    num_sms: int = 0, next_buffer_id: int = 0,
+) -> tuple[list[TaskDesc], dict[int, list[int]], int]:
     """Fuse consecutive same-numel ELEMENTWISE tasks into a single FUSED_ELEMENTWISE
-    with a micro-op program interpreted on-GPU."""
+    with a micro-op program interpreted on-GPU.
+
+    Returns (tasks, program_buffers, updated_next_buffer_id).
+    program_buffers maps buffer_id → list of packed uint32 uops (overflow beyond 8).
+    """
     read_counts = _read_counts(tasks)
+    prog_bufs: dict[int, list[int]] = {}
+    current_bid = next_buffer_id
 
     chains: list[list[int]] = []
     i = 0
@@ -320,7 +324,7 @@ def _fuse_elementwise_chains(
             i += 1
 
     if not chains:
-        return tasks
+        return tasks, prog_bufs, current_bid
 
     skip_indices: set[int] = set()
     fused_at: dict[int, TaskDesc] = {}
@@ -337,8 +341,9 @@ def _fuse_elementwise_chains(
         buf_to_reg: dict[int, int] = {}
         uops: list[int] = []
         next_reg = 0
+        bc_info_list: list[tuple[int, int]] = []
 
-        def _ensure_loaded(buf: int) -> int:
+        def _ensure_loaded(buf: int, bc_numel: int = 0, bc_repeat: int = 0) -> int:
             nonlocal next_reg
             if buf in buf_to_reg:
                 return buf_to_reg[buf]
@@ -346,7 +351,13 @@ def _fuse_elementwise_chains(
                 buf_to_slot[buf] = len(buffer_slots)
                 buffer_slots.append(buf)
             reg = next_reg; next_reg += 1
-            uops.append(pack_uop(UopCode.LOAD, dst=reg, src1=buf_to_slot[buf]))
+            if bc_numel > 0:
+                bc_idx = len(bc_info_list)
+                bc_info_list.append((bc_numel, bc_repeat))
+                uops.append(pack_uop(UopCode.LOAD_BROADCAST,
+                                     dst=reg, src1=buf_to_slot[buf], src2=bc_idx))
+            else:
+                uops.append(pack_uop(UopCode.LOAD, dst=reg, src1=buf_to_slot[buf]))
             buf_to_reg[buf] = reg
             return reg
 
@@ -354,7 +365,9 @@ def _fuse_elementwise_chains(
             s1_reg = _ensure_loaded(ct.buffer_indices[1])
 
             if ct.op_code in _FUSABLE_BINARY:
-                s2_reg = _ensure_loaded(ct.buffer_indices[2])
+                bc_numel = ct.dimensions[2]
+                bc_repeat = ct.dimensions[3]
+                s2_reg = _ensure_loaded(ct.buffer_indices[2], bc_numel, bc_repeat)
                 dst_reg = next_reg; next_reg += 1
                 uops.append(pack_uop(_ELEM_TO_UOP[ct.op_code],
                                      dst=dst_reg, src1=s1_reg, src2=s2_reg))
@@ -368,12 +381,26 @@ def _fuse_elementwise_chains(
         uops.append(pack_uop(UopCode.STORE, dst=0,
                               src1=buf_to_reg[final_output]))
 
-        if len(uops) > 8 or len(buffer_slots) > 8 or next_reg > 8:
+        if (len(uops) > 32 or len(buffer_slots) > 8 or next_reg > 16
+                or len(bc_info_list) > 5):
             continue
 
         buf_indices = buffer_slots + [UNUSED_BUFFER] * (8 - len(buffer_slots))
         dims = [numel, len(uops)] + [0] * 6
-        strides = uops + [0] * (8 - len(uops))
+
+        # Pack broadcast info into dimensions[3..7]
+        for bi, (bc_n, bc_r) in enumerate(bc_info_list):
+            dims[3 + bi] = (bc_n << 16) | (bc_r & 0xFFFF)
+
+        if len(uops) <= 8:
+            strides = uops + [0] * (8 - len(uops))
+        else:
+            strides = list(uops[:8])
+            overflow = uops[8:]
+            pbid = current_bid; current_bid += 1
+            buffer_sizes[pbid] = len(overflow) * 4
+            prog_bufs[pbid] = overflow
+            dims[2] = pbid
 
         fused_task = TaskDesc(
             op_type=OpType.FUSED_ELEMENTWISE,
@@ -398,7 +425,7 @@ def _fuse_elementwise_chains(
             result.append(fused_at[i])
         else:
             result.append(task)
-    return result
+    return result, prog_bufs, current_bid
 
 
 def _eliminate_redundant_copies(
@@ -1288,7 +1315,12 @@ def compile_from_ep(
         )
 
     tasks = _fuse_tasks(tasks, buffer_sizes)
-    tasks = _fuse_elementwise_chains(tasks, buffer_sizes, sm_version, num_sms)
+    tasks, prog_bufs, next_buffer_id = _fuse_elementwise_chains(
+        tasks, buffer_sizes, sm_version, num_sms, next_buffer_id)
+    for pbid, uop_data in prog_bufs.items():
+        weight_buffers.add(pbid)
+        weight_names[pbid] = f"__folded__.__uop_prog_{pbid}"
+        folded_weight_tensors[pbid] = torch.tensor(uop_data, dtype=torch.int32).cuda()
     tasks = _eliminate_redundant_copies(tasks, buffer_sizes)
 
     placements, total_workspace = plan_buffers(tasks, buffer_sizes, weight_buffers)

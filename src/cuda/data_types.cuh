@@ -34,7 +34,11 @@
 #define UOP_RSQRT   0x0D
 #define UOP_LOG     0x0E
 #define UOP_ABS     0x0F
-#define UOP_GELU_TANH 0x10
+#define UOP_GELU_TANH      0x10
+#define UOP_LOAD_BROADCAST 0x11
+#define UOP_REDUCE_SUM     0x12
+#define UOP_REDUCE_MAX     0x13
+#define UOP_REDUCE_MEAN    0x14
 
 #define ELEM_ADD          0x00
 #define ELEM_MUL          0x01

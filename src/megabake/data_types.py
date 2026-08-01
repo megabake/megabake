@@ -64,7 +64,11 @@ class UopCode(IntEnum):
     RSQRT   = 0x0D
     LOG     = 0x0E
     ABS     = 0x0F
-    GELU_TANH = 0x10
+    GELU_TANH      = 0x10
+    LOAD_BROADCAST = 0x11
+    REDUCE_SUM     = 0x12
+    REDUCE_MAX     = 0x13
+    REDUCE_MEAN    = 0x14
 
 
 def pack_uop(opcode: int, dst: int = 0, src1: int = 0, src2: int = 0) -> int:
