@@ -34,7 +34,7 @@ The intended split is:
   propagation
 - **Megabake custom logic** for region formation, persistent scheduling, and
   artifact emission
-- **Luminal / Mirage / Hazy / MPK ideas** influencing design and search
+- **Luminal / Mirage / Hazy / MPK / TileIR ideas** influencing design and search
   strategy, but generally **not** imported as hard runtime dependencies
 
 
@@ -917,6 +917,68 @@ HF is not exactly a compiler project, but it is central to the workload shape.
 - tuning corpus generation
 
 
+## 5.6 TileIR
+
+### Reuse directly
+
+Potentially, but only in a narrow place:
+
+- as an **optional backend kernel IR** for selected tile-centric region
+  families
+
+### Use conceptually
+
+- stable low-level tile target
+- target-specific backend lowering boundary
+- tile-centric codegen separation from semantic graph IRs
+
+### Avoid reusing directly
+
+- as a replacement for `FXGraph + FactTables`
+- as a replacement for `RegionGraph`
+- as a replacement for `ScheduleProgram`
+- as the core persistent runtime orchestration language, at least initially
+
+### Integrates at
+
+- `backend/kernel_ir.py`
+- `backend/tileir.py`
+- Stage 6 target-specific code generation
+- `KernelBundle` backend variants for selected compute-heavy regions
+
+### Why this integration is intentionally narrow
+
+TileIR is valuable precisely because it can enhance the **backend lowering
+boundary** without forcing changes upward into the semantic IR stack.
+
+That means we add it only where all of the following are true:
+
+- the region is already semantically formed
+- the schedule is already chosen
+- the region is tile-centric and compute-heavy
+- the backend choice can be evaluated by replay tuning
+
+This avoids repeating a common architecture mistake:
+
+- seeing a powerful low-level backend IR
+- then letting it leak upward and reshape semantic compiler layers that it was
+  never meant to own
+
+### Admission criteria
+
+TileIR should be admitted only when:
+
+1. the region family is something like `MatvecRegion`, `MatmulRegion`, or
+   `AttentionRegion`
+2. the default CUDA/CuTe path is either hard to retarget or clearly leaving
+   performance on the table
+3. the integration stays below `ScheduleProgram`
+4. replay tuning shows a real win or materially cleaner backend portability
+
+If those conditions are not met, Megabake should stay on the default
+CUDA/CuTe-style backend path.
+
+
 ## 6. Integration Map: Where Each Project Enters the Pipeline
 
 ### Stage 1: Canonical graph and facts
@@ -985,12 +1047,14 @@ Use:
 - custom Megabake logic
 - replay tuning
 - target-specific codegen
+- optional TileIR lowering for selected backend kernel families
 
 Influence from:
 
 - Inductor tuning philosophy
 - Mirage-style search mindset
 - Hazy / MPK runtime philosophy
+- TileIR as a possible late backend target for tile-centric kernels
 
 
 ## 7. Adopt / Adapt / Avoid
@@ -1010,6 +1074,7 @@ This is the short operational version.
 - Luminal: small IR discipline
 - Hazy / MPK: persistent schedule design
 - Mirage: candidate search and partition-space reasoning
+- TileIR: optional backend kernel IR for selected compute-heavy regions
 - HF: workload priors and corpus generation
 
 ### Avoid
@@ -1033,6 +1098,8 @@ That gives the cleanest split:
 
 - PyTorch / Inductor solves the early, standard compiler work
 - Megabake solves the execution-model-specific work
+- TileIR may optionally enhance the backend lowering layer without changing the
+  main IR stack
 - Luminal / Mirage / Hazy / MPK shape the design, but do not bloat the codebase
 
 That is how v2 stays both ambitious and implementable.

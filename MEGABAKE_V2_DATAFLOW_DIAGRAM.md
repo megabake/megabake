@@ -54,7 +54,7 @@ flowchart TB
 
   subgraph Stage5["Stage 5: Schedule Synthesis"]
     Q["ScheduleProgram<br/>- per-SM programs<br/>- tile descriptors<br/>- dependency tokens<br/>- prefetch actions<br/>- handoff actions<br/>- release actions"]
-    R["KernelBundle<br/>- target-specific code templates<br/>- generated kernel entrypoints<br/>- schedule interpreter / driver kernel"]
+    R["KernelBundle<br/>- backend kernel IR lowerings<br/>- CUDA/CuTe or TileIR variants<br/>- generated kernel entrypoints<br/>- schedule interpreter / driver kernel"]
   end
 
   subgraph Stage6["Stage 6: Replay Extraction + Tuning"]
@@ -183,6 +183,7 @@ classDiagram
   class KernelBundle {
     +kernel_entrypoints
     +codegen_family
+    +backend_kind
     +target_specific_objects
   }
 
@@ -418,6 +419,10 @@ This plan contains:
 **Does**
 
 - lowers selected regions into target-specific code objects
+- chooses backend lowering variants per selected region family
+  - CUDA/CuTe by default
+  - TileIR only as an optional late backend kernel IR for selected tile-centric,
+    compute-heavy regions
 - emits persistent schedule driver kernel logic
 - binds schedule layout to codegen family
 
@@ -430,6 +435,8 @@ This plan contains:
 - choose bucket families
 - choose launch count
 - re-run semantic fusion logic
+- replace the top-level Megabake IR stack
+- pull TileIR upward into semantic or schedule layers
 
 
 ### Stage 7: Replay Extraction + Baseline-Gated Tuning

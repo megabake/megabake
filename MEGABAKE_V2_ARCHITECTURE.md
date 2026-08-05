@@ -777,6 +777,26 @@ Codegen families should include:
 - norm / pointwise executors
 - persistent schedule interpreter / program loop
 
+TileIR can fit here as an **optional backend kernel IR** for selected
+tile-centric region families. The intended use is narrow and deliberate:
+
+- do **not** replace `RegionGraph`
+- do **not** replace `ScheduleProgram`
+- do use TileIR as a possible lowering target for compute-heavy regions such as
+  matvec / matmul / attention if it improves backend portability or kernel
+  quality for those regions
+
+The admission rule should be strict:
+
+- CUDA/CuTe remains the default backend path
+- TileIR is considered only after region boundaries and schedule are already fixed
+- TileIR is considered only for tile-centric, compute-heavy regions
+- TileIR stays only if replay tuning shows it beats or materially improves the
+  default backend for that region family
+
+In other words, TileIR is a candidate implementation detail of `KernelBundle`,
+not a replacement for the main Megabake IR stack.
+
 The important point is that codegen comes **after** schedule decisions, not
 before.
 
@@ -1170,6 +1190,10 @@ src/megabake/v2/
     search.py
     replay.py
     runners.py
+  backend/
+    kernel_ir.py
+    cuda_cute.py
+    tileir.py
   runtime/
     loader.py
     launcher.py
@@ -1185,6 +1209,8 @@ src/cuda_v2/
     matvec_decode.cu
     attention_decode.cu
     norm_pointwise.cu
+  tileir/
+    README.md
   common/
     data_types.cuh
     cp_async.cuh
