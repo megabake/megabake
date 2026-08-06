@@ -800,7 +800,7 @@ not a replacement for the main Megabake IR stack.
 The important point is that codegen comes **after** schedule decisions, not
 before.
 
-### Stage 7: Region replay tuning and acceptance against the baseline
+### Stage 7: Helion-style bounded replay search and acceptance against the baseline
 
 Input:
 
@@ -825,7 +825,9 @@ It should:
 - keep only plans that beat the launched reference baseline by a margin
 
 This is how "reliably beat `torch.compile`" becomes an engineering loop rather
-than a hope.
+than a hope. The intended style here is deliberately closer to a bounded,
+high-quality late search over backend/kernel parameters and tiny schedule
+neighborhoods than to an open-ended whole-compiler search.
 
 ### Stage 8: Emit the ArtifactPack
 
@@ -1105,6 +1107,201 @@ The cost model must also honor compiler policy:
 - in `auto` mode, it can choose the segmentation that minimizes latency
 - if delegation is disabled, candidates from external kernels are illegal
 
+## 11A. Helion-Style Late Search Amendment
+
+This architecture adopts a **Helion-style search philosophy** at the late
+backend/tuning layer, not at the top of the compiler stack.
+
+The specific inspiration is:
+
+- implicit or lightly-declared search spaces over backend implementation choices
+- ahead-of-time tuning
+- bounded search rather than exhaustive exploration
+- smarter search than brute force, such as local refinement or lightweight
+  Bayesian-style filtering
+
+See:
+
+- [pytorch/helion](https://github.com/pytorch/helion)
+- [Helion: A High-Level DSL for Performant and Portable ML Kernels](https://pytorch.org/blog/helion/)
+- [Accelerating Autotuning in Helion with Bayesian Optimization](https://pytorch.org/blog/accelerating-autotuning-in-helion/)
+- [From Minutes to Seconds: LLM-Guided Autotuning for Helion Kernels](https://pytorch.org/blog/from-minutes-to-seconds-llm-guided-autotuning-for-helion-kernels/)
+
+### Why this amendment exists
+
+The architecture already has:
+
+- semantic graph cleanup
+- region formation
+- candidate enumeration
+- cost modeling
+- replay tuning
+
+What it did not yet state explicitly enough is:
+
+> the tuner should behave like a bounded, late, implementation-level search,
+> not like a whole-compiler search over semantic graph structure.
+
+That distinction is crucial because Megabake wants Helion’s **good search
+discipline**, not Mirage-style open-ended exploration over the full graph space.
+
+### What this amendment changes
+
+It formalizes the rule that the search lives **after**:
+
+- `FXGraph + FactTables`
+- `RegionGraph`
+- preliminary `ScheduleProgram`
+
+and **before** final artifact acceptance.
+
+So search is allowed to refine:
+
+- backend family choice
+- tile shapes
+- warp roles
+- staging depth
+- prefetch depth
+- handoff toggles
+- tiny segmentation neighborhoods such as `{1, 2, 4, 8}` regions
+
+Search is **not** allowed to reopen:
+
+- graph canonicalization
+- semantic motif recovery
+- arbitrary global region partition space
+- arbitrary runtime-model redesign
+
+### Search objects
+
+The search space should be defined over:
+
+#### Region-local backend choices
+
+- `MatvecRegion`
+  - tile shapes
+  - vector width
+  - staging depth
+  - quantized vs non-quantized path
+  - backend lowering family
+
+- `AttentionRegion`
+  - `block_q`
+  - `block_k`
+  - staging depth
+  - warp partition
+  - backend lowering family
+
+- `NormPointwiseRegion`
+  - microprogram variant
+  - fusion pattern selection
+  - reduction staging
+
+#### Small schedule neighborhoods
+
+- `max_regions in {1, 2, 4, 8}`
+- prefetch on/off for selected edges
+- handoff on/off for selected edges
+- backend-family mix across a fixed region plan
+
+The key idea is:
+
+> search the **implementation neighborhood**, not the entire semantic design
+> space.
+
+### Search inputs
+
+The search should start from:
+
+- `TargetModel`
+- `SelectedRegionPlan`
+- `ReferencePlan`
+- `AutotuneDB` priors
+- optional HF/model-family priors
+
+This means the search is seeded, not blind.
+
+### Search algorithm policy
+
+The architecture does **not** require one exact search algorithm, but it should
+obey these policy rules:
+
+1. **Analytical pruning first**
+   - remove illegal or obviously bad candidates before benchmarking
+
+2. **Strong seed set second**
+   - use heuristics, `TargetModel`, and `AutotuneDB` to choose a small set of
+     promising initial candidates
+
+3. **Bounded local refinement third**
+   - hill-climb, pattern search, LFBO-like filtering, or similar lightweight
+     refinement over the local neighborhood
+
+4. **Early stopping**
+   - stop when improvements plateau or win margin over the reference baseline is
+     already sufficient
+
+This is the part of Helion we want:
+
+- a high-quality late search over implementation parameters
+
+This is the part we explicitly do **not** want:
+
+- extremely large, slow, open-ended exploration over the entire architecture
+
+### Search budgets
+
+The default tuning budget should be intentionally small.
+
+For default performance mode, the architecture should target something like:
+
+- only the hottest region families
+- only a few schedule neighborhoods
+- roughly `10-30` candidate measurements per hot region family
+- optional offline “aggressive” tuning mode for deeper search
+
+This keeps the system practical while still allowing meaningful optimization.
+
+### Acceptance rule
+
+Search success is **not** measured by “best Megabake kernel found.”
+
+Search success is measured by:
+
+> does the resulting Megabake plan beat the `ReferencePlan` by a useful margin?
+
+That means:
+
+- default performance mode accepts only winners over the launched baseline
+- strict purity mode may accept a slower one-kernel plan if the user asked for
+  strict fusion explicitly
+
+This makes the search subordinate to the product goal rather than to kernel
+beauty.
+
+### Architectural consequences
+
+This amendment implies:
+
+- `Stage 7` is not a generic autotune pass; it is a bounded late search pass
+- `AutotuneDB` is not just a cache; it is a central architectural object
+- `ReferencePlan` is mandatory, because the search must know what it is trying
+  to beat
+- backend diversity is allowed, but only below the semantic IR stack
+
+### Final rule
+
+Megabake should use Helion-style search **only** where the remaining problem is:
+
+> “which low-level implementation of this already-chosen region/program is
+> best?”
+
+It should **not** use Helion-style search for:
+
+> “what does this graph mean?” or “what is the whole compiler architecture?”
+
+That is the clean line that keeps the architecture disciplined.
+
 
 ## 12. Artifact Format
 
@@ -1187,8 +1384,11 @@ src/megabake/v2/
     torch_compile.py
   autotune/
     db.py
+    policy.py
     search.py
     replay.py
+    seed.py
+    acceptance.py
     runners.py
   backend/
     kernel_ir.py
@@ -1312,6 +1512,7 @@ Deliver:
 
 Deliver:
 
+- bounded Helion-style late search
 - replay-based tuning loop
 - `AutotuneDB`
 - bucketed artifact store
