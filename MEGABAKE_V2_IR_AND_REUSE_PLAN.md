@@ -829,6 +829,89 @@ Luminal’s real value here is:
 - field design discipline
 - "new pass, yes; new IR, only if necessary" rule
 
+### Detailed Luminal analysis from the local clone
+
+The local clone in `agent_space/luminal` reinforces that Luminal is most useful
+to Megabake as an **IR-discipline and late-search reference**, not as a direct
+replacement for our stack.
+
+#### What Luminal actually has
+
+From the inspected repository:
+
+- `Graph` owns the compiler state and search state
+- `HLIRGraph` is the user/model-facing graph
+- a saturated **e-graph** holds rewrite/search alternatives
+- `LLIRGraph` is the extracted executable backend graph
+- `ShapeTracker` and symbolic `Expression` machinery carry shape/stride facts
+- `DimBucket`-style profiling buckets and runtime maps attach dynamic-shape
+  reasoning to compilation and profiling
+
+The most important practical observation is:
+
+> Luminal really has a **semantic graph → searchable rewrite space → extracted
+> low-level graph** flow.
+
+That is much closer to our:
+
+- `FXGraph + FactTables`
+- `RegionGraph`
+- `ScheduleProgram`
+
+split than it first appears from the README.
+
+#### What we should copy from Luminal very directly in spirit
+
+- every node/value should be paired with rich shape/layout truth
+- symbolic and bucketed dimension reasoning should be first-class
+- late-stage profiling search should be bounded and data-driven
+- legality/resource filters should explicitly reject bad candidates
+- the semantic core should remain as small and stable as possible
+
+These are excellent fits for Megabake.
+
+#### What we should explicitly not copy
+
+- Luminal’s 15-op semantic HLIR as our Layer 1
+- egglog/e-graph as the primary Megabake IR
+- whole-graph genetic search over semantic alternatives
+- implicit discovery of persistent schedule structure from primitive graph search
+
+These do not fit because Megabake is:
+
+- FX/export-first
+- transformer-aware
+- persistent-program oriented
+- trying to keep the search at the late backend/schedule neighborhood
+
+#### Concrete mapping to Megabake
+
+- Luminal `ShapeTracker` / symbolic expressions
+  - inspires Megabake `FactTables`
+
+- Luminal search-space saturation + extracted executable form
+  - inspires Megabake’s clean separation between `RegionGraph` and
+    `ScheduleProgram`
+
+- Luminal bounded profiling search
+  - inspires Megabake’s Stage 7 replay tuning
+
+- Luminal resource / legality filtering
+  - inspires Megabake’s candidate validation and baseline-gated acceptance
+
+#### Why this matters for the IR design
+
+The important lesson is not:
+
+> "copy Luminal’s IR"
+
+The important lesson is:
+
+> "copy Luminal’s discipline about keeping semantics small, facts explicit, and
+> search late."
+
+That is the part that genuinely strengthens Megabake’s IR design.
+
 
 ## 5.3 Hazy / MPK / Persistent Megakernel Research
 
