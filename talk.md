@@ -33,8 +33,8 @@ Design: start *very* basic, keep a single high-level pipeline on screen, then **
 
 ```mermaid
 flowchart LR
-    A["Your model\n(Python, nn.Module)"] -->|"+2 lines"| B[torch.compile]
-    B --> C["Record -> Rewrite + Fuse -> Run on GPU"]
+    A["Your model\n(Python, nn.Module)"] -->|"+2 lines"| B["torch.compile"]
+    B --> C["Record, rewrite + fuse, run on GPU"]
     style A fill:#fde3e3,color:#000
     style B fill:#ffe6b3,color:#000
     style C fill:#c8f0d4,color:#000
@@ -51,8 +51,8 @@ Three problems in eager mode; one fix for each. This slide earns the rest of the
 
 ```mermaid
 flowchart TD
-    P1["Problem 1: Python overhead\nEvery op crosses Py<->C++ boundary"] --> F1["Fixed by: BATCH ops into one kernel call"]
-    P2["Problem 2: Memory round-trips\nTemp results spill to GPU memory"] --> F2["Fixed by: FUSION -> fewer reads/writes"]
+    P1["Problem 1: Python overhead\nEvery op crosses the Python / C++ boundary"] --> F1["Fixed by: BATCH ops into one kernel call"]
+    P2["Problem 2: Memory round-trips\nTemp results spill to GPU memory"] --> F2["Fixed by: FUSION = fewer reads/writes"]
     P3["Problem 3: Per-call launch cost\nKernel launch ~5-20us each"] --> F3["Fixed by: CUDA Graphs replay all at once"]
     style P1 fill:#fde3e3,color:#000
     style P2 fill:#fde3e3,color:#000
@@ -82,8 +82,8 @@ Name-drop check before we go fast. One paragraph each; no code.
 
 ```mermaid
 flowchart LR
-    Mod["nn.Module.forward\n(Python, eager)"] -->|record| Graph["FX graph\n(data: nodes -> kernels)"]
-    Graph --> Guarded["Compiled fn + GUARDS"]
+    Mod["nn.Module.forward\n(Python, eager)"] -->|record| FXG["FX graph\n(data: nodes to kernels)"]
+    FXG --> Guarded["Compiled fn + GUARDS"]
     Guarded -.->|"every call: check guards"| Mod
 ```
 
@@ -96,26 +96,29 @@ Keep this on screen for the entire Dynamo+Inductor walkthrough. Zoom-in arrows p
 
 ```mermaid
 flowchart TD
-    U["User: torch.compile(model)(x)\n-> 'record' model.forward\ninto an FX graph"]:::start
+    U["User: torch.compile(model)(x)\nrecord model.forward\ninto an FX graph"]:::start
     DYN["TORCHDYNAMO\ntrace Python at runtime\nsymbolic execution + guards"]:::dyn
-    AOT["AOTAUTOGRAD\ndeompose ops, split fwd/bwd\nmin-cut partition"]:::aot
-    IND["INDUCTOR\nlower to IR -> schedule -> fuse\n-> emit Triton/CUDA kernels"]:::ind
-    CALL["Compiled runnable + CUDA Graphs\nreplays GPU work with ~0 launch overhead"]:::done
+    AOT["AOTAUTOGRAD\ndecompose ops, split fwd/bwd\nmin-cut partition"]:::aot
+    IND["INDUCTOR\nlower to IR, schedule, fuse\nemit Triton/CUDA kernels"]:::ind
+    RUNNABLE["Compiled runnable + CUDA Graphs\nreplays GPU work with ~0 launch overhead"]:::done
 
-    U --> DYN --> AOT --> IND --> CALL
+    U --> DYN --> AOT --> IND --> RUNNABLE
 
     subgraph zoomed ["We will drop into each of these 3 boxes"]
         direction LR
-        Z1["S10-18"] -.-> DYN
-        Z2["S19-20"] -.-> AOT
-        Z3["S21-31"] -.-> IND
+        Z1["S10-18"]
+        Z2["S19-20"]
+        Z3["S21-31"]
     end
+    Z1 -.-> DYN
+    Z2 -.-> AOT
+    Z3 -.-> IND
 
-classDef start fill:#fde3e3,stroke:#c22,color:#000;
-classDef dyn   fill:#ffe6b3,stroke:#a87, color:#000, stroke-width:2px;
-classDef aot   fill:#d8d6f5,stroke:#65c, color:#000, stroke-width:2px;
-classDef ind   fill:#cbdff0,stroke:#36c, color:#000, stroke-width:2px;
-classDef done  fill:#c8f0d4,stroke:#294,color:#000;
+    classDef start fill:#fde3e3,stroke:#c22,color:#000
+    classDef dyn fill:#ffe6b3,stroke:#a87,color:#000,stroke-width:2px
+    classDef aot fill:#d8d6f5,stroke:#65c,color:#000,stroke-width:2px
+    classDef ind fill:#cbdff0,stroke:#36c,color:#000,stroke-width:2px
+    classDef done fill:#c8f0d4,stroke:#294,color:#000
 ```
 
 **KEY MECHANISM:** the handoff is *data*, not calls. Dynamo hands Inductor an **FX graph + example inputs**; AOTAutograd wraps that with fwd/bwd splitting; Inductor returns a *runnable*. Each layer only speaks FX graphs → one clean contract.
@@ -129,19 +132,20 @@ Same model, two fates: eager vs compiled. Everything else is *how* we get from l
 
 ```mermaid
 flowchart LR
-    subgraph before ["BEFORE @torch.compile"]
+    subgraph before ["BEFORE torch.compile"]
         direction TB
-        b1["y = x.add(1)  -> kernel launch\nz = y.mul(2)   -> kernel launch\nw = z.relu()    -> kernel launch"]
-        b1b[".cuda().add... each step crosses\nPython<->C++ boundary (slow, memory-bound)"]
+        b1["y = x.add(1)  = kernel launch\nz = y.mul(2)   = kernel launch\nw = z.relu()    = kernel launch"]
+        b1b["each step crosses the\nPython / C++ boundary\n(slow, memory-bound)"]
     end
-    subgraph after ["AFTER @torch.compile"]
-        a1["torch.compile(model)\n(first call: traces + builds guards\n+  compiles Inductor kernels)\ncached; reused every later call"]
-        a2["one fused kernel does add->mul->relu\nin registers, ONE launch via CUDA Graphs"]
+    subgraph after ["AFTER torch.compile"]
+        direction TB
+        a1["torch.compile(model)\nfirst call: traces + guards\n+ compiles Inductor kernels\ncached; reused later"]
+        a2["one fused kernel does\nadd, mul, relu in registers\nONE launch via CUDA Graphs"]
     end
-    before -->|".compile() is just:\nrecord this forward graph"| after
+    b1b -->|"compile() records this forward graph"| a1
 
-style before fill:#fffbe6,color:#000
-style after  fill:#eaf7ea,stroke:#2a9,color:#000
+    style before fill:#fffbe6,color:#000
+    style after fill:#eaf7ea,stroke:#2a9,color:#000
 ```
 
 **KEY MECHANISM:** compilation costs are *amortized*. The first call pays the whole compile; every later matching call runs only the fused kernels (after guards pass). Compile time is front-loaded.
@@ -155,14 +159,14 @@ AOT compiles `forward()` once from source; it can't see *how you'll run it*. JIT
 
 ```mermaid
 flowchart TD
-    src["Source: model.forward()"] -.->|AOT\nonce, sees static shape only| aotk["1 graph for 1 shape;\nmisses data-dependent shapes, control flow"]
+    src["Source: model.forward()"] -.->|AOT: once, static shape only| aotk["1 graph for 1 shape\nmisses data-dependent shapes and control flow"]
     jx["JIT (torch.compile)"] -->|watch real execution| trace["Record ACTUAL op calls as they run\nguard on the facts we assumed"]
-    trace --> cached["Cache compiled fn keyed by guards\n=> reuse when guards pass, recompile only when they fail"]
+    trace --> cached["Cache compiled fn keyed by guards\nreuse when guards pass, recompile only on fail"]
 
-style src fill:#efe8f5,color:#000
-style aotk  fill:#fde3e3,color:#000
-style jx    fill:#cfe9ff,color:#000
-style cached fill:#c8f0d4,color:#000
+    style src fill:#efe8f5,color:#000
+    style aotk fill:#fde3e3,color:#000
+    style jx fill:#cfe9ff,color:#000
+    style cached fill:#c8f0d4,color:#000
 ```
 
 **KEY MECHANISM:** guards are the *price of admission* to correctness-in-Python. Each fact Dynamo assumes (this tensor is 2-D, grad mode on, this config value) becomes a guard; on every call we check them. They're cheap because they're checked in C++ as a tree (more later).
@@ -178,18 +182,18 @@ Two artifacts frame everything: the **full runtime trace** from `torch.compile(m
 
 ```mermaid
 flowchart TD
-    E["torch.compile(model)\n<code>__init__.py:3134</code>"] --> DYN_SPINE["DYNAMO SPINE\ntrace + guards -> hand FX graph to backend"]
-    DYN_SPINE --> HF["compile_fx (Inductor entry)\n<code>compile_fx.py:2889</code>"]
-    HF --> AOT_A["aot_autograd split fwd/bwd :3275"]
-    AOT_A --> INDNODES["lower FX -> IR ; Scheduler.fuse_nodes ; codegen"]
-    INDNODES --> KERNEL["CompiledFxGraph + Triton kernel\n<code>output_code.py:516</code>"]
+    E["torch.compile(model)\n(init.py:3134)"] --> DYN_SPINE["DYNAMO SPINE\ntrace + guards, hand FX graph to backend"]
+    DYN_SPINE --> HF["compile_fx (Inductor entry)\n(compile_fx.py:2889)"]
+    HF --> AOT_A["aot_autograd split fwd/bwd (compile_fx.py:3275)"]
+    AOT_A --> INDNODES["lower FX to IR, Scheduler.fuse_nodes, codegen"]
+    INDNODES --> KERNEL["CompiledFxGraph + Triton kernel\n(output_code.py:516)"]
     KERNEL -.->|"optionally wrapped in CUDA Graphs"| CG["cudagraph_trees.py"]
 
-style E fill:#fde3e3,color:#000
-style DYN_SPINE  fill:#ffe6b3,stroke-width:2px,color:#000
-style HF         fill:#d8d6f5,color:#000
-style INDNODES   fill:#cbdff0,color:#000
-style KERNEL     fill:#c8f0d4,color:#000
+    style E fill:#fde3e3,color:#000
+    style DYN_SPINE fill:#ffe6b3,stroke-width:2px,color:#000
+    style HF fill:#d8d6f5,color:#000
+    style INDNODES fill:#cbdff0,color:#000
+    style KERNEL fill:#c8f0d4,color:#000
 ```
 
 **KEY MECHANISM:** the entire pipeline is a **spine plus branches**. The spine is "happy path / cache miss on first call, then graph break recovery and guards branch off it." Zoom slides below are *branches of this spine*.
@@ -247,16 +251,20 @@ Split from one node into two regimes visually because that separation is *the* c
 
 ```mermaid
 flowchart LR
-    subgraph FIRST["CALL #1 (cache miss)"]
-        F0[torch.compile model] --> Ftrace[Dynamo trace forward bytecodes] --> Ffx[build FX graph+guards] --> FB[Built-in backend:\nInductor: aot + ind compile] --> FCACHE[(store CacheEntry keyed by guards+hash)]
+    subgraph FIRST["CALL 1 (cache miss)"]
+        F0["torch.compile model"] --> Ftrace["Dynamo trace forward bytecodes"]
+        Ftrace --> Ffx["build FX graph + guards"]
+        Ffx --> FB["Built-in backend:\nInductor aot + ind compile"]
+        FB --> FCACHE[("store CacheEntry keyed by guards + hash")]
     end
-    subgraph LATER["CALL #2..N (cache hit)"]
-        LX0[same model call] --> LGuard[(C++ tree walk:\nroot->children leaves first\nfast path diff_guard_root)] --> LPASS{"all guard nodes pass?\n<code>extra_state.cpp:320</code>"}
-        LPASS --yes--> LReplay["execute fused kernel(s)\n~zero launch overhead via CUDA Graphs"]
-        LPASS --no--> LFail[recompile via new trace\n+ store as new cache entry]
+    subgraph LATER["CALL 2..N (cache hit)"]
+        LX0["same model call"] --> LGuard["C++ tree walk:\nroot to children, leaves first\nfast path diff_guard_root"]
+        LGuard --> LPASS{"all guard nodes pass?\n(extra_state.cpp:320)"}
+        LPASS --yes--> LReplay["execute fused kernel(s)\nnear-zero launch overhead via CUDA Graphs"]
+        LPASS --no--> LFail["recompile via new trace\nstore as new cache entry"]
     end
 
-style FCACHE fill:#ffe6b3,stroke-width:2px,color:#000
+    style FCACHE fill:#ffe6b3,stroke-width:2px,color:#000
 ```
 
 **KEY MECHANISM:** on call #1 we pay trace + AOT + Inductor once; **call #2..N pays only a C++ guard tree walk.** That asymmetry is why JIT works: rare compile, common replay. The diff_guard_root fast-path (a reduced recheck of likely-changed guards) makes even the hit nearly free.
@@ -271,9 +279,9 @@ No code in this slide at all; pure vocabulary + diagram, because it's a new conc
 ```mermaid
 flowchart LR
     py["Python runs model.forward()\nbytecodes already exist (compiled .pyc)\nEval loop interprets them"] --> hk["PEP 523 says:\nyou can SWAP the interpreter\nused to evaluate a frame"]
-    hk --> shim["PyTorch installs\ndynamo_custom_eval_frame_shim(on every call, in C++)\nthen unconditionally runs it per frame\n<code>torch/csrc/dynamo/eval_frame.c:616</code>"]
+    hk --> shim["PyTorch installs dynamo_custom_eval_frame_shim\non every call, in C++\nthen runs it per frame\n(eval_frame.c:616)"]
 
-style py fill:#fffbe0,color:#000
+    style py fill:#fffbe0,color:#000
 ```
 
 **KEY MECHANISM:** Dynamo does NOT rewrite bytecode of your source file, nor use a JIT that re-compiles .py -> new .pyc. Instead it **swaps the eval loop at runtime via PEP 523's `PyEval_EvalFrameDefault` slot**. Every existing function already carries those bytecodes; we simply "put a watch on execution." The shim runs C++ for each frame (super fast), only *maybe* diverting to Python compile logic.
@@ -287,26 +295,30 @@ Trace flow top-down: from `torch.compile(model)` through guards tree build and b
 
 ```mermaid
 flowchart TD
-    N0("user: torch.compile(model)\n<code>__init__.py:3134</code>"):::start
-    W["_TorchCompileInductorWrapper sets mode+backend\n<code>:2984</code>"]
-    OPT["torch._dynamo.optimize -> _optimize + catch_errors\n<code>eval_frame.py:1775 / 1582</code>"]:::opt
-    CB["OptimizeContext builds compile_wrapper around model\n(installs PEP523 callback chain)\n<code>:1453 / :1147</code>"]:::cb
+    N0["user: torch.compile(model)\n(init.py:3134)"]:::start
+    W["_TorchCompileInductorWrapper sets mode+backend\n(init.py:2984)"]
+    OPT["torch._dynamo.optimize, _optimize + catch_errors\n(eval_frame.py:1775 / 1582)"]:::opt
+    CB["OptimizeContext builds compile_wrapper around model\ninstalls PEP523 callback chain\n(eval_frame.py:1453 / 1147)"]:::cb
 
-    subgraph HIT["on call #1 (cold): trace path"]
-        SHIM["set_eval_frame -> per-frame C++ shim:\nskip checks, cache lookup, compile\n<code>eval_frame.c:616 / 226</code>"]
-        LOOK{"cache hit?\n<code>extra_state.cpp:274</code>"}
-        COMPILE["-> convert_frame._compile\n(disassemble + symbolic trace)\ntorch/_dynamo/convert_frame.py"]:::hot
+    subgraph HIT["on call 1 (cold): trace path"]
+        SHIM["set_eval_frame, per-frame C++ shim:\nskip checks, cache lookup, compile\n(eval_frame.c:616 / 226)"]
+        LOOK{"cache hit?\n(extra_state.cpp:274)"}
+        COMPILE["convert_frame._compile\ndisassemble + symbolic trace\n(torch/_dynamo/convert_frame.py)"]:::hot
     end
 
-    subgraph LATER_COLD_GOTO["rejoin: later calls hit this branch (next slide)"]
-      GEARROW--> LOOK --yes--> REPLAY[(C++ tree guard eval -> run kernel)]:::done
-    end
+    REPLAY["C++ tree guard eval, then run kernel"]:::done
 
-    N0 --> W --> OPT --> CB --> SHIM --> LOOK --miss on cold path--> COMPILE
-    COMPILE => SUBGRAPH1[ "build FX graph + guards (deep-dive next 6 slides)"]:::mid
-    SUBGRAPH1 -.-> LATER_COLD_GOTO
-style mid fill:#ffe6b3,color:#000,stroke-width:2px
+    N0 --> W --> OPT --> CB --> SHIM --> LOOK
+    LOOK --miss on cold path--> COMPILE
+    LOOK --yes--> REPLAY
+    COMPILE --> SUBGRAPH1["build FX graph + guards (deep-dive next 6 slides)"]:::mid
 
+    classDef start fill:#fde3e3,color:#000
+    classDef opt fill:#fffbe0,color:#000
+    classDef cb fill:#ffe6b3,color:#000
+    classDef hot fill:#fde3e3,color:#000
+    classDef done fill:#c8f0d4,color:#000
+    classDef mid fill:#ffe6b3,color:#000,stroke-width:2px
 ```
 
 > **Speaker notes.** Keep the *wording* identical to what I said on the overview slide — this just adds two things Dynamo-only: the C++ shim entry and that "compile" here means *trace*, not JIT bytecode recompilation. Give them this framing once and it unlocks every subsequent trace-related slide without re-explaining PEP523 each time. Pause after showing the diagram, say "we split compile into many smaller steps; I'll name all 4 next." This foreshadows S13-S18 as "the meaty internals of COMPILE here". Skip the subgraph LATER_COLD_GOTO drawing if time tight — mention verbally that this slide focuses *cold* path only, warm-cache is covered on S10 already.
@@ -318,12 +330,12 @@ Break COMPILE into its four distinct phases so deep dives stay coherent; audienc
 
 ```mermaid
 flowchart LR
-    P1["1 Symbolic-trace\nread bytecodes of forward()\nmanipulate VARIABLE TRACKERS\n<code>symbolic_convert.py</code>"]:::trace --> P2["2 Backend handoff\ngive graph to aot_autograd+inductor\n<code>_call_user_compiler :3172</code>"]
-    P2 --> P3["3 Guard build tree from accumulated guards\n<code>CheckFunctionManager.build_guards\nguards.py:4901</code>"]:::guard
-    P3 --> P4["4 Eager replay\nstore CacheEntry in ExtraState\ncall compiled code directly\n<code>:679/689 eval_frame_cpp.cpp</code>"]
+    P1["1 Symbolic-trace\nread bytecodes of forward()\nmanipulate VARIABLE TRACKERS\n(symbolic_convert.py)"]:::trace --> P2["2 Backend handoff\ngive graph to aot_autograd+inductor\n(_call_user_compiler :3172)"]
+    P2 --> P3["3 Guard build tree from accumulated guards\nCheckFunctionManager.build_guards\n(guards.py:4901)"]:::guard
+    P3 --> P4["4 Eager replay\nstore CacheEntry in ExtraState\ncall compiled code directly\n(eval_frame_cpp.cpp:679/689)"]
 
-style trace fill:#fffbe0,color:#000
-style guard fill:#e2f3ea,stroke-width:1.5px,color:#000
+    classDef trace fill:#fffbe0,color:#000
+    classDef guard fill:#e2f3ea,stroke-width:1.5px,color:#000
 ```
 
 **KEY MECHANISM:** these 4 are what happens on *call #*; every subsequent `model(x)` just runs stage 4's "replay" for cheap and possibly repeats only stages that changed via guard-failure retrace — but crucially the codepath is unified because each CacheEntry stores not the raw python function, it stores a compiled *bytecode+guards bundle* the C++ side swaps into eval in place of the original bytecode.
@@ -337,26 +349,40 @@ Deepest single concept; spend more air time here than most slides. It answers "h
 
 ```mermaid
 flowchart TD
-    INPUT["Python input at frame entry\n(locals: tensors, ints, nn.Module refs,\nclosures...)"] --> VBLBR["VariableBuilder: three-stage dispatch\nturn each local into a VARIABLE TRACKER (VT)\n<code>builder.py: Builder._wrap 1067</code>]:::vb
+    INPUT["Python input at frame entry\nlocals: tensors, ints, nn.Module refs, closures"] --> VBLBR["VariableBuilder: three-stage dispatch\nturn each local into a VARIABLE TRACKER (VT)\n(builder.py: Builder._wrap 1067)"]:::vb
 
-    subgraph VTCLASSES["VARIABLE TRACKER HIERARCHY\n(class-per-type symbolic model)"]
-        base["VariableTracker (base)\ncall_method(), as_proxy(), etc.\nbase.py:1593"]:::vt --> tv
-        base --> sv; base --> cv; base --> lv; base --> dv ; base --> nnvar; base --> uv; base --> bvl; base --> hopv
-        tv[TensorVariable  tensor.py:203\nsymbolic proxy node, tracks FX node refs]:::vt
-        sv[SymNodeVariable dynamic int/float\ntensor.py:2614]:::vt
-        cv[ConstantVariable :37\nints,bools,str,None literals]:::lit
-        lv[ListVariable lists.py:1042\ntuple/list/deque symbolics]:::coll
-        dv[ConstDictVariable dicts.py:101\nsymbolic dict objects]:::coll
-        nnvar[NNModuleVariable nn_module.py:263\nweight lookup guards + lazy param cache]:::mod
-        uv[UserDefinedObjectVariable user_defined.py:1690\narbitrary python objs w/ method calls traced]:::udo
-        bvl[BuiltinVariable builtin.py:534\nlen, isinstance... etc.]:::ubo
-        hopv[TorchHigherOrderOperatorVariable higher_order_ops.py:2270\n torch.cond, map, while_loop, scan]:::hop
+    subgraph VTCLASSES["VARIABLE TRACKER HIERARCHY\nclass-per-type symbolic model"]
+        base["VariableTracker (base)\ncall_method(), as_proxy(), etc.\n(base.py:1593)"]:::vt
+        base --> tv
+        base --> sv
+        base --> cv
+        base --> lv
+        base --> dv
+        base --> nnvar
+        base --> uv
+        base --> bvl
+        base --> hopv
+        tv["TensorVariable  tensor.py:203\nsymbolic proxy node, tracks FX node refs"]:::vt
+        sv["SymNodeVariable dynamic int/float\n(tensor.py:2614)"]:::vt
+        cv["ConstantVariable\nints, bools, str, None literals"]:::lit
+        lv["ListVariable lists.py:1042\ntuple/list/deque symbolics"]:::coll
+        dv["ConstDictVariable dicts.py:101\nsymbolic dict objects"]:::coll
+        nnvar["NNModuleVariable nn_module.py:263\nweight lookup guards + lazy param cache"]:::mod
+        uv["UserDefinedObjectVariable\narbitrary python objs, methods traced"]:::udo
+        bvl["BuiltinVariable builtin.py:534\nlen, isinstance, ..."]:::ubo
+        hopv["TorchHigherOrderOperatorVariable\ntorch.cond, map, while_loop, scan"]:::hop
     end
 
-    INPUT --> VBLBR;  VBLBR -.->|dispatches by type (id->table then isinstance)| VTCLASSES
+    VBLBR -.->|"dispatch by type"| base
 
-style lit fill:#efe8f5,color:#000
-style coll fill:#dfeefb,color:#000
+    classDef vb fill:#fffbe0,color:#000
+    classDef vt fill:#ffe6b3,color:#000
+    classDef lit fill:#efe8f5,color:#000
+    classDef coll fill:#dfeefb,color:#000
+    classDef mod fill:#d8d6f5,color:#000
+    classDef udo fill:#fad6e3,color:#000
+    classDef ubo fill:#e2f3ea,color:#000
+    classDef hop fill:#cbdff0,color:#000
 ```
 
 **KEY MECHANISM**: *symbolic* execution means every value flowing through the traced region is represented **not by a number or tensor but by an object describing "how this was computed"** (its FX node identity, its dtype/shape assumptions as guards). Arithmetic like `a + b` on two `TensorVariable`s triggers registration of an `aten.add(FXnode_a, FXnode_b)` into the output graph plus installs guarding the types/shapes; nothing about *actual data* is moved. This makes tracing O(ops) independent of tensor volume — a 10GB weight doesn't get copied or even shaped-piloted more than necessary to record its dtype+stride guards.
@@ -370,18 +396,23 @@ style coll fill:#dfeefb,color:#000
 
 ```mermaid
 flowchart LR
-    INIT["InstructionTranslator.__init__\n<code>:5556</code>"]:::init --> SETUP[create OutputGraph + symbolic_locals from each frame local]:::setup
-    SETUP --> LOOP{"step()?\n<code># symbolic_convert.py while self.step(): pass\n(2087)</code>", fill:#fffbe0}:::core
+    INIT["InstructionTranslator constructor\n(symbolic_convert.py:5556)"]:::init --> SETUP["create OutputGraph + symbolic_locals from each frame local"]:::setup
+    SETUP --> LOOP{"step() still running?\n(symbolic_convert.py while-loop :2087)"}:::core
 
-subgraph INNER["PER-BYTECODE step body"]
-  FETCH[FETCH next opcode+arg from code object] --> HANDLER["look up dispatch_table[op]\n<code>1747</code>\ncatch Unsupported->jump to 'resume generation'\ndecode arg if present\n(POP, PUSH, STORE...)"]
-  HANDLER --> EXEC[EXEC handler modifies symbolic stack + appends FX nodes accordingly]:::exec
+    subgraph INNER["PER-BYTECODE step body"]
+        FETCH["FETCH next opcode+arg from code object"] --> HANDLER["look up dispatch_table(op)\n(:1747)\ncatch Unsupported, jump to resume generation\ndecode arg if present\nPOP, PUSH, STORE"]
+        HANDLER --> EXEC["EXEC handler modifies symbolic stack\nand appends FX nodes"]:::exec
+    end
 
-end
-LOOP --> INNER--> CORE2{"RETURN opcode seen?"}--> CLOSE["stop looping; hand graph to backend via compile_subgraph\ntorward<code>:1878</code>"]:::end
+    LOOP --> FETCH
+    EXEC --> CORE2{"RETURN opcode seen?"}
+    CORE2 --> CLOSE["stop looping; hand graph to backend via compile_subgraph\n(symbolic_convert.py:1878)"]:::fin
 
-style core fill:#dfeefb,color:#000,stroke-width:2px
-INNER --> EXEC
+    classDef init fill:#fffbe0,color:#000
+    classDef setup fill:#fffbe0,color:#000
+    classDef core fill:#dfeefb,color:#000,stroke-width:2px
+    classDef exec fill:#ffe6b3,color:#000
+    classDef fin fill:#c8f0d4,color:#000
 ```
 
 **KEY MECHANISM:** *it's one while loop.* Each iteration pops the next `opcode`, consults a per-opcode table of Python functions that manipulate a symbolic operand stack + push/pop FX nodes. When it finally sees RETURN, tracing ends cleanly and returns to compile_subgraph stage from S13 step2. The dispatch_table design means adding support for new bytecodes is just writing a one-method dispatcher — no need to patch interpreter core; this extends even to catching unhandleable ops triggering graph break recovery (discussed next).
@@ -395,12 +426,17 @@ Important enough to get its own slide: VT operations aren't alone; two other sub
 
 ```mermaid
 flowchart LR
-    S25 --> VTM["VT operations on symbolic stack\n(what got computed)"]:::vt
-    S25 --> GARDS["GUARD accumulation\n(install_guard(...) on every new/lookup)\ntensor.py+source.py, pervasive"]:::gurad
-    S25 --> SEff["SIDE EFFECTS tracking\n(store_attr/list.append/dict[...]=  recorded for replay in compiled bytecode)\nside_effects.py:195"]:::se
+    S25["step() loop"] --> VTM["VT operations on symbolic stack\n(what got computed)"]:::vt
+    S25 --> GARDS["GUARD accumulation\ninstall_guard on every new/lookup\ntensor.py + source.py, pervasive"]:::gurad
+    S25 --> SEff["SIDE EFFECTS tracking\nstore_attr / list.append / dict assign\nrecorded for replay in compiled bytecode\n(side_effects.py:195)"]:::se
 
-style se fill:#fad6e3,color:#000
-vt --> COMPILE_SUB["REJOIN at compile_subgraph stage\nguards->CheckFxnMgr build; SideEffects ->code-gen replay\ngraph-> backend"]
+    VTM --> COMPILE_SUB["REJOIN at compile_subgraph\nguards to CheckFxnMgr build\nSideEffects to codegen replay\ngraph to backend"]
+    GARDS --> COMPILE_SUB
+    SEff --> COMPILE_SUB
+
+    classDef vt fill:#fffbe0,color:#000
+    classDef gurad fill:#e2f3ea,color:#000
+    classDef se fill:#fad6e3,color:#000
 ```
 
 > **Speaker notes.** "Three parallel bookkeeping engines running simultaneously, all writing to the same output graph object." This explains *why Dynamo is memory-hungry but CPU-efficient:* no extra Python overhead since these are plain C++-accelerated append-on-insert into ordered data structures vs separate loop. Also foreshadow their convergence point on next-to-next slide about handoff + guards tree creation, because "guards generated during trace" aren't compiled-to-tree *during* tracing but post-trace batched via checkfunctionmanager, which is why we split S14 (machine overview) and S20ish for guard details rather than one giant slide.
@@ -414,16 +450,21 @@ Single most important "why did my model take forever the first few batch iters" 
 
 ```mermaid
 flowchart TD
-    PASS1["PASS 1: trace to completion attempt"] --> U{"unhandled op?\ncatch Unsupported @symbolic_convert.py:1756"}:::u
-    U --yes--> FA[FAIL_AND_RESTART_ANALYSIS\nmark speculatively untraced region as needing restart\n<code>:1801</code>]:::restart
+    PASS1["PASS 1: trace to completion attempt"] --> U{"unhandled op?\ncatch Unsupported at symbolic_convert.py:1756"}:::u
+    U --yes--> FA["FAIL_AND_RESTART_ANALYSIS\nmark untraced region as needing restart\n(symbolic_convert.py:1801)"]:::restart
     FA --> PASS2["PASS 2: RE-RUN with checkpoint saved\nSpeculationLog remembers failure location"]:::p2
 
-subgraph RESUME_GEN["generate resume function for post-break remainder\n<code>resume_execution.py:create_call_resume_at:328/344</code>"]
-    NEWCODE[create new .pyc code object for rest of function body after break]--> JUMP["jump back into PEP523 shim to continue tracing there\ncached as new CacheEntry on next call"]:::rejoin
-end
+    subgraph RESUME_GEN["generate resume function for post-break remainder\n(resume_execution.py:create_call_resume_at 328/344)"]
+        NEWCODE["create new .pyc code object for rest of function body after break"] --> JUMP["jump back into PEP523 shim to continue tracing\ncached as new CacheEntry on next call"]:::rejoin
+    end
 
-style restart fill:#feb,stroke-width:1.5px,color:#000
-RESUME_GEN --> NEWCODE; FA<--"REJOINS mainloop via new speculation"|PASS1
+    PASS2 --> NEWCODE
+    FA -->|"REJOINS mainloop via new speculation"| PASS1
+
+    classDef u fill:#fde3e3,color:#000
+    classDef restart fill:#ffe6b3,stroke-width:1.5px,color:#000
+    classDef p2 fill:#dfeefb,color:#000
+    classDef rejoin fill:#c8f0d4,color:#000
 ```
 
 **KEY MECHANISM (the heart):** graph break = *partial* compilation of [start..unhandled_op], remainder untraced so far treated as separate Python 'tail' compiled next time we reach it (two separate CacheEntries stitched by a generated resume function). Two-pass because first pass's exception location info is stored in `SpeculationLog`; second pass knows where to split without retrying full original traversal before break. Resume functions themselves are traced via same loop so further nested breaks keep compounding — but each resulting partial graph cached by guards means once all fragments resolved, later calls run fully compiled end-to-end chain of resume fns back into each other with no Python eval between fused kernels.
@@ -438,23 +479,30 @@ Fourth-time revisiting guards idea from S3; this time actually showing the machi
 ```mermaid
 flowchart LR
     subgraph TRACE_PHASE["Trace phase: every op emits guards"]
-        SRC[Source records HOW value reached\ntensor, attr chain... <code>source.py</code>]:::src --> INSTALL[install_guard(Guard(source,check_fn)\n<code>guards.py:5695</code>) accumulates into] --> ACC[(GuardsContext.dynamo_guards)]:::acc
+        SRC["Source records HOW value reached\ntensor, attr chain (source.py)"]:::src --> INSTALL["install_guard(Guard source, check_fn)\n(guards.py:5695) accumulates into"]
+        INSTALL --> ACC["GuardsContext.dynamo_guards"]:::acc
     end
 
-    subgraph BUILD_PHASE["Post-trace build phase @compile_subgraph\ntree built by CheckFunctionManager :4901, recurse per source node"]
-      SORT[sort guards by sort_key + run guard_filter_fn reduce redundant checks] --> BUILDER[GuardBuilder wraps locals/globals scope dict as C++ nodes\nget_guard_manager_from_source maps each python Source chain to matching c++ Accessor chains recursively\ne.g LocalSource(model)-> AttrSource(layer)-> ...
- leaf TENSOR_MATCH installed at terminal node level per source depth level matched one-to-one]:::bld
-
+    subgraph BUILD_PHASE["Post-trace build at compile_subgraph\nCheckFunctionManager :4901"]
+        SORT["sort guards by sort_key + run guard_filter_fn"] --> BUILDER["GuardBuilder wraps locals/globals as C++ nodes\nget_guard_manager_from_source maps each Source chain\nto matching C++ Accessor chains\nleaf TENSOR_MATCH at terminal node"]:::bld
     end
 
-    subgraph RUNTIME["Call #2..N runtime eval phase <code>guards.cpp:7463</code>"]
-      root[run_root_guard_manager casts void* to RootGuardManager* then runs check_nopybind entry point on tree ]:::root --> LEAF_FIRST{check_leaf_guards first (fast exit early if fail)\nthen Recurse children accessor-nodes depth-first \nprioritize diff_rootmgr reduced-tree hot re-check path}:::hot
-      LEAF_FIRST --all pass--> PASS[execute compiled code via replay]:::done
-      LEAF_FIRST --fail one node--> MISS[next_cache_entry lookup loop then RECOMPILE if all miss]
-
+    subgraph RUNTIME["Call 2..N runtime eval (guards.cpp:7463)"]
+        root["run_root_guard_manager\ncheck_nopybind on tree"]:::root --> LEAF_FIRST{"check_leaf_guards first (fail fast)\nthen recurse children depth-first\ndiff_rootmgr hot re-check path"}:::hot
+        LEAF_FIRST --all pass--> PASS["execute compiled code via replay"]:::done
+        LEAF_FIRST --fail one node--> MISS["next_cache_entry lookup, then RECOMPILE if all miss"]
     end
 
-style trace_phase fill:#e2fff0,stroke-width:1.5px,color:#000
+    ACC --> SORT
+    BUILDER --> root
+
+    classDef src fill:#e2fff0,color:#000
+    classDef acc fill:#c8f0d4,color:#000
+    classDef bld fill:#dfeefb,color:#000
+    classDef root fill:#ffe6b3,color:#000
+    classDef hot fill:#fffbe0,color:#000
+    classDef done fill:#c8f0d4,color:#000
+    style TRACE_PHASE fill:#e2fff0,stroke-width:1.5px,color:#000
 ```
 
 **KEY MECHANISMS:** (1) Source <-> C++ Accessor 1:1 structural mirror property so generated tree isn't ad-hoc heuristic but a faithful *translation* of the exact object access path Dynamo saw while tracing. This makes guard correctness provable from original run rather than requiring new validation. Same reason each node's leaf guards are minimal set covering only what that exact op needed checked -- e.g add of two tensors doesn't need shape-env guard beyond basic types/dtypes/strides since addition broadcasts fine for many rank dims; a reshape however would trigger stronger constraint on input size being statically known matching total numel.
@@ -470,15 +518,19 @@ Last structural concept of Dynamo half: how `torch.cond`, loops, and arbitrary P
 
 ```mermaid
 flowchart TD
-    CALL["CALL opcode hits UserFunctionVariable.call_function\ncodefunctions.py:840"]:::u --> DEC{"inline decision?\n can_fully_inline / cost estimate\n(1652)"}:::dep
-    DEC --yes--> INLINE[create InliningInstrTranslator nested child translator\nshares parent OutputGraph, runs step() loop on callee's bytecode recursively re-entering same while-loop of S15 via new stack frame context object]:::rejoinloop
+    CALL_OP["CALL opcode hits UserFunctionVariable.call_function\n(codefunctions.py:840)"]:::u --> DEC{"inline decision?\ncan_fully_inline / cost estimate\n(:1652)"}:::dep
+    DEC --yes--> INLINE["create InliningInstrTranslator nested child translator\nshares parent OutputGraph, runs step() on callee bytecode"]:::rejoinloop
 
-subgraph HOPS["if op was torch.cond/map/while/scan instead:\nspeculate_subgraph traces sub-fn into isolated SubgraphTracer\n<code>higher_order_ops.py:2005</code>"]
-    ISODIS[isolated tracer builds separate FX node subtree attached as attribute onto parent graph without mixing stack states]--> ATTACH["attach resulting subnodes to parent graph then continue linear main-loop after returning back up original nesting level with fused child represented symbolically still as one combined HOP operation rather than expanded inline nodes keeping final emitted graph compact instead of exploding node count via full expansion"]
-end
+    subgraph HOPS["if op was torch.cond/map/while/scan:\nspeculate_subgraph traces sub-fn into isolated SubgraphTracer\n(higher_order_ops.py:2005)"]
+        ISODIS["isolated tracer builds a separate FX subtree\nattached as an attribute on the parent graph"] --> ATTACH["attach subnodes, then continue the main loop\nchild stays one HOP op, graph stays compact"]
+    end
 
-style rejoinloop fill:#fad6e3,color:#000
-ATTCACH -.->|REJOIN into mainloop]|CALL
+    CALL_OP -.-> ISODIS
+    ATTACH -.->|"REJOIN into mainloop"| CALL_OP
+
+    classDef u fill:#ffe6b3,color:#000
+    classDef dep fill:#fffbe0,color:#000
+    classDef rejoinloop fill:#fad6e3,color:#000
 ```
 
 **KEY MECHANISM:** inlining gives Dynamo *structural recursion* — same single while-loop handles arbitrary nesting depth by spawning transient nested translators each carrying a local copy of state then re-joining parent via shared output graph object; HOP mechanism instead *defers full expansion* to backend-level so user-authored conditionals etc. appear as compact placeholder operations rather than bloated intermediate node trees inside main compiled module while still permitting downstream fusion optimization since their semantics are fully specified up-front by the specific HOP's registered lowering pass later consumed by the patternmatchersystem when postGrad passes run them after autograd done partitioning.
@@ -510,12 +562,14 @@ Two jobs that neither Dynamo nor Inductor do alone. This is why logs show two gr
 
 ```mermaid
 flowchart LR
-    ENTRY["compile_fx :2889\n(FX graph + example_inputs)"]:::ent --> PREG[pre_grad_passes :336\ncleanup / normalization]
-    PREG --> AOT{"aot_autograd(fw,bw,partition)\n:3275"}:::part
-    AOT --"train\nsplit via min-cut"| FW["compile_fx_inner :857\n(fwd subgraph)"] --> BOTH[per-subgraph\ncodegen pipeline]:::bothpaths
-    AOT --"inference\nno autograd"| INFER["inference_compiler :3148"]
+    ENTRY["compile_fx :2889\n(FX graph + example_inputs)"]:::ent --> PREG["pre_grad_passes :336\ncleanup / normalization"]
+    PREG --> AOT{"aot_autograd(fw, bw, partition)\n:3275"}:::part
+    AOT -->|"train: split via min-cut"| FW["compile_fx_inner :857\n(fwd subgraph)"] --> BOTH["per-subgraph\ncodegen pipeline"]:::bothpaths
+    AOT -->|"inference: no autograd"| INFER["inference_compiler :3148"]
 
-style bothpaths fill:#ffd9d9,color:#000,stroke-width:1.5px
+    classDef ent fill:#d8d6f5,color:#000
+    classDef part fill:#ffe6b3,color:#000
+    classDef bothpaths fill:#ffd9d9,color:#000,stroke-width:1.5px
 ```
 
 **KEY MECHANISM:** AOTAutograd's only real contribution is *structure before lowering*: (1) split forward/backward so each optimizes independently; (2) apply `min_cut_rematerialization_partition` on the joint graph first because choosing cut points needs the whole fwd+bwd structure — something Dynamo deliberately doesn't produce.
@@ -529,15 +583,19 @@ Where high-level aten ops get rewritten into smaller optimizable pieces *before*
 
 ```mermaid
 flowchart TD
-    JOINT[{"joint graph passes\non fwd+bwd together\n<code>joint_graph.py</code>"}]:::jp --> PAT["PatternMatcher.apply :2641\nSEARCH trace search_fn via fx_to_pattern -> PatternExpr DAG\nMATCH structural compare, reverse-topo order"]
+    JOINT["joint graph passes\non fwd+bwd together\n(joint_graph.py)"]:::jp --> PAT["PatternMatcher.apply :2641\nSEARCH: trace search_fn via fx_to_pattern to PatternExpr DAG\nMATCH: structural compare, reverse-topo order"]
 
-subgraph PM["matcher internals (pattern_matcher.py)"]
-    REG[register_replacement / register_lowering_pair]:::reg --> VALIDATE{validate mutation region +<br/>stream boundary:<br/>all matched nodes in same<br/>atomic fusion region?<br/><code>:2658</code>}:::val
-    VALIDATE --no--> ABORT["abort, graph unchanged"]
-    VALIDATE --yes--> APPLY[copy replacement into graph]
-end
+    subgraph PM["matcher internals (pattern_matcher.py)"]
+        REG["register_replacement / register_lowering_pair"]:::reg --> VALIDATE{"validate mutation region +\nstream boundary:\nall matched nodes in same\natomic fusion region?\n(:2658)"}:::val
+        VALIDATE --no--> ABORT["abort, graph unchanged"]
+        VALIDATE --yes--> APPLY["copy replacement into graph"]
+    end
 
-style jp fill:#dfeefb,stroke-width:1.5px,color:#000
+    PAT --> REG
+
+    classDef jp fill:#dfeefb,stroke-width:1.5px,color:#000
+    classDef reg fill:#ffe6b3,color:#000
+    classDef val fill:#fffbe0,color:#000
 ```
 
 **KEY INSIGHT:** semantic structural rewriting on FX graphs — it recognizes logically identical ops spelled through different aten names (handwritten vs autodiff-generated backward equivalents) that text tools miss. Hot fusions like fused-SDPA ship as *serialized* precompiled patterns (`fx_passes/serialized_patterns/`).
@@ -553,17 +611,19 @@ Keep the slide-4 three-layer anchor in view; this is *inside* that third box, en
 
 ```mermaid
 flowchart TD
-    I1["[1] compile_fx :2889\nFX graph + example_inputs from Dynamo"]:::start --> I2["_compile_fx_main :3080"]
-    I2 --> PREG[pre_grad_passes :336]
-    PREG --> AOTB[aot_autograd (bridge S19-20)]
+    I1["1 compile_fx :2889\nFX graph + example_inputs from Dynamo"]:::start --> I2["_compile_fx_main :3080"]
+    I2 --> PREG["pre_grad_passes :336"]
+    PREG --> AOTB["aot_autograd (bridge S19-20)"]
     AOTB --> I7a["_compile_fx_inner :930\nFxGraphCache check + TritonBundler"]:::hot
     I7a --> FCAC["fx_codegen_and_compile :1927\nstrategy: in-proc / subproc / async / progressive"]
-    FCAC --> PGR[_recursive_post_grad_passes :166]
-    PGR --> GLG[GraphLowering.run_node :1878\nFX op -> IR node (Pointwise/Reduction/ExternKernel)]:::gllw
-    GLG --> I13[compile_to_module :3053\ncodegen -> Scheduler -> wrapper]
+    FCAC --> PGR["_recursive_post_grad_passes :166"]
+    PGR --> GLG["GraphLowering.run_node :1878\nFX op to IR node (Pointwise/Reduction/ExternKernel)"]:::gllw
+    GLG --> I13["compile_to_module :3053\ncodegen, Scheduler, wrapper"]
     I13 --> OUT["CompiledFxGraph :516 + optional CUDAGraphs"]
 
-style start fill:#ffe0e0,color:#000,stroke-width:2px
+    classDef start fill:#ffe0e0,color:#000,stroke-width:2px
+    classDef hot fill:#ffe6b3,color:#000
+    classDef gllw fill:#cbdff0,color:#000
 ```
 
 **KEY MECHANISM:** the FxGraphCache lookup at `_compile_fx_inner` can skip *entire* downstream compilation for a repeat graph whose hash already hit a persisted entry. The strategy node picks how to actually build on a miss — async/progressive keep the caller unblocked while compilation runs in a background pool.
@@ -578,13 +638,14 @@ Caching is the single biggest real-world lever; it gates *whether* any codegen r
 ```mermaid
 flowchart LR
     subgraph G["GRAPH-LEVEL"]
-        CC1[FxGraphCache :1993\nkey = hash(gm + inputs meta + config)\n=> persistent .py/.pkl on disk]:::cc --> HIT[load prebuilt CompiledFxGraph,\nfull codegen skipped this call]
+        CC1["FxGraphCache :1993\nkey = hash(gm + inputs meta + config)\npersistent .py/.pkl on disk"]:::cc --> HIT["load prebuilt CompiledFxGraph,\nfull codegen skipped this call"]
     end
     subgraph K["KERNEL-LEVEL"]
-        CC4["CompiledTritonKernels :228\nin-memory, key = source + torch_key"]:::k --> SUBMIT[submit only *new* sources to compile pool]
+        CC4["CompiledTritonKernels :228\nin-memory, key = source + torch_key"]:::k --> SUBMIT["submit only new sources to compile pool"]
     end
 
-style cc fill:#7de,color:#000,stroke-width:1.5px
+    classDef cc fill:#77ddee,color:#000,stroke-width:1.5px
+    classDef k fill:#ffe6b3,color:#000
 ```
 
 **KEY MECHANISM:** hash spans graph structure *and* config version and static input-class metadata — so distinct graphs never collide onto a wrong cached kernel (which would corrupt outputs silently). Kernel-level dedup means identical Triton source strings across many nodes compile once, reused everywhere by pointer.
@@ -598,22 +659,30 @@ The conceptual heart of the Inductor half; spend a full slide here before fusion
 
 ```mermaid
 flowchart TD
-    TB[("TensorBox :10603\nlayout-level wrapper")]:::box --> SB[StorageBox :10618\nvalue-holder; realize() lives here]:::sb
+    TB(["TensorBox :10603\nlayout-level wrapper"]):::box --> SB["StorageBox :10618\nvalue-holder; realize() lives here"]:::sb
 
-subgraph LAZY["lazy IR (unevaluated until realized)"]
-        PW[Pointwise :1220\nelement-wise ops]:::pnode --> REAL(("realize()")) 
-      RED[Reduction :1399\nsum/max/mean...]:::rnode --> REAL
-      SCAT[Scatter :1261 (a Pointwise)]:::snode --> REAL
-        REAL --> CBUF((ComputedBuffer :5432\nactual data lives here)):::cbuf
+    subgraph LAZY["lazy IR (unevaluated until realized)"]
+        PW["Pointwise :1220\nelement-wise ops"]:::pnode --> REAL(("realize()"))
+        RED["Reduction :1399\nsum/max/mean"]:::rnode --> REAL
+        SCAT["Scatter :1261 (a Pointwise)"]:::snode --> REAL
+        REAL --> CBUF(("ComputedBuffer :5432\nactual data lives here")):::cbuf
     end
 
-subgraph EAGER["eager IR (calls external lib, no lazy fusion)"]
-      EXT[ExternKernel :7021\ncuBLAS/oneDNN/cudnn boxes]:::fb
-      FB[FallbackKernel :9373\n"fall back to eager ATen when Inductor has no native lowering for this op yet"]:::fbg
+    subgraph EAGER["eager IR (calls external lib, no lazy fusion)"]
+        EXT["ExternKernel :7021\ncuBLAS/oneDNN/cudnn boxes"]:::fb
+        FB["FallbackKernel :9373\nfall back to eager ATen when Inductor has no native lowering"]:::fbg
     end
 
-style box fill:#e6d5f2,stroke-width:1.5px,color:#000
-cbuf --> REGISTER[graph.register_output() once materialized]
+    CBUF --> REGISTER["graph.register_output() once materialized"]
+
+    classDef box fill:#e6d5f2,stroke-width:1.5px,color:#000
+    classDef sb fill:#d8d6f5,color:#000
+    classDef pnode fill:#cfe9ff,color:#000
+    classDef rnode fill:#cfe9ff,color:#000
+    classDef snode fill:#cfe9ff,color:#000
+    classDef cbuf fill:#c8f0d4,color:#000
+    classDef fb fill:#ffe6b3,color:#000
+    classDef fbg fill:#fde3e3,color:#000
 ```
 
 **KEY INSIGHT:** fusion is *possible only because* Pointwise/Reduction are pure unevaluated description objects carrying no data-movement cost yet — `realize()` (triggered heuristically by multi-user fanout, large inner function, stream/mempool boundary) is the single moment materialization happens as a new ComputedBuffer registered on graph. Everything downstream of that realize point can still fold adjacent lazy nodes into one fused kernel covering both input+output buffers in same loop body avoiding intermediate round-trip to global memory entirely for that op pair specifically.
@@ -629,12 +698,14 @@ How does a specific aten op become *some* IR node? A strict priority cascade so 
 
 ```mermaid
 flowchart TD
-    RUN["run_node :1878 -> call_function"]:::entry --> P{which lowering?<br/><code>graph.py:1520</code>}
-    P --priority 1--> U[user_lowerings[target]\nuser-registered, <code>lowering.py:127</code>]
-    P --priority 2--> B[built-in lowerings[target]\nvia @register_lowering]:::bld
-    P --unrecognised--> F[fallback_handler -> FallbackKernel\n<eager ATen call>, lowering.py:2876]:::fb
+    RUN["run_node :1878 then call_function"]:::entry --> P{"which lowering?\n(graph.py:1520)"}
+    P --priority 1--> U["user_lowerings(target)\nuser-registered (lowering.py:127)"]
+    P --priority 2--> B["built-in lowerings(target)\nvia register_lowering"]:::bld
+    P --unrecognised--> F["fallback_handler to FallbackKernel\neager ATen call, lowering.py:2876"]:::fb
 
-style fb fill:#fa6,stroke-width:1.5px,color:#000
+    classDef entry fill:#dfeefb,color:#000
+    classDef bld fill:#cfe9ff,color:#000
+    classDef fb fill:#ffaa66,stroke-width:1.5px,color:#000
 ```
 
 **KEY MECHANISM:** layout constraints (contiguity / channels_last) are applied *before* dispatch (`lowering.py`), so the IR node built already respects target stride requirements — this is why downstream fusion sees correctly-laid buffers, not arbitrary tensors needing reshuffling later. Layout mismatch handled up-front here prevents fusions that would be invalidated by surprise realignments mid-pipe mid-graph mid-loop iteration.
@@ -649,13 +720,18 @@ The scheduler is where "a bag of fuzzy lazy IR nodes" becomes an *ordered, sched
 
 ```mermaid
 flowchart TD
-    A[create_scheduler_node<br/>each op -> SchedulerNode]:::si --> B[compute_dependencies<br/>alias merge + mutation deps][:4279]:::dep
-    B --> C[topological_sort_schedule<br/>DFS via unmet_dependencies ::4280]:::tortop
-   D[dead_node_elimination<br/>+ compute_ancestors ::4281-4283]:::dne
-    C --> D --> E[create_foreach_nodes ::4292<br/>group foreach ops into ForeachKernelSchedulerNode]:::foreach
-    E --> F[stream + mempool assignments ::4319-4320<br/>one stream, one memory-pool per node]:::assign
+    A["create_scheduler_node\neach op to SchedulerNode"]:::si --> B["compute_dependencies\nalias merge + mutation deps :4279"]:::dep
+    B --> C["topological_sort_schedule\nDFS via unmet_dependencies :4280"]:::tortop
+    D["dead_node_elimination\n+ compute_ancestors :4281-4283"]:::dne
+    C --> D --> E["create_foreach_nodes :4292\ngroup foreach ops into ForeachKernelSchedulerNode"]:::foreach
+    E --> F["stream + mempool assignments :4319-4320\none stream, one memory-pool per node"]:::assign
 
-style assign fill:#ffe6b3,color:#000,stroke-width:1.5px
+    classDef si fill:#dfeefb,color:#000
+    classDef dep fill:#cfe9ff,color:#000
+    classDef tortop fill:#fffbe0,color:#000
+    classDef dne fill:#efe8f5,color:#000
+    classDef foreach fill:#d8d6f5,color:#000
+    classDef assign fill:#ffe6b3,color:#000,stroke-width:1.5px
 ```
 
 **KEY MECHANISM:** stream/mempool assignment happens *before* fusion (`_init` ends by populating `node_to_stream`, `buff_to_stream`). This prevents fusing two nodes that live on different streams or memory pools — a correctness gate the scheduler enforces structurally so later passes never even consider a cross-stream fusion candidate.
@@ -669,11 +745,15 @@ The performance payoff lands here. Two pieces: a looping outer pass that runs un
 
 ```mermaid
 flowchart LR
-    LOOP{"fuse_nodes (up to 10 rounds)"<br/><code>scheduler.py:5304</code></> --> ONCE[fuse_nodes_once<br/>prune deps + get_possible_fusions + score]:::once
-    ONCE --> PAIRS[try each sorted pair via can_fuse()<br/><code>:7891</code>, 8 gates shown next}:::can
+    LOOP{"fuse_nodes (up to 10 rounds)\n(scheduler.py:5304)"} --> ONCE["fuse_nodes_once\nprune deps + get_possible_fusions + score"]:::once
+    ONCE --> PAIRS["try each sorted pair via can_fuse()\n(:7891), 8 gates shown next"]:::can
     PAIRS --any gate fails--> ONCE
-    PAIRS --all pass--> FUSE2[fuse_two_nodes -> FusedSchedulerNode ::6174]:::fuseN
-    LOOP --done, no new fusions--> POST[merge_loops ::5277<br/>finalize_multi_template_buffers ::5441]
+    PAIRS --all pass--> FUSE2["fuse_two_nodes to FusedSchedulerNode :6174"]:::fuseN
+    LOOP --done, no new fusions--> POST["merge_loops :5277\nfinalize_multi_template_buffers :5441"]
+
+    classDef once fill:#dfeefb,color:#000
+    classDef can fill:#fffbe0,color:#000
+    classDef fuseN fill:#c8f0d4,color:#000
 ```
 
 > **Speaker notes.** Emphasize the *fixed-point* property explicitly (up to 10 rounds, repeat until no more fusions found per round): this is why a single well-placed fusion can cascade into many further ones downstream once earlier fusion exposes new adjacent candidate pairs previously blocked by intermediate buffer boundaries before that first pass concluded successfully earlier iteration loop cycle.
@@ -685,14 +765,17 @@ Fusion isn't "merge everything next to each other"; each candidate pair must cle
 
 ```mermaid
 flowchart TD
-    G[can_fuse() pair check<br/><code>scheduler.py:7891</code>]:::cf --> CF1[G1 stream + mempool boundary<br/>same stream, same pool ::7948]
-    G --> CF2[G2 multi-output template /<br/>reduction epilogue OK? ::7973]:::cf
-   G --> CF3[G3 extern kernel epilogue check ::7991]:::cf
-    G --> CF4[G4 node1 not ancestor of node2<br/>(ordering) ::8085]:::cf
-    G --> CF5[G5 device match + memory<br/>shared-data score above threshold ::8180]::__cf
-   G --> CF6[G6 vertical: consumer reads\nmatch producer writes ::8241]:::cf
-     G --> C7[G7 horizontal allowed\n(backend check) ::8275]::__cf
-      G --> CF8[G8 cycle detection DFS<br/>will_fusion_create_cycle ::6922]:::cyc
+    G["can_fuse() pair check\n(scheduler.py:7891)"]:::cf --> CF1["G1 stream + mempool boundary\nsame stream, same pool :7948"]
+    G --> CF2["G2 multi-output template /\nreduction epilogue OK? :7973"]:::cf
+    G --> CF3["G3 extern kernel epilogue check :7991"]:::cf
+    G --> CF4["G4 node1 not ancestor of node2\n(ordering) :8085"]:::cf
+    G --> CF5["G5 device match + memory\nshared-data score above threshold :8180"]:::cf
+    G --> CF6["G6 vertical: consumer reads\nmatch producer writes :8241"]:::cf
+    G --> CF7["G7 horizontal allowed\n(backend check) :8275"]:::cf
+    G --> CF8["G8 cycle detection DFS\nwill_fusion_create_cycle :6922"]:::cyc
+
+    classDef cf fill:#dfeefb,color:#000
+    classDef cyc fill:#fde3e3,color:#000
 ```
 
 **KEY MECHANISM:** G1 (stream + mempool) is checked *first* and cheapest because almost all cross-stream / cross-pool pairs immediately drop out here — a fast reject before the more expensive ancestor-DAG checks get to cost anything meaningful on that particular input pair this time round.
@@ -706,13 +789,17 @@ After fusion, *each* surviving node is emitted to exactly one code-gen path chos
 
 ```mermaid
 flowchart LR
-    CODEGEN["Scheduler.codegen_node_schedule\n<code>scheduler.py:9823 -> simd.py:3140</code>\ndispatch node -> one backend"]:::cd --> T{node kind?}
-    T --template--> CDT[codegen_template<br/>GEMM + epilogue fusion]:::ctr
-    T --extern--> CDE[codegen_extern_call\ninplace decision <code>:9085</code>]:::ced
-    T --foreach/combo--> CDC[codegen_combo_kernel\nmultiple ops one launch]:::cfc
-    T --standard pointwise/reduction--> CDI[SIMDScheduling.codegen_node :3045<br/>Triton path (below)]:::cdsd
+    CODEGEN["Scheduler.codegen_node_schedule\n(scheduler.py:9823 to simd.py:3140)\ndispatch node to one backend"]:::cd --> T{"node kind?"}
+    T --template--> CDT["codegen_template\nGEMM + epilogue fusion"]:::ctr
+    T --extern--> CDE["codegen_extern_call\ninplace decision (:9085)"]:::ced
+    T --foreach/combo--> CDC["codegen_combo_kernel\nmultiple ops one launch"]:::cfc
+    T --standard pointwise/reduction--> CDI["SIMDScheduling.codegen_node :3045\nTriton path"]:::cdsd
 
-style cdsd fill:#fac,stroke-width:1.5px,color:#000
+    classDef cd fill:#dfeefb,color:#000
+    classDef ctr fill:#ffe6b3,color:#000
+    classDef ced fill:#d8d6f5,color:#000
+    classDef cfc fill:#cfe9ff,color:#000
+    classDef cdsd fill:#ffccaa,stroke-width:1.5px,color:#000
 ```
 
 **KEY MECHANISM:** codegen is a *type switch*, not an op-name lookup — by the time we reach `Scheduler.codegen` (S26-27 done), every node already has exactly one kind, so dispatch never needs to re-inspect op names at all.
@@ -727,12 +814,15 @@ Same scheduler/codegen backbone as the Triton path, but here we emit real C++ so
 
 ```mermaid
 flowchart LR
-    CPP5["CppKernelProxy :4373"]:::cpx --> TIL{tiling-select<br/>cpp.py:4134}
-    TIL --scalar--> C2["CppKernel baseline, always generated"]::_cpk
-    TIL --vectorized--> CPV["CppVecKernel :2860\nat::vec loads/stores when dtype is vectorizable and strides are contiguous"]::_cpcv
-    TIL --2D-tiled--> CT2["CppTile2DKernel :3838\none transposed axis via transpose_mxn helper (only when one axis is non-contiguous)"]::_cpp2d
+    CPP5["CppKernelProxy :4373"]:::cpx --> TIL{"tiling-select\ncpp.py:4134"}
+    TIL --scalar--> C2["CppKernel baseline, always generated"]:::cpk
+    TIL --vectorized--> CPV["CppVecKernel :2860\nat.vec loads/stores when dtype is vectorizable and strides are contiguous"]:::cpcv
+    TIL --2D-tiled--> CT2["CppTile2DKernel :3838\none transposed axis via transpose_mxn (only when one axis is non-contiguous)"]:::cpp2d
 
-style _cpcv fill:#ffd,stroke-width:1.5px,color:#000
+    classDef cpx fill:#dfeefb,color:#000
+    classDef cpk fill:#efe8f5,color:#000
+    classDef cpcv fill:#ffffdd,stroke-width:1.5px,color:#000
+    classDef cpp2d fill:#cfe9ff,color:#000
 ```
 
 **KEY MECHANISM**: `TilingSelect` (cpp.py:4134) compares generated-code size *and* estimated runtime from a small heuristic model; only the single best variant survives to actual compilation via `CppCodeCache.load_async`, keeping compile cost down even when three variants were briefly emitted in parallel internally during selection phase decision-making moment up front before settling on one final winner pick choice option.
@@ -746,10 +836,12 @@ Both the Triton and C++ paths converge here: one shared finish-line step stitche
 
 ```mermaid
 flowchart LR
-    WRAP["PythonWrapperCodegen._generate<br/>wrapper.py :2460"]:::w --> MPLY[MemoryPlanningState reuse pass<br/>wrapper.py:479]::_mply
-    WRAP --> ASYNC["async_compile.wait(globals)<br/>async_compile.py :903\nresolves Future handles for any\nstill-pending kernels launched earlier off-thread"]:::_asyn
+    WRAP["PythonWrapperCodegen._generate\nwrapper.py :2460"]:::w --> MPLY["MemoryPlanningState reuse pass\nwrapper.py:479"]:::mply
+    WRAP --> ASYNC["async_compile.wait(globals)\nasync_compile.py :903\nresolves Future handles for any\nstill-pending kernels launched off-thread"]:::asyn
 
-style _mply fill:#fae6c,stroke-width:1px,color:#000
+    classDef w fill:#dfeefb,color:#000
+    classDef mply fill:#fae6cc,stroke-width:1px,color:#000
+    classDef asyn fill:#cfe9ff,color:#000
 ```
 
 **KEY MECHANISM**: `MemoryPlanningState` (wrapper.py:479) tracks every freed buffer by `(dtype, size, stride)` so later allocations can *reuse* that exact pre-existing slot in-place rather than always requesting fresh memory from CUDA's caching allocator — this is precisely the difference between naive independent per-node allocation and actual peak-memory optimization in practice.
@@ -762,17 +854,23 @@ Fused kernels still pay a per-launch CPU dispatch cost (~5–20µs each). CUDAGr
 
 ```mermaid
 flowchart TD
-    CG1{triton.cudagraphs<br/>enabled?} -->|no| RET[return callable as-is]
-    CG1 --yes--> TREEN[CUDAGraphTreeManager :2261\na tree of recorded graphs]:::t
+    CG1{"triton.cudagraphs enabled?"} -->|no| RET["return callable as-is"]
+    CG1 --yes--> TREEN["CUDAGraphTreeManager :2261\na tree of recorded graphs"]:::t
 
-subgraph LIFE["per-batch-descriptor lifecycle"]
-    FIST[run_eager warmup :2689] --> REC[record_function :2641\ncapture GPU commands once, per batch size]:::rec
-    REC --> RUN{check_invariants :1950\nptrs match? statics stable?}:::cinv
-   RUN --pass--> REPLAY[execute_node :2681<br/>copy inputs, replay, rebuild output]:::rep
-    RUN --fail--> BRANCH[fork new child branch :2618]:::br
-end
+    subgraph LIFE["per-batch-descriptor lifecycle"]
+        FIST["run_eager warmup :2689"] --> REC["record_function :2641\ncapture GPU commands once, per batch size"]:::rec
+        REC --> RUN{"check_invariants :1950\nptrs match? statics stable?"}:::cinv
+        RUN --pass--> REPLAY["execute_node :2681\ncopy inputs, replay, rebuild output"]:::rep
+        RUN --fail--> BRANCH["fork new child branch :2618"]:::br
+    end
 
-style cinv fill:#ffd,color:#000,stroke-width:1.5px
+    TREEN --> FIST
+
+    classDef t fill:#d8d6f5,color:#000
+    classDef rec fill:#cfe9ff,color:#000
+    classDef cinv fill:#ffffdd,color:#000,stroke-width:1.5px
+    classDef rep fill:#c8f0d4,color:#000
+    classDef br fill:#fde3e3,color:#000
 ```
 
 **KEY MECHANISM**: The **tree shape** (vs a flat list) is the key insight this era of Dynamo added — after replaying one graph, different output-liveness patterns can lead down *different valid* subsequent recordings; when invariants fail, `CUDAGraphTreeManager` records a new child branch rather than erroring out.
@@ -786,11 +884,14 @@ Template ops (GEMM/conv) have *multiple* candidate launch configs. A first-stage
 
 ```mermaid
 flowchart LR
-    POOL[candidate launch configs]:::p --> RS[random search -> best-so-far]::_rs
-   RS --> CA[CachingAutotuner :620<br/>-> CoordescTuner.autotune :377\nrefine one field per step]::_cauto
-     RI[realize_inputs :6151\neager IR inputs before extern call]:::ri --> POOL
+    POOL["candidate launch configs"]:::p --> RS["random search to best-so-far"]:::rs
+    RS --> CA["CachingAutotuner :620\nCoordescTuner.autotune :377\nrefine one field per step"]:::cauto
+    RI["realize_inputs :6151\neager IR inputs before extern call"]:::ri --> POOL
 
-style _rs fill:#7de,color:#000,stroke-width:1px
+    classDef p fill:#dfeefb,color:#000
+    classDef rs fill:#77ddee,color:#000,stroke-width:1px
+    classDef cauto fill:#ffe6b3,color:#000
+    classDef ri fill:#efe8f5,color:#000
 ```
 
 **KEY MECHANISM:** coordinate descent walks tunable fields one at a time (Gauss-Seidel style) rather than exhaustive grid search — a large speed-up for high-dimensional config spaces; the persistent `AlgorithmSelectorCache` guarantees this cost is paid only once ever.
@@ -804,17 +905,23 @@ One picture that ties everything back together, re-anchoring on slide 4's three 
 
 ```mermaid
 flowchart LR
-    subgraph DY["Dynamo — record"]
-        D1[PEP523 hook] --> D2[symbolic trace -> FX graph<br/>+ guards + side effects]:::d2
+    subgraph DY["Dynamo: record"]
+        D1["PEP523 hook"] --> D2["symbolic trace to FX graph\n+ guards + side effects"]:::d2
     end
-   subgraph AO["AOTAutograd — split fwd/bwd"]
-        A[joint passes + Pattern Matcher DSL\nmin-cut partition]:::a
-end
-    subgraph IN["Inductor — optimize + codegen"]
-       P[fuse_nodes fixed-point<br/>8-gate can_fuse check]:::p --> CG[C++/Triton codegen<br/>+ async compile pools]::_cg
+    subgraph AO["AOTAutograd: split fwd/bwd"]
+        A["joint passes + Pattern Matcher DSL\nmin-cut partition"]:::a
     end
-   DY --> AO --> P
-    P --> OUT([Compiled runnable\nzero-launch replay]):::o
+    subgraph IN["Inductor: optimize + codegen"]
+        P["fuse_nodes fixed-point\n8-gate can_fuse check"]:::p --> CGN["C++/Triton codegen\n+ async compile pools"]:::cg
+    end
+    D2 --> A --> P
+    CGN --> OUT(["Compiled runnable\nzero-launch replay"]):::o
+
+    classDef d2 fill:#ffe6b3,color:#000
+    classDef a fill:#d8d6f5,color:#000
+    classDef p fill:#cbdff0,color:#000
+    classDef cg fill:#cfe9ff,color:#000
+    classDef o fill:#c8f0d4,color:#000
 ```
 
 Recap in one breath: record (Dynamo) → split & compose passes (AOTAutograd) → schedule, fuse & emit fused kernels + graph-wrapped finish line (Inductor). Cache every step so the *second* identical call skips straight to the replay node.
