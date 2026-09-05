@@ -1,1540 +1,802 @@
-# Megabake V2 Architecture
+# MegaBake V2.2 Architecture
 
-This document is the repo-local snapshot of the v2 design work. It is meant to
-be the durable companion to the interactive canvas at
-`/home/devuser/.cursor/projects/home-devuser-megabake/canvases/megabake-first-principles-redesign.canvas.tsx`.
+Status: second redesign after the GraCE/CUDA investigation and a source-level performance audit of
+the current runtime. This document is normative with:
 
-The goal of v2 is not "more fusion" in the abstract. The goal is:
+- [`MEGABAKE_V2_DATAFLOW_DIAGRAM.md`](./MEGABAKE_V2_DATAFLOW_DIAGRAM.md)
+- [`MEGABAKE_V2_IR_AND_REUSE_PLAN.md`](./MEGABAKE_V2_IR_AND_REUSE_PLAN.md)
+- [`grace_hack.md`](./grace_hack.md)
 
-> Given a `torch.export` / FX graph for a narrow target workload, produce a
-> shape-bucket-specific, hardware-parameterized execution artifact that can be
-> specialized by target modeling and empirical tuning into a persistent
-> megakernel schedule competitive with vendor-grade kernels on the operations
-> that actually dominate the chosen regime.
+## 1. Executive decision
 
-The main lesson from v1 and the current traces is that `megabake` lowers into
-low-level task records too early. That makes the project good at *running a flat
-task list* but weak at *reasoning about graph regions, memory residency, target
-capabilities, and schedule alternatives*.
+MegaBake V2.2 is a **traffic-first, bucket-specialized inference compiler**. Its purpose is not to
+maximize the amount of code placed in one kernel. Its purpose is to minimize measured end-to-end
+cost under an explicit latency, throughput, numerical, and execution-domain contract.
 
-## North Star
+The design has two execution planes:
 
-The north-star goal for Megabake v2 is:
+1. **Persistent plane** — owned `DEVICE_CALLABLE` implementations execute inside resource-specific
+   persistent CUDA grids.
+2. **Graph plane** — CUDA Graphs orchestrate persistent entries and separately launched high-quality
+   kernels such as cuBLASLt, cuDNN, or standalone generated kernels.
 
-> any exportable torch model FX graph should lower into a Megabake execution
-> plan whose default objective is to beat `torch.compile`
+Strict research mode may require one persistent grid. Default performance mode is free to use both
+planes in one top-level graph submission. One host submission and one GPU grid remain different
+quantities.
 
-This is the long-term project goal. The architecture should be evaluated by
-whether it makes that goal increasingly achievable without collapsing back into
-v1-style early lowering and ad hoc task emission.
+The compiler has only three real representations:
 
-## Default Objective
+1. `FXGraph + FactTables`
+2. `RegionGraph`
+3. `PlanTemplate`, frozen as `FinalExecutionPlan` after code generation and measurement
 
-The compiler’s default optimization objective is:
+V2.2 changes the previous proposal in six important ways:
 
-> beat `torch.compile` on end-to-end latency by combining near-baseline or
-> slightly better hot-region kernels with dramatically lower launch and
-> orchestration overhead
+- weight, activation, KV-cache, and materialization bytes are first-class costs;
+- precision and prepacked layout are first-class plan choices;
+- fixed buckets use a small compiled `PhaseProgram`, not arbitrary per-worker busy-wait DAGs;
+- a cheap producer may be recomputed `PER_WORKER` or `PER_CLUSTER` instead of materialized to HBM;
+- persistent entrypoints are split by compiled resource class rather than sharing one maximum-SMEM
+  universal kernel;
+- per-call binding, scheduler reset, and output ownership are explicit `InvocationContract` costs.
 
-This is different from:
+The first performance proof remains narrow: reference-precision decode on Hopper at `M=1..4`.
+Weight-only quantization and continuous batching are separate numerical/serving regimes, but they
+are represented from the beginning because they attack the fundamental decode bottleneck: weight
+traffic.
 
-- maximizing fusion count
-- maximizing single-kernel purity
-- maximizing coverage at any performance cost
+## 2. Physical facts that determine the architecture
 
-Those can all be important secondary goals, but the default objective should be
-winning the end-to-end latency comparison.
+### 2.1 Persistent launch is not persistent model storage
 
-## First Proven Regimes
+For a batch-one linear layer, nearly every weight is consumed once per token. Model weights are far
+larger than the combined register, shared-memory, and L2 capacity of the target MIG partition.
+Keeping a grid resident removes dispatch boundaries; it does not keep a multi-gigabyte model
+resident on chip.
 
-The architecture should support the north-star goal broadly, but the first
-regimes proven in practice can be narrower.
+Therefore, the main decode levers are:
 
-That means:
+- increase achieved bandwidth for each weight stream;
+- reduce weight bytes with an accepted precision policy;
+- reuse each loaded weight tile across multiple active tokens or requests;
+- eliminate avoidable activation/KV/materialization traffic and synchronization.
 
-- the compiler remains FX / export native and model-generic
-- the first successful workload buckets can still be transformer-heavy
-- decode may be proven before prefill
-- selected batch / sequence / dtype / target buckets may be proven before the
-  full space
+No amount of schedule cleverness changes this roofline.
 
-This is not a retreat from the north star. It is the proof strategy for getting
-there.
+### 2.2 GraCE does not make cuBLAS device-callable
 
-## Strict Fusion Mode vs Performance Mode
+For an immutable vendor kernel, a GraCE prelude writes new values into existing parameter slots of
+a captured graph node. It changes neither the vendor kernel ABI nor its code, function identity,
+block shape, resource allocation, or grid boundary.
 
-Megabake should explicitly separate:
+Consequently:
 
-1. **strict purity**
-   - "can I turn this into one megakernel?"
-2. **default performance**
-   - "what plan actually beats `torch.compile`?"
+- cuBLAS and cuBLASLt candidates are `GRAPH_NODE`, never `DEVICE_CALLABLE`;
+- a live private `CUfunction` is a host handle and diagnostic oracle;
+- direct relaunch of a frozen private plan is a research experiment, not a deployment interface;
+- one-grid composition requires owned device code from CuTe/CUTLASS, Mirage MPK, cuBLASDx, or a
+  MegaBake implementation.
 
-That implies two legitimate operating modes:
+### 2.3 One host submission is not one GPU grid
 
-- **Strict fusion mode**
-  - best effort single-megakernel lowering
-  - useful for research, purity, and architectural validation
+V2.2 counts these separately:
 
-- **Performance mode**
-  - allow segmentation and, if policy allows, delegation
-  - optimize for beating `torch.compile`, not for minimum region count
+- host submissions;
+- GPU grids;
+- persistent segments;
+- phase joins and atomics;
+- HBM materializations;
+- binding and copy operations.
 
-This split is necessary so the project can preserve the single-megakernel
-ambition without forcing every workload into a shape that loses on actual
-latency.
+A graph containing twenty kernel nodes is one host submission and twenty GPU grids.
 
+### 2.4 On-chip storage belongs to a CTA or cluster
 
-## 1. V2 Thesis
+Registers belong to threads. Shared memory belongs to a CTA. Distributed shared memory belongs to a
+declared block cluster. None belongs to an abstract physical SM across arbitrary tasks.
 
-Megabake v2 should be an ahead-of-time compiler for a narrow inference regime,
-but it should not be architected as a hardcoded "SM90 compiler." It should be a
-hardware-parameterized compiler with late target binding.
+On-chip forwarding is legal only when a compiled `FusionContract` proves:
 
-The first validated workload can still be narrow, but the architecture should
-look like this:
+- producer scope and consumer scope;
+- thread/warp ownership;
+- layout, dtype, size, and alignment;
+- synchronization and lifetime;
+- combined compiled resources.
 
-- early semantic IRs are hardware-neutral
-- a formal `TargetModel` injects hardware knowledge later
-- a formal `AutotuneDB` stores empirical schedule results per target and bucket
-- codegen and schedule emission are target-specific only at the end
-- the compiler can validate one backend first without baking that backend into
-  every design decision
+`blockIdx.x` is a worker slot, not a stable SM identifier.
 
-The winning design is:
+### 2.5 Recomputation can beat communication
 
-1. Normalize the FX graph into a small canonical tensor IR.
-2. Recover large semantic motifs such as matvec, attention, norm, rope, and
-   epilogues.
-3. Build explicit optimization regions and a real memory/dataflow plan.
-4. Use a `TargetModel` and empirical tuning to choose profitable schedules for a
-   bucketed workload regime.
-5. Generate a per-bucket persistent schedule, not just a list of generic tasks.
-6. Emit target-specific code late, after schedule and candidate selection have
-   converged.
+Decode activations are tiny relative to linear weights. It can be cheaper for every output-tile CTA
+to recompute RMSNorm, keep the normalized input in its own shared memory, and immediately stream its
+weight rows than to materialize the normalized tensor and coordinate a global handoff.
 
-
-## 2. What V1 Gets Wrong Structurally
-
-V1 has important pieces, but they are arranged in the wrong order:
-
-- `graph_walker.py` mixes canonicalization, motif recovery, layout handling,
-  lowering, fusion, buffer planning, and schedule emission in one pass.
-- `TaskDesc` becomes the first serious optimization IR, but it is already too
-  low-level to express region formation or schedule alternatives.
-- scheduling is effectively rebuilt in `runtime/loader.py`, so the compiler does
-  not really emit the final schedule artifact
-- `dyn_dims` / `batch_range` / `seq_range` exist mostly as metadata, not as a
-  real dynamic bucket or symbolic-shape mechanism
-- decode-specialized paths exist only partially
-- prefetch / SMEM handoff / page planning are mostly scaffolding
-
-The tra
-
-- launch count is not the main unsolved problem anymore
-- raw kernel quality for decode ces reinforce this:matvec / GEMV / GEMM is the primary gap
-- attention is not the first bottleneck on the captured decode runs
-
-Therefore v2 should be built around *compiler structure* and *kernel quality*,
-not around adding more peephole fusion to the current one-pass lowering path.
-
-
-## 3. Design Goals
-
-### Primary goals
-
-1. **Emit a real compile-time schedule artifact**
-   - no late reconstruction of DAGs and SM queues in the runtime
-
-2. **Be shape-bucket-specific**
-   - a schedule is specialized to concrete shape families, not one fully generic
-     runtime interpreter
-
-3. **Be hardware-parameterized, not hardware-hardcoded**
-   - early IRs should stay architecture-neutral
-   - target capabilities should enter through a formal `TargetModel`
-   - only late schedule/codegen stages should become backend-specific
-
-4. **Be region-first, not node-first**
-   - optimize semantic regions such as matvec + epilogue, not a flat sequence of
-     ATen nodes
-
-5. **Model memory residency explicitly**
-   - registers, SMEM, and HBM are all part of the compile-time plan
-
-6. **Treat autotuning and profile-guided tuning as part of the compiler**
-   - schedule quality comes from search and measurement, not only handwritten
-     heuristics
-
-### Secondary goals
-
-- retain a clear correctness fallback path
-- keep artifacts introspectable and debuggable
-- preserve enough modularity to support a future prefill path without rewriting
-  the whole compiler again
-
-
-## 4. Non-goals for V2.0
-
-These are intentionally *not* the first target:
-
-- broad model coverage across arbitrary exported graphs
-- training
-- full dynamic shape support across wildly varying sequence lengths
-- perfect prefill performance from day one, even though prefill must be
-  represented architecturally from the start
-- a large number of validated backends on day one
-- broad BF16 / FP32 / mixed-precision surface before decode FP16 is solid
-
-V2.0 should win one narrow thing first.
-
-
-## 5. Target Regimes and Bucket Families
-
-The compiler should be designed around explicit workload regimes and bucket
-families, not a single universal "golden path."
-
-A bucket key should be something like:
-
-- model family
-- mode (`decode`, later `prefill`)
-- batch bucket
-- sequence bucket
-- hidden-size / head-dim family
-- dtype family
-- target fingerprint
-
-The first validated bucket can still be narrow, for example:
-
-- decoder-only transformer
-- `seq_q = 1`
-- KV-cache already present
-- hidden sizes / head dims drawn from a small known family
-- weight layout allowed to change at compile/prepack time
-
-But two important caveats should be explicit:
-
-1. the architecture should not assume low batch is the only profitable regime
-2. persistent megakernel profitability is empirical, not monotonic in batch size
-
-For some workloads, small decode batches will benefit most from persistent
-scheduling and on-chip handoff. For others, medium-batch or more irregular
-serving regimes may be better. The compiler should represent that as a tuning
-and schedule-selection question, not as a thesis baked into the IR.
-
-Prefill should therefore be treated as:
-
-- an explicit bucket family from day one
-- a first-class regime in the architecture
-- not the first required performance win for v2.0
-
-### 5.1 Optimization Objective and Compiler Policies
-
-The compiler should be framed as solving a constrained optimization problem:
-
-> minimize estimated latency  
-> subject to legality, resource budgets, and user-selected fusion / delegation
-> constraints
-
-This is the right place to represent "one megakernel" versus "ten launches
-instead of four hundred" versus "best latency overall."
-
-The architecture should expose at least two policy dimensions.
-
-#### Fusion policy
-
-- `fusion_policy="strict"`
-  - best effort single megakernel
-  - equivalent to `max_regions = 1`
-  - useful for research, purity, and architecture validation
-
-- `fusion_policy="budgeted"`
-  - constrain the compiler to a launch budget such as `max_regions = 10`
-  - useful when the product goal is "dramatically fewer launches" rather than
-    absolute monolithic purity
-
-- `fusion_policy="auto"`
-  - no explicit region-count cap
-  - optimize purely for latency subject to legality and cost model
-
-#### Delegation policy
-
-- `delegation_policy="none"`
-  - pure megakernel mode
-  - no external library escape for the chosen region
-
-- `delegation_policy="fallback_only"`
-  - escape only when legality or correctness requires it
-
-- `delegation_policy="perf"`
-  - allow external kernel families when the cost model and tuning data say they
-    win
-
-#### Recommended interpretation
-
-- `strict_fusion=True` should be treated as a shorthand for:
-  - `fusion_policy="strict"`
-  - `max_regions = 1`
-
-- the practical middle ground should be:
-  - `fusion_policy="budgeted"`
-  - `max_regions = N`
-
-This lets Megabake support both:
-
-- a pure research mode that asks "can this become one megakernel?"
-- a performance mode that asks "what is the fastest region decomposition?"
-
-That split is especially important for prefill. Prefill may eventually want the
-same persistent machinery, but it should not be forced into strict one-kernel
-form if that destroys GEMM or attention quality for the current hardware.
-
-
-### 5.2 Reliable Win Objective
-
-The primary optimization target for v2 should be stated plainly:
-
-> Megabake should reliably beat `torch.compile` end-to-end latency by combining
-> near-baseline or slightly better kernel quality on the hot regions with
-> dramatically lower orchestration and launch overhead.
-
-This means the compiler should optimize **total latency**, not fusion count.
-
-A useful mental model is:
-
-- `torch.compile total = launched-kernel compute + launch / orchestration gap`
-- `megabake total = persistent-region compute + tiny scheduling overhead`
-
-The goal is therefore:
-
-`megabake_compute + megabake_schedule_overhead < torch_compile_compute + torch_compile_launch_gap`
-
-The current traces already show why this matters:
-
-- **SmolLM2 decode**
-  - `torch.compile`: about `1175 us` compute and `7607 us` inter-kernel gap
-  - `megabake`: about `4333 us` compute and almost no gap
-  - result: Megabake wins span despite worse raw compute
-
-- **gemma-2b decode**
-  - `torch.compile`: about `6197 us` compute and `1715 us` inter-kernel gap
-  - `megabake`: about `11442 us` compute
-  - result: Megabake loses because the compute gap is larger than the launch-gap advantage
-
-So the architecture must be designed around two rules:
-
-1. **always preserve the large launch-time advantage**
-2. **never let the compute gap on hot regions grow larger than the launch-time advantage can pay for**
-
-This is why:
-
-- strict one-kernel mode is valuable
-- but the default performance mode must be free to segment or delegate when that
-  is the only way to keep the total-latency inequality favorable
-
-The compiler should therefore carry an explicit notion of a **reference launched
-plan** or **TorchCompile surrogate baseline** and compare candidate Megabake
-plans against it during tuning.
-
-
-## 6. V2 IR Stack
-
-V2 should use **three real compiler layers**, not a large tower of first-class
-IRs. The goal is to keep the semantics clean without repeating v1’s mistake of
-lowering too early.
-
-The rule is:
-
-- many semantic passes are fine
-- many heavyweight IR universes are not
-
-### 6.1 Layer 1: FX Graph + Fact Tables
-
-This is still fundamentally the exported FX / ATen graph, but it is paired with
-rich analysis side tables.
-
-**Before this layer**
-
-- raw export graph
-- decomposed transformer patterns
-- many metadata-only shape/layout ops
-- no trustworthy global fact table
-
-**After this layer**
-
-- graph is canonicalized and cleaned
-- constants are folded where appropriate
-- views are tracked as metadata until materialization is required
-- every value has attached facts
-
-**What this layer carries**
-
-- graph topology
-- canonical ATen-ish ops after decomposition
-- shapes, dtypes, layouts, strides, offsets, alias groups
-- constant values where known
-- bucket key
-- memory-effect markers (`pure`, `view`, `materialize`, `stateful update`)
-
-**What this layer is allowed to decide**
-
-- semantic normalization
-- shape / layout / alias facts
-- whether a view stays virtual or must materialize
-- motif-friendly graph cleanup
-
-**What this layer must not decide**
-
-- warp roles
-- SM assignment
-- final kernel family
-- final fusion budget
-- final persistent schedule
-
-This layer should aggressively reuse PyTorch / Inductor machinery:
-
-- `torch.export`
-- decompositions
-- canonicalization
-- constant folding
-- CSE / DCE
-- fake tensor / symbolic shape infrastructure
-- pattern matcher infrastructure where possible
-
-### 6.2 Layer 2: RegionGraph
-
-This is the first truly Megabake-specific IR.
-
-Instead of asking "what ATen nodes do I have?" the compiler now asks:
-
-> what semantic regions do I have, and what are the candidate ways to execute
-> them?
-
-**Before this layer**
-
-- a canonicalized graph of cleaned ATen-ish ops
-- all semantic facts known
-- no final execution structure yet
-
-**After this layer**
-
-- the graph is compressed into meaningful execution regions
-- candidate kernel families exist per region
-- fusion boundaries are explicit
-- residency opportunities are explicit
-
-**Region kinds should include at least**
-
-- `MatvecRegion`
-- `MatmulRegion`
-- `AttentionRegion`
-- `NormPointwiseRegion`
-- `RopeRegion`
-- `KVCacheRegion`
-- `ExternRegion` for bring-up / correctness / non-golden-path cases
-
-**What this layer carries**
-
-- region kind
-- input / output tensors
-- shape and layout keys
-- region adjacency
-- residency opportunities
-- candidate implementation families
-- estimated byte / flop counts
-- fusion / split constraints
-
-**What this layer is allowed to decide**
-
-- which nodes belong together semantically
-- which candidate families are legal
-- where fusion boundaries live
-- where handoff / residency is even possible
-
-**What this layer must not decide**
-
-- exact per-SM program
-- exact prefetch instruction sequence
-- final warp-level implementation
-
-This layer should be **HF-aware but not HF-dependent**:
-
-- HF transformers metadata and configs can inform priors
-- exported FX graph remains the source of truth
-- the IR must stay generic enough for non-transformer models later
-
-### 6.3 Layer 3: ScheduleProgram
-
-This is the persistent-program IR.
-
-This is the layer that finally answers:
-
-> how does this exact RegionGraph become 1, 8, or 15 persistent regions on this
-> target under this fusion policy?
-
-**Before this layer**
-
-- semantic regions are known
-- candidate families are known
-- target constraints and tuning priors are known
-
-**After this layer**
-
-- a concrete persistent execution program exists
-- region count is fixed
-- per-SM work is fixed
-- prefetch and handoff actions are fixed
-- the artifact can be emitted
-
-**What this layer carries**
-
-- region count / segmentation plan
-- per-SM static programs
-- tile descriptors
-- warp-role descriptors
-- dependency tokens
-- prefetch actions
-- handoff actions
-- release / completion actions
-- codegen-family choices
-
-**What this layer is allowed to decide**
-
-- exact persistent schedule
-- exact segmentation count
-- exact tile and warp strategy
-- exact handoff and prefetch actions
-
-**What this layer must not decide**
-
-- raw semantic graph questions like "is this RMSNorm?" or "should this view fold?"
-
-If those questions survive this late, the earlier layers failed.
-
-### 6.4 Auxiliary Compiler Objects
-
-These are not semantic IR layers, but they are first-class compiler inputs.
-
-#### `TargetModel`
-
-`TargetModel` should describe:
-
-- architecture family
-- tensor core / MMA capabilities
-- async copy / TMA capabilities
-- register and SMEM budgets
-- occupancy model
-- memory bandwidth and latency estimates
-- launch overhead estimates
-
-#### `AutotuneDB`
-
-`AutotuneDB` should store:
-
-- target fingerprint
-- bucket key
-- region kind
-- candidate schedule choices
-- measured performance
-- selected winner
-- reference baseline comparison, if available
-
-#### `ArtifactPack`
-
-The final emitted object should contain:
-
-- schedule program blob
-- bucket descriptor
-- target fingerprint
-- prepacked weight layout metadata
-- debug maps back to regions / graph nodes
-- cubin / fatbin references
-
-### 6.5 Layer Boundary Sanity Check
-
-This is the easiest way to avoid repeating v1.
-
-If a layer violates these tests, the architecture is drifting:
-
-- if Layer 1 starts deciding GPU schedule details, it is too low-level
-- if Layer 2 starts looking like packed task records, it is too low-level
-- if Layer 3 still needs to rediscover transformer semantics, earlier passes are too weak
-
-The goal is not "many IRs." The goal is:
-
-- **Layer 1 removes semantic uncertainty**
-- **Layer 2 removes structural uncertainty**
-- **Layer 3 removes execution uncertainty**
-
-
-## 7. End-to-End Compiler Pipeline
-
-This is the v2 compile pipeline from first principles after simplifying the IR
-story. The guiding idea is:
-
-- reuse Inductor / PyTorch for standard graph cleanup
-- build Megabake-specific logic only once the problem becomes persistent-program
-  synthesis
-- compare candidate Megabake plans against a TorchCompile-style reference plan
-
-### Stage 0: Workload regime, target fingerprint, and optional region census
-
-Input:
-
-- `nn.Module`
-- example inputs
-- target mode (`decode`, later `prefill`)
-- target device
-
-Output:
-
-- `BucketKey`
-- `TargetFingerprint`
-- `TargetModel`
-
-This stage decides what regime we are compiling for:
-
-- model family
-- mode
-- batch bucket
-- sequence bucket
-- hidden-size / head-dim family
-- dtype family
-- target fingerprint
-
-There are really two related activities here:
-
-1. **per-compile target binding**
-   - identify the bucket and target
-
-2. **offline workload characterization**
-   - optionally run a region census over a corpus of exported HF transformer
-     graphs to learn the most common region shapes and transitions
-
-That second part is not required for correctness, but it is highly valuable for
-architecture and tuning priorities.
-
-### Stage 1: Export, canonicalize, and build fact tables
-
-Input:
-
-- model + example inputs
-
-Output:
-
-- Layer 1: `FXGraph + FactTables`
-
-Implementation bias:
-
-- reuse `torch.export`
-- reuse decomposition tables
-- reuse graph cleanup / canonicalization
-- reuse fake tensor / symbolic shape machinery
-- reuse pattern matcher infrastructure where possible
-
-Passes in this stage:
-
-- decomposition
-- canonicalization
-- constant folding
-- CSE / DCE
-- shape / dtype / layout propagation
-- alias analysis
-- view folding
-- copy insertion where required
-
-At the end of this stage, the graph should be:
-
-- semantically clean
-- fact-rich
-- still hardware-neutral
-
-### Stage 2: Build the RegionGraph
-
-Input:
-
-- Layer 1: `FXGraph + FactTables`
-- optional transformer priors from HF metadata
-
-Output:
-
-- Layer 2: `RegionGraph`
-
-This is where Megabake becomes Megabake.
-
-The compiler should:
-
-- recover norms, RoPE, QKV bundles, attention, MLP patterns, KV-cache updates,
-  and residual epilogues
-- group nodes into semantic execution regions
-- record region adjacency and residency opportunities
-- attach candidate implementation families to each region
-
-HF integration matters here, but as a **front-end prior**, not as a hard
-dependency:
-
-- HF configs can inform likely region shapes and motif families
-- the exported FX graph remains the source of truth
-
-### Stage 3: Enumerate candidates, including a launched reference baseline
-
-Input:
-
-- Layer 2: `RegionGraph`
-- `TargetModel`
-- compiler policy (`fusion_policy`, `delegation_policy`, `max_regions`)
-
-Output:
-
-- candidate sets per region
-- a reference launched plan
-
-This stage should generate two kinds of candidates:
-
-1. **Megabake candidates**
-   - persistent matvec variants
-   - persistent attention variants
-   - norm / pointwise microprogram regions
-   - segmented persistent-region plans
-
-2. **Reference launched candidates**
-   - a TorchCompile-style surrogate plan consisting of strong launched kernels
-     plus expected orchestration cost
-
-This is critical for the project goal. If v2 wants to *reliably beat*
-`torch.compile`, then its tuner needs an explicit baseline to beat, not just an
-internal score.
-
-### Stage 4: Cost modeling and plan selection
-
-Input:
-
-- region candidates
-- reference launched plan
-- `TargetModel`
-- policy constraints
-
-Output:
-
-- selected region family per region
-- selected segmentation plan
-- selected residency strategy
-- selected reference comparison margin
-
-The cost model should answer:
-
-1. which Megabake candidate wins for this region?
-2. how many regions should the final program have?
-3. does the chosen plan beat the reference launched plan by enough margin?
-
-This is where:
-
-- `strict` mode enforces `max_regions = 1`
-- `budgeted` mode enforces a launch cap
-- `auto` mode optimizes pure latency
-- delegation constraints are applied
-
-### Stage 5: Synthesize the ScheduleProgram
-
-Input:
-
-- chosen region plan
-- chosen residency plan
-- `TargetModel`
-
-Output:
-
-- Layer 3: `ScheduleProgram`
-
-This stage produces the actual persistent execution program:
-
-- region count
-- per-SM programs
-- tile descriptors
-- warp roles
-- dependency tokens
-- prefetch actions
-- handoff actions
-- release actions
-
-This stage must happen at compile time, not in the runtime loader.
-
-### Stage 6: Generate target-specific code
-
-Input:
-
-- `ScheduleProgram`
-- chosen region families
-
-Output:
-
-- target-specific code objects
-
-Codegen families should include:
-
-- decode matvec kernels
-- attention kernels
-- norm / pointwise executors
-- persistent schedule interpreter / program loop
-
-TileIR can fit here as an **optional backend kernel IR** for selected
-tile-centric region families. The intended use is narrow and deliberate:
-
-- do **not** replace `RegionGraph`
-- do **not** replace `ScheduleProgram`
-- do use TileIR as a possible lowering target for compute-heavy regions such as
-  matvec / matmul / attention if it improves backend portability or kernel
-  quality for those regions
-
-The admission rule should be strict:
-
-- CUDA/CuTe remains the default backend path
-- TileIR is considered only after region boundaries and schedule are already fixed
-- TileIR is considered only for tile-centric, compute-heavy regions
-- TileIR stays only if replay tuning shows it beats or materially improves the
-  default backend for that region family
-
-In other words, TileIR is a candidate implementation detail of `KernelBundle`,
-not a replacement for the main Megabake IR stack.
-
-The important point is that codegen comes **after** schedule decisions, not
-before.
-
-### Stage 7: Helion-style bounded replay search and acceptance against the baseline
-
-Input:
-
-- target-specific candidate objects
-- representative region replays
-- optional short forward-pass snippets
-- reference launched plan
-
-Output:
-
-- tuned winner stored in `AutotuneDB`
-- measured margin over reference
-
-The compiler should not tune only the whole model and not only synthetic
-microbenchmarks.
-
-It should:
-
-- extract hot region replays from the actual model
-- tune them on real bucket shapes
-- validate interactions on short forward snippets
-- keep only plans that beat the launched reference baseline by a margin
-
-This is how "reliably beat `torch.compile`" becomes an engineering loop rather
-than a hope. The intended style here is deliberately closer to a bounded,
-high-quality late search over backend/kernel parameters and tiny schedule
-neighborhoods than to an open-ended whole-compiler search.
-
-### Stage 8: Emit the ArtifactPack
-
-Input:
-
-- tuned `ScheduleProgram`
-- tuned code objects
-- bucket and target metadata
-
-Output:
-
-- `ArtifactPack`
-
-This should include:
-
-- schedule program blob
-- bucket descriptor
-- target fingerprint
-- weight layout / quantization descriptor
-- code object references
-- debug map
-
-
-## 8. Persistent Runtime Model
-
-The runtime should become intentionally small.
-
-It should do only:
-
-1. fingerprint the target and pick the matching artifact bucket
-2. bind prepacked weights
-3. bind input/output pointers
-4. bind dynamic bucket fields if needed
-5. optionally run first-use calibration / replay tuning if no tuned artifact exists
-6. persist tuning results into `AutotuneDB`
-7. launch the persistent program
-8. collect optional telemetry
-
-It should *not* rebuild the schedule graph, rediscover dependencies, or invent
-the SM program late.
-
-
-## 9. Persistent Program Model
-
-At runtime, the GPU should conceptually execute something closer to this:
+V2.2 therefore permits these value transports:
 
 ```text
-for each SM:
-    load SMProgram[sm_id]
-    for each action in program:
-        if action == WAIT_DEP:
-            wait until dependency token reaches zero
-        if action == PREFETCH:
-            cp.async / TMA next weight tile or region payload
-        if action == RUN_REGION:
-            execute specialized kernel body for this tile
-        if action == HANDOFF:
-            publish data in agreed SMEM/register slot
-        if action == RELEASE_DEP:
-            decrement successor tokens
+ALIAS_VIEW
+MATERIALIZE_HBM
+REGISTER_FORWARD
+SMEM_FORWARD
+RECOMPUTE_PER_WORKER
+RECOMPUTE_PER_CLUSTER
 ```
 
-The important difference from v1 is that the "program" is already compiled. It
-is not reconstructed from generic tasks in the loader.
+Recomputation is a measured implementation choice. It never changes graph semantics.
 
-The important difference from a hand-written backend is that the program is
-chosen through target modeling and empirical replay tuning, not just hardcoded
-per architecture.
+### 2.6 Resource allocation is entrypoint-wide
 
+A monolithic persistent entry inherits the maximum register, shared-memory, launch-attribute, and
+warp-structure requirements of its reachable paths. A light pointwise phase does not regain
+occupancy merely because the heavy WGMMA path is inactive.
 
-## 10. Kernel Families
-
-### 10.1 Decode matvec family
-
-This is the first-class kernel family for v2.
-
-Requirements:
-
-- shape-specialized for `M = 1..4`
-- tuned for exact hidden sizes / projection sizes
-- support fused bias / activation / residual epilogues
-- support weight-only quantized variants early
-- explicit residency / prefetch strategy
-
-The compiler should treat this family as more important than attention on the
-initial decode target.
-
-This does not mean decode is the only profitable regime. It means v2 should
-prove itself on one regime first while leaving room for other bucket families to
-win later through the same target-model + tuning pipeline.
-
-
-### 10.2 Attention family
-
-The attention family should be decode-specific first:
-
-- single-query or small-query decode attention
-- explicit K/V cache layout assumptions
-- tensor-core capable variants where it matters
-- hardware-specific blocking
-
-Attention should still be architected properly, but it is not the first
-performance hill to die on for the current decode traces.
-
-
-### 10.3 Pointwise / norm family
-
-This family should handle:
-
-- RMSNorm / LayerNorm
-- RoPE
-- pointwise epilogues
-- small reductions
-- broadcast-heavy chains
-
-These can remain microprogram / interpreter-friendly as long as they do not
-become the decode bottleneck.
-
-### 10.4 Backend Surface: Handwritten vs Generated
-
-V1 accumulated many handwritten CUDA kernels because its architecture is roughly:
-
-1. normalize the FX graph a bit
-2. map recognized ops or patterns to `TaskDesc`
-3. dispatch each task to a handwritten CUDA implementation
-
-That naturally creates an ever-growing backend surface:
-
-- handwritten matmul
-- handwritten attention
-- handwritten reduce
-- handwritten rope
-- handwritten embedding
-- handwritten index
-- handwritten copy
-- handwritten fused elementwise
-- then handwritten special cases for more patterns over time
-
-That is useful for bring-up, but it is not the long-term shape of a compiler.
-It makes the project feel more like an op-to-kernel selector than a region
-compiler.
-
-V2 should draw a much harder line:
-
-> handwritten per-op kernels are a smell  
-> handwritten backend primitives are normal
-
-The right goal is not "zero handwritten CUDA." The right goal is:
-
-> handwrite the machine-level substrate once, then generate the model-specific
-> behavior automatically
-
-#### What should remain handwritten in v2
-
-Only a small backend substrate should be handwritten and maintained directly:
-
-1. **Persistent runtime program**
-   - the megakernel execution loop
-   - dependency handling
-   - prefetch and handoff primitives
-   - warp / SM orchestration
-
-2. **A small number of kernel families**
-   - matvec / GEMM family
-   - attention family
-   - pointwise / reduction engine
-   - optional data movement / layout engine
-
-3. **Hardware utility layer**
-   - cp.async / TMA wrappers
-   - tensor-core / MMA / WGMMA wrappers
-   - residency / paging helpers
-   - synchronization helpers
-
-This is the stable, low-level substrate of the compiler.
-
-#### What should be generated in v2
-
-Everything graph-specific or fusion-specific should come from the compiler:
-
-- region decomposition
-- fusion boundaries
-- launch count / segmentation plan
-- epilogue composition
-- pointwise chains
-- small reductions
-- layout-specific glue logic
-- residency and prefetch plans
-- per-bucket schedules
-- tuned tile choices
-
-In other words, the compiler should generate:
-
-- **which backend family to use**
-- **how it is parameterized**
-- **how regions are stitched together**
-
-but it should not require a new handwritten CUDA file every time a new pattern
-appears in the graph.
-
-#### The v2 maintenance rule
-
-If a new model feature requires:
-
-- a new schedule
-- a new epilogue
-- a new pointwise chain
-- a new launch segmentation
-
-then the fix should land in compiler IR or schedule generation.
-
-If it requires:
-
-- a fundamentally new machine primitive
-- a new tensor-core strategy
-- a new persistent runtime mechanism
-
-then it may justify new handwritten backend substrate.
-
-That rule is how v2 avoids turning back into a curated kernel zoo.
-
-
-## 11. Cost Model
-
-The cost model should answer two questions:
-
-1. Which kernel family should implement this region?
-2. Should this boundary stay fused or split?
-
-In practice it should answer a third question too:
-
-3. Does the resulting Megabake plan beat the launched reference baseline by a
-   sufficient margin?
-
-Inputs:
-
-- shape bucket
-- target fingerprint
-- dtype
-- layout
-- SMEM need
-- register estimate
-- bytes from HBM
-- tensor-core availability
-- expected occupancy
-- predecessor / successor residency opportunities
-- launched reference-plan estimate
-
-Outputs:
-
-- chosen candidate
-- accepted fusion edges
-- tile family
-- prefetch policy
-- region count / segmentation plan
-- delegation decisions, if allowed by policy
-- predicted win / loss margin against the reference launched plan
-
-Even if the final architecture remains "pure megakernel" for a chosen bucketed
-regime,
-the cost model is still required. Otherwise the compiler has no formal reason
-for its decisions.
-
-This cost model should not remain purely analytical forever. It should be
-calibrated against real measurements and eventually defer to `AutotuneDB` when
-bucket-specific empirical winners exist.
-
-The architecture should treat "beat `torch.compile`" as a first-class scoring
-target, not a side effect. So the cost model and tuner should both compare
-Megabake candidates against a reference launched plan and reject candidates that
-lose unless the user explicitly requested strict purity.
-
-The cost model must also honor compiler policy:
-
-- in `strict` mode, it optimizes under `max_regions = 1`
-- in `budgeted` mode, it optimizes under a launch budget
-- in `auto` mode, it can choose the segmentation that minimizes latency
-- if delegation is disabled, candidates from external kernels are illegal
-
-## 11A. Helion-Style Late Search Amendment
-
-This architecture adopts a **Helion-style search philosophy** at the late
-backend/tuning layer, not at the top of the compiler stack.
-
-The specific inspiration is:
-
-- implicit or lightly-declared search spaces over backend implementation choices
-- ahead-of-time tuning
-- bounded search rather than exhaustive exploration
-- smarter search than brute force, such as local refinement or lightweight
-  Bayesian-style filtering
-
-See:
-
-- [pytorch/helion](https://github.com/pytorch/helion)
-- [Helion: A High-Level DSL for Performant and Portable ML Kernels](https://pytorch.org/blog/helion/)
-- [Accelerating Autotuning in Helion with Bayesian Optimization](https://pytorch.org/blog/accelerating-autotuning-in-helion/)
-- [From Minutes to Seconds: LLM-Guided Autotuning for Helion Kernels](https://pytorch.org/blog/from-minutes-to-seconds-llm-guided-autotuning-for-helion-kernels/)
-
-### Why this amendment exists
-
-The architecture already has:
-
-- semantic graph cleanup
-- region formation
-- candidate enumeration
-- cost modeling
-- replay tuning
-
-What it did not yet state explicitly enough is:
-
-> the tuner should behave like a bounded, late, implementation-level search,
-> not like a whole-compiler search over semantic graph structure.
-
-That distinction is crucial because Megabake wants Helion’s **good search
-discipline**, not Mirage-style open-ended exploration over the full graph space.
-
-### What this amendment changes
-
-It formalizes the rule that the search lives **after**:
-
-- `FXGraph + FactTables`
-- `RegionGraph`
-- preliminary `ScheduleProgram`
-
-and **before** final artifact acceptance.
-
-So search is allowed to refine:
-
-- backend family choice
-- tile shapes
-- warp roles
-- staging depth
-- prefetch depth
-- handoff toggles
-- tiny segmentation neighborhoods such as `{1, 2, 4, 8}` regions
-
-Search is **not** allowed to reopen:
-
-- graph canonicalization
-- semantic motif recovery
-- arbitrary global region partition space
-- arbitrary runtime-model redesign
-
-### Search objects
-
-The search space should be defined over:
-
-#### Region-local backend choices
-
-- `MatvecRegion`
-  - tile shapes
-  - vector width
-  - staging depth
-  - quantized vs non-quantized path
-  - backend lowering family
-
-- `AttentionRegion`
-  - `block_q`
-  - `block_k`
-  - staging depth
-  - warp partition
-  - backend lowering family
-
-- `NormPointwiseRegion`
-  - microprogram variant
-  - fusion pattern selection
-  - reduction staging
-
-#### Small schedule neighborhoods
-
-- `max_regions in {1, 2, 4, 8}`
-- prefetch on/off for selected edges
-- handoff on/off for selected edges
-- backend-family mix across a fixed region plan
-
-The key idea is:
-
-> search the **implementation neighborhood**, not the entire semantic design
-> space.
-
-### Search inputs
-
-The search should start from:
-
-- `TargetModel`
-- `SelectedRegionPlan`
-- `ReferencePlan`
-- `AutotuneDB` priors
-- optional HF/model-family priors
-
-This means the search is seeded, not blind.
-
-### Search algorithm policy
-
-The architecture does **not** require one exact search algorithm, but it should
-obey these policy rules:
-
-1. **Analytical pruning first**
-   - remove illegal or obviously bad candidates before benchmarking
-
-2. **Strong seed set second**
-   - use heuristics, `TargetModel`, and `AutotuneDB` to choose a small set of
-     promising initial candidates
-
-3. **Bounded local refinement third**
-   - hill-climb, pattern search, LFBO-like filtering, or similar lightweight
-     refinement over the local neighborhood
-
-4. **Early stopping**
-   - stop when improvements plateau or win margin over the reference baseline is
-     already sufficient
-
-This is the part of Helion we want:
-
-- a high-quality late search over implementation parameters
-
-This is the part we explicitly do **not** want:
-
-- extremely large, slow, open-ended exploration over the entire architecture
-
-### Search budgets
-
-The default tuning budget should be intentionally small.
-
-For default performance mode, the architecture should target something like:
-
-- only the hottest region families
-- only a few schedule neighborhoods
-- roughly `10-30` candidate measurements per hot region family
-- optional offline “aggressive” tuning mode for deeper search
-
-This keeps the system practical while still allowing meaningful optimization.
-
-### Acceptance rule
-
-Search success is **not** measured by “best Megabake kernel found.”
-
-Search success is measured by:
-
-> does the resulting Megabake plan beat the `ReferencePlan` by a useful margin?
-
-That means:
-
-- default performance mode accepts only winners over the launched baseline
-- strict purity mode may accept a slower one-kernel plan if the user asked for
-  strict fusion explicitly
-
-This makes the search subordinate to the product goal rather than to kernel
-beauty.
-
-### Architectural consequences
-
-This amendment implies:
-
-- `Stage 7` is not a generic autotune pass; it is a bounded late search pass
-- `AutotuneDB` is not just a cache; it is a central architectural object
-- `ReferencePlan` is mandatory, because the search must know what it is trying
-  to beat
-- backend diversity is allowed, but only below the semantic IR stack
-
-### Final rule
-
-Megabake should use Helion-style search **only** where the remaining problem is:
-
-> “which low-level implementation of this already-chosen region/program is
-> best?”
-
-It should **not** use Helion-style search for:
-
-> “what does this graph mean?” or “what is the whole compiler architecture?”
-
-That is the clean line that keeps the architecture disciplined.
-
-
-## 12. Artifact Format
-
-The new artifact format should be closer to:
+V2.2 normally emits separate entries for resource classes such as:
 
 ```text
-ArtifactHeader
-BucketDescriptor
-TargetFingerprint
-WeightLayoutDescriptor[]
-RegionDescriptor[]
-TensorDescriptor[]
-ScheduleDescriptor
-  SMProgram[]
-  DependencyTable
-  TileDescriptor[]
-  PrefetchPlan[]
-  HandoffPlan[]
-DebugMap
-CodeObjectRefs
+LINEAR_HEAVY      TMA/WGMMA or large mixed-dtype pipelines
+SKINNY_STREAMING  M=1..4 GEMV/skinny GEMM variants
+ATTENTION_HEAVY   paged/split-KV attention pipelines
+COMPACT           reductions, RoPE, pointwise and small composites
 ```
 
-The schedule should already contain:
+CUDA Graphs may connect these entries cheaply. A single-grid artifact is retained only when its
+measured fusion savings exceed its resource penalty.
 
-- dependency structure
-- SM programs
-- queue / tile plan
-- prefetch instructions
-- handoff instructions
+### 2.7 Machine pipelines belong in generated variants
 
-The runtime should only bind pointers and launch.
+Useful TMA/cp.async overlap requires producer and consumer warps executing concurrently. Prefetch
+issued after one task completes and immediately before the next waits is not such a pipeline.
 
+The following are compile-time properties of `KernelVariant` or `CompositeVariant` code:
 
-## 13. Suggested Module Layout
+- TMA/cp.async issue, waits, tensor maps, and barriers;
+- producer and consumer warp roles;
+- MMA/WGMMA atoms and shapes;
+- stage count and shared-memory layout;
+- register-accumulator layout;
+- epilogue and on-chip forwarding.
 
-V2 should probably become a parallel module tree, not an edit-in-place of
-`graph_walker.py`.
+The scheduler selects a variant and work range. It does not interpret machine-level prefetch or warp
+role opcodes.
 
-Suggested Python structure:
+## 3. Orthogonal workload contracts
+
+Performance claims are meaningless unless three policies and one compound invocation contract are
+fixed independently.
+
+### 3.1 Performance objective
 
 ```text
-src/megabake/v2/
-  capture/
-    export.py
-  frontends/
-    hf.py
-  target/
-    model.py
-    fingerprint.py
-    calibrate.py
-  ir/
-    canonical.py
-    region.py
-    memory.py
-    schedule.py
-    artifact.py
-  analysis/
-    shapes.py
-    layouts.py
-    aliases.py
-    constants.py
-    patterns.py
-  corpus/
-    region_census.py
-    workloads.py
-  passes/
-    canonicalize.py
-    recover_motifs.py
-    form_regions.py
-    enumerate_candidates.py
-    plan_memory.py
-    build_schedule.py
-    emit_artifact.py
-  cost_model/
-    roofline.py
-    occupancy.py
-    residency.py
-  baseline/
-    reference_plan.py
-    torch_compile.py
-  autotune/
-    db.py
-    policy.py
-    search.py
-    replay.py
-    seed.py
-    acceptance.py
-    runners.py
-  backend/
-    kernel_ir.py
-    cuda_cute.py
-    tileir.py
-  runtime/
-    loader.py
-    launcher.py
+SINGLE_REQUEST_LATENCY
+BOUNDED_LATENCY_THROUGHPUT
+PREFILL_THROUGHPUT
 ```
 
-Suggested CUDA / kernel layout:
+`SINGLE_REQUEST_LATENCY` does not wait for other requests. `BOUNDED_LATENCY_THROUGHPUT` may perform
+continuous batching within an explicit waiting and fairness budget. Results from one objective are
+not presented as results for another.
+
+### 3.2 Numerical policy
 
 ```text
-src/cuda_v2/
-  megakernel.cu
-  runtime_program.cuh
-  regions/
-    matvec_decode.cu
-    attention_decode.cu
-    norm_pointwise.cu
-  tileir/
-    README.md
-  common/
-    data_types.cuh
-    cp_async.cuh
-    tensor_core.cuh
-    residency.cuh
+REFERENCE_FP16_BF16
+FP8
+W8A16
+W4A16
 ```
 
+Every policy has its own correctness criteria and strongest equivalent baseline. A W4A16 result is
+never compared as if it preserved reference-precision semantics.
 
-## 14. Migration Plan from V1
+### 3.3 Execution policy
 
-### Keep / adapt
+```text
+STRICT_SINGLE_GRID
+HYBRID_GRAPH
+CORRECTNESS_FIRST
+```
 
-- `inductor_passes.py` as inspiration for front-end normalization
-- pieces of `shape_ops.py`
-- `buffer_planner.py` concepts, but move them later into a proper memory IR
-- serializer concepts, but redesign the payload
-- CUDA building / loading machinery as scaffolding
+- `STRICT_SINGLE_GRID` permits only `DEVICE_CALLABLE` candidates in exactly one grid.
+- `HYBRID_GRAPH` selects the fastest measured legal mixture of persistent and graph nodes.
+- `CORRECTNESS_FIRST` permits host escapes for unsupported operations.
 
-### Rewrite
+### 3.4 Invocation contract
 
-- `graph_walker.py`
-- `tiling.py`
-- `scheduler.py`
-- `dependency.py`
-- `runtime/loader.py`
-- the current task-centric schedule format
+```text
+binding_mode = STATIC_SESSION | DYNAMIC_BINDINGS
+output_mode  = RUN_INTO | BORROWED_OUTPUT | OWNED_OUTPUT
+reset_mode   = IN_ENTRY_PARALLEL_RESET | EPOCH_TAGGED | GRAPH_MEMSET
+```
 
-### Eventually delete or de-emphasize
+- `STATIC_SESSION` uses stable device addresses and can avoid per-call pointer updates; it may be
+  combined with any output mode.
+- `RUN_INTO` binds caller-owned output storage.
+- `BORROWED_OUTPUT` returns a view valid until the documented reuse point.
+- `OWNED_OUTPUT` guarantees independent lifetime using a pool/allocation or copy; all associated
+  work is charged to latency and operation counts.
 
-- one-pass task emission as the main compiler path
-- runtime reconstruction of DAG + SM queues
-- ad-hoc overload of `TaskDesc.strides[]` as the main carrier for dispatch
-  semantics
-- proliferation of op-specific handwritten CUDA files as the primary extension
-  mechanism
+Inputs also carry explicit dtype, layout, alignment, alias, and lifetime requirements. Hidden
+contiguous/cast/copy operations are forbidden in a performance result.
 
+### 3.5 Independent budgets
 
-## 15. Implementation Phases
+```text
+max_host_submissions
+max_gpu_grids
+max_persistent_segments
+max_hbm_materializations
+max_binding_bytes
+max_batch_wait_us
+allow_host_fallback
+```
 
-### Phase A: Canonical graph compiler skeleton
+These are policy constraints, not aliases for semantic region count.
 
-Deliver:
+## 4. Architecture overview
 
-- `TargetModel`
-- HF-aware front-end hooks
-- optional region census tooling
-- Export Graph IR
-- Canonical Tensor IR
-- motif recovery
+```text
+CompileRequest
+  -> WorkloadContract + WorkloadBucketKey
+  -> FXGraph + FactTables
+  -> RegionGraph with traffic and recomputation opportunities
+  -> CandidateSet + MeasuredBaselineSuite
+  -> PlanTemplate[]
+  -> generate/compile/resource-inspect/replay/refine
+  -> FinalExecutionPlan
+       |- PrecisionLayoutPlan
+       |- InvocationContract
+       |- PersistentSegment[]
+       |- CudaGraphSegment[]
+       `- fallback chain
+  -> ArtifactPack
+```
 
-Do not build codegen yet beyond debug dumps.
+There are three compiler representations, not one IR per pipeline stage. Precision, binding,
+buffers, resources, and measurements are plan objects and contracts.
 
+## 5. Compiler representations
 
-### Phase B: Region IR and cost model skeleton
+### 5.1 `FXGraph + FactTables`
 
-Deliver:
+This layer preserves exported PyTorch semantics and records:
 
-- region formation
-- candidate enumeration
-- reference launched-plan generator
-- basic cost model
-- target-parameterized candidate selection
+- shapes and bucket constraints;
+- dtype, stride, layout, alignment, offset, and aliasing;
+- parameter identity and prepack eligibility;
+- view versus materialization facts;
+- mutation/effects, including KV-cache append and sampling state;
+- input/output roles and lifetimes;
+- numerical-policy legality.
 
-Again, prioritize visibility over completeness.
+It may canonicalize, decompose, fold constants, perform CSE/DCE, and preserve views. It may not
+select persistent execution, precision tactics, kernel families, or worker schedules.
 
+### 5.2 `RegionGraph`
 
-### Phase C: Memory IR and schedule IR
+`RegionGraph` recovers transformer computations large enough to expose meaningful traffic and
+composition choices.
 
-Deliver:
+Initial primitive regions include:
 
-- explicit residency plan
-- compile-time SM program
-- serialized schedule artifact
+- `LinearRegion` and `MatmulRegion`;
+- `NormRegion` and `PointwiseRegion`;
+- `DecodeAttentionRegion` and `PrefillAttentionRegion`;
+- `RopeRegion` and `KVCacheRegion`;
+- `EmbeddingRegion`, `SamplingRegion`, and `GenericRegion`.
 
-This is the point where scheduling leaves the runtime and becomes a compiler
-product.
+Bounded composite opportunities include:
 
+- `NormLinearComposite`;
+- `QKVProjectionComposite`;
+- `GatedMLPComposite` for gate/up/activation/multiply;
+- `RopeKVAppendComposite`;
+- linear epilogue composites;
+- decode-attention composites appropriate to paged/GQA layouts.
 
-### Phase D: Decode matvec-first codegen
+Each region records a `TrafficEstimate` rather than one undifferentiated operation count:
 
-Deliver:
+```text
+weight_bytes
+activation_read_bytes
+activation_write_bytes
+kv_read_write_bytes
+workspace_bytes
+flops
+parallel_work
+```
 
-- one great decode matvec family
-- fused epilogues
-- weight prepack / quantization support
+Each edge records legal value transports, including materialization, on-chip forwarding, and
+recomputation scope. A region is not assumed to equal one CUDA launch.
 
-This is the first performance milestone.
+### 5.3 `PlanTemplate` to `FinalExecutionPlan`
 
+`PlanTemplate` fixes a small legal execution neighborhood:
 
-### Phase E: Attention family
+```text
+PlanTemplate
+  WorkloadContract
+  segment templates and dependencies
+  candidate configuration sets
+  PrecisionLayoutPlan alternatives
+  ValueTransportPlan alternatives
+  BufferPlan
+  BindingSchema
+  InvocationContract alternatives
+  policy and resource constraints
+```
 
-Deliver:
+After lowering, compilation, correctness testing, profiling, and bounded search, it becomes:
 
-- decode-specialized attention family
-- integrated schedule actions
+```text
+FinalExecutionPlan
+  selected precision/layout and prepack descriptors
+  selected value transports and composites
+  exact PersistentSegment[] and CudaGraphSegment[]
+  exact InvocationContract and state-reset policy
+  measured latency/throughput/traffic breakdown
+  strongest equivalent baseline
+  compatibility guards and fallback chain
+```
 
+Compiled feedback may change tile/stage/vector configurations, worker counts, value transport,
+resource segmentation, and persistent-versus-graph selection. It may not reopen graph semantics.
 
-### Phase F: Autotuning and artifact packaging
+## 6. Execution objects
 
-Deliver:
+### 6.1 `KernelVariant`
 
-- bounded Helion-style late search
-- replay-based tuning loop
-- `AutotuneDB`
-- bucketed artifact store
-- simple runtime artifact selection
-- acceptance against a TorchCompile-style baseline
+```text
+KernelVariant
+  semantic_region_kind
+  execution_capability
+  supported_shape_layout_precision
+  compile_time_parameters
+  InputOutputContract
+  ResourceEnvelope
+  FusionEndpoint[]
+  measured_results
+```
 
+`ExecutionCapability` is one of:
 
-## 16. Bottom Line
+```text
+DEVICE_CALLABLE
+GRAPH_NODE
+HOST_ONLY
+```
 
-Megabake v2 should be designed as:
+Only `DEVICE_CALLABLE` enters a persistent entry.
 
-> a staged compiler that lowers an FX graph into a bucketed region graph, then
-> into a target-parameterized memory-resident persistent schedule, then into
-> late-bound target-specific code chosen and refined by empirical tuning against
-> a TorchCompile-style launched baseline.
+### 6.2 `ResourceEnvelope`
 
-It should not be designed as:
+```text
+threads_per_cta
+warp_group_structure
+static_smem_bytes
+dynamic_smem_bytes
+registers_per_thread_actual
+spill_bytes_actual
+max_resident_ctas
+cluster_shape
+launch_attributes
+tma_tensor_map_requirements
+minimum_arch_toolkit
+```
 
-> a better one-pass graph walker that emits slightly smarter low-level task
-> records.
+Post-compile resource values are mandatory. Resource estimates are sufficient only for early
+rejection.
 
-That is the main architectural line between the current project and the next
-version, and it is the mechanism by which v2 should aim to reliably beat
-`torch.compile`: slightly better or near-parity kernels on the hot regions, plus
-consistently much lower orchestration cost.
+### 6.3 `FusionContract` and `ValueTransportPlan`
+
+```text
+FusionContract
+  producer_variant
+  consumer_variant
+  producer_scope = ONCE | PER_WORKER | PER_CLUSTER
+  transport = REGISTER_FORWARD | SMEM_FORWARD | RECOMPUTE
+  layout_dtype_alignment
+  thread_warp_ownership
+  synchronization_protocol
+  lifetime
+  recompute_cost
+  combined_resource_envelope
+```
+
+`REGISTER_FORWARD` and `SMEM_FORWARD` require static composition into a `CompositeVariant`.
+`RECOMPUTE_PER_WORKER` permits a cheap semantically identical producer inside every consuming CTA.
+HBM materialization is represented explicitly when no such contract wins.
+
+### 6.4 `PersistentSegment`
+
+A persistent segment is one owned grid containing one compatible resource class:
+
+```text
+PersistentSegment
+  resource_class
+  entrypoint
+  worker_count
+  threads_per_worker
+  dynamic_smem_bytes
+  launch_attributes
+  PhaseProgram
+  selected_variant_ids
+  binding_map
+  state_reset_policy
+  combined_resource_envelope
+```
+
+`worker_count` is not automatically the SM count. It is tuned with the actual MIG partition and
+variant. Each phase may activate a subset of resident workers.
+
+### 6.5 Fixed-bucket `PhaseProgram`
+
+The default scheduler is deliberately small:
+
+```text
+PhaseProgram
+  PhaseDesc[]
+  WorkDesc[]
+  CompletionEpoch[]
+
+PhaseDesc
+  composite_or_variant_id
+  active_worker_count
+  distribution = STATIC_RANGE | ATOMIC_CURSOR | ALL_ACTIVE_WORKERS
+  work_range_or_cursor
+  binding_slice
+  completion = NONE | CTA_JOIN | GRID_JOIN
+```
+
+Rules:
+
+- static ranges are preferred when work is known;
+- one atomic cursor is allowed for meaningful imbalance, not as the default for every task;
+- joins occur between composite phases, not every FX node;
+- counters are preallocated and reset inside the entry, epoch-tagged, or represented by graph
+  memset nodes; they are never cloned per invocation;
+- arbitrary per-worker dependency polling is absent;
+- release and profiling binaries are separate.
+
+### 6.6 Serving scheduler
+
+Dynamic request admission is a separate runtime mode, not hidden inside the fixed-bucket executor.
+It may add:
+
+- continuous/in-flight batching;
+- bounded waiting and fairness;
+- layer/shape/precision-compatible work queues;
+- grouped persistent GEMM visitors;
+- a dedicated scheduler CTA when measurements justify its resource cost.
+
+Its primary purpose is to reuse a weight tile across several tokens, not merely to provide a more
+general task abstraction.
+
+### 6.7 `CudaGraphSegment`
+
+```text
+CudaGraphSegment
+  covered_regions
+  GraphRecipe
+  workspace_plan
+  binding_update_map
+  environment_guards
+```
+
+Graph recipes use public operations and owned nodes. They may contain resource-specific persistent
+entries, vendor kernels, memsets, and binding preludes. Live graph/function handles and private
+parameter packs are never serialized.
+
+Programmatic dependent launch is an optional graph-edge tactic only when a downstream kernel has a
+substantial prefix independent of its producer and uses the required synchronization protocol. It
+is measured like any other candidate; ordinary full dependencies remain the default.
+
+## 7. Precision and layout architecture
+
+`PrecisionLayoutPlan` is a plan object because byte width and physical layout often dominate decode
+performance. It may mix precisions across tensors and operations when the numerical policy permits.
+
+```text
+PrecisionLayoutPlan
+  default_policy
+  TensorPrecisionPlan[]
+  OperationPrecisionPlan[]
+  PrepackDescriptor[]
+
+TensorPrecisionPlan
+  value_or_parameter_id
+  storage_dtype
+  scale_dtype_and_granularity
+  zero_point_policy
+  physical_layout
+
+OperationPrecisionPlan
+  region_or_variant_id
+  input_dtypes
+  accumulator_dtype
+  output_dtype
+```
+
+The initial candidate families are:
+
+- reference FP16/BF16;
+- FP8 where activation conversion/scaling cost is measured;
+- W8A16;
+- W4A16 groupwise/per-channel layouts.
+
+Weights are packed once at load/build time into the exact layout required by the selected skinny or
+WGMMA variant. Transposes, scale swizzles, padding, and alignment are part of the artifact, not
+performed during invocation.
+
+Quantized plans require model-quality validation in addition to numerical kernel checks. They are
+accepted only against an equivalent quantized baseline.
+
+## 8. Binding and invocation architecture
+
+V2.2 has a fast static path and a general dynamic path.
+
+### 8.1 Static-session fast path
+
+Model weights, arena buffers, inputs, outputs, KV pages, and scheduler state have stable addresses.
+The invocation may need only a small device-resident sequence/token update or no binding transfer at
+all.
+
+This is the preferred serving contract.
+
+### 8.2 Dynamic binding path
+
+A compact pinned-host `BindingBlock` is copied once into a stable device `BindingTable`:
+
+```text
+BindingBlock -> one asynchronous update -> BindingTable
+                                            |- persistent entries
+                                            `- one batched GraCE-style prelude
+```
+
+The prelude updates only confirmed existing pointer/scalar slots of graph nodes. It is an ancestor
+of every edited node, checks every status, and is used only when it beats host update or fixed
+addresses.
+
+### 8.3 Output lifetime
+
+The runtime never hides an output clone. The chosen `InvocationContract.output_mode` states whether
+output is:
+
+- written into caller storage;
+- borrowed until the next reuse event;
+- double-buffered;
+- placed in an independently owned pool/allocation or copied into an owned tensor.
+
+Every copy appears in trace, operation count, and latency.
+
+## 9. Measurement and cost model
+
+### 9.1 Analytical seed
+
+For each region/plan, estimate a vector rather than one score:
+
+```text
+T_compute      = flops / calibrated_compute_rate
+T_weight       = weight_bytes / calibrated_stream_bandwidth
+T_activation   = activation_and_materialization_bytes / calibrated_bandwidth
+T_kv           = kv_bytes / calibrated_kv_bandwidth
+T_orchestration= grids + joins + atomics + binding + copies
+```
+
+The seed lower bound is based on the dominant non-overlapped terms, with explicit contention when
+independent branches share HBM. It prunes impossible plans; measurements decide winners.
+
+Bandwidth is calibrated on the actual MIG instance. Full-GPU peak bandwidth is not divided and
+treated as measured truth. L2 persisting-cache set-aside is not an architecture dependency because
+CUDA disables it under MIG.
+
+### 9.2 Baseline suite
+
+For each equivalent workload and numerical policy, measure as legal:
+
+1. eager/reference correctness;
+2. ordinary `torch.compile`;
+3. strongest `torch.compile` CUDA-Graph/static-address mode;
+4. direct vendor/CUTLASS operation baselines for hot regions;
+5. static vendor graph replay;
+6. GraCE-style indirect graph replay;
+7. MegaBake strict and hybrid plans;
+8. an equivalent serving engine for batching/quantized claims when available.
+
+### 9.3 Mandatory measurements
+
+- CPU wall latency and GPU event latency;
+- full latency distribution and warm steady-state throughput;
+- every CUDA kernel, memcpy, memset, and allocation event;
+- GPU grid count and host submission count;
+- achieved DRAM/L2 traffic and cache rates;
+- register count, spills, SMEM, theoretical and achieved occupancy;
+- scheduler/reset/binding time outside task bodies;
+- model weight, activation, and KV bytes implied by the plan;
+- correctness and model-quality results appropriate to numerical policy.
+
+Profiler filtering may classify operations but may not remove them from totals. Task-local timers are
+never used as a substitute for whole-entry time.
+
+### 9.4 Acceptance
+
+A performance artifact is accepted only when it:
+
+- passes correctness, guard-region, and sanitizer checks;
+- satisfies its numerical/quality policy;
+- is stable across bucket shapes, layouts, and alignments;
+- beats the strongest equivalent legal baseline by a configured noise margin;
+- includes compatibility guards and a measured fallback.
+
+A strict one-grid research artifact may be emitted slower, but its deficit must be explicit.
+
+## 10. Kernel program
+
+### 10.1 Decode linear first
+
+Generate exact `M=1`, `M=2`, and `M=4` families. `M`, dtype, layout, vector width, epilogue, and
+scale format are compile-time constants wherever practical. Never retain an accumulator array sized
+for an unused `M=64` path.
+
+Candidate sources:
+
+1. selected pinned Mirage MPK Hopper task bodies;
+2. CUTLASS/CuTe collectives adapted below the host launcher;
+3. optional cuBLASDx device-callable components;
+4. a small custom streaming GEMV only where it measures best.
+
+Candidate tactics include tuned SIMT GEMV, transposed small-N WGMMA, TMA warp specialization, and
+mixed-dtype W8/W4 variants. Worker count, tile shape, stage count, and SMEM are tuned together.
+
+### 10.2 Transformer composites
+
+Prioritize composites that remove traffic or joins:
+
+1. replicated RMSNorm into decode linear;
+2. fused gate/up dot products with SiLU-multiply epilogue;
+3. grouped/concatenated QKV projection with output routing;
+4. bias/residual/activation linear epilogues;
+5. RoPE plus KV-cache append.
+
+Mere adjacency or dispatch fusion is not sufficient.
+
+### 10.3 Attention and KV cache
+
+Attention is sequence-bucketed separately from linear. Decode candidates include:
+
+- paged KV layouts;
+- GQA/MQA-aware head mapping;
+- single-block and split-KV/multi-block variants;
+- reference, FP8, or INT8 KV cache under the numerical policy;
+- TMA/vectorized movement and online softmax;
+- a graph/vendor fallback until the owned variant wins.
+
+The planner pivots variants using measured sequence-length and parallelism thresholds.
+
+### 10.4 Code generation discipline
+
+- emit only variants reachable from the bucket;
+- do not concatenate every task family into one entry;
+- compile release and instrumented binaries separately;
+- collect ptxas resources and disassembly for every candidate;
+- reject unexpected local memory or spills in hot skinny kernels;
+- retain source revision and license metadata for reused code.
+
+## 11. Runtime model
+
+The fixed-bucket runtime does only this:
+
+1. fingerprint target and libraries;
+2. select a compatible artifact and numerical/objective policy;
+3. allocate stable arena, scheduler state, KV pages, and binding table;
+4. load prepacked weights and owned code;
+5. reconstruct, instantiate, and upload graph recipes once;
+6. apply the documented invocation binding/state-reset operation;
+7. launch one persistent entry or one top-level graph;
+8. return output under the explicit lifetime contract.
+
+It does not rediscover regions, rebuild schedules, infer vendor ABIs, clone dependency arrays, hide
+output copies, or silently autotune on every process start.
+
+For an autoregressive static session, a later graph recipe may use conditional graph nodes or device
+tail launches for sampling/termination control. This remains a multi-grid GPU-controlled loop, not
+one magically fused vendor kernel.
+
+## 12. Implementation roadmap
+
+### Phase 0 — make measurement truthful and remove housekeeping
+
+- count every CUDA operation and record CPU/GPU latency separately;
+- store real-model benchmark artifacts;
+- measure actual MIG bandwidth and resource limits;
+- remove per-invocation counter clones and hidden output clones;
+- add `STATIC_SESSION`, `RUN_INTO`, and `BORROWED_OUTPUT` paths;
+- build ordinary, static-graph, and indirect-graph baselines.
+
+Exit: an empty/minimal invocation has a fully explained timeline.
+
+### Phase 1 — one competitive reference-precision decode linear
+
+- choose the hottest real `M=1` and `M=4` shapes;
+- generate exact-size variants with no dynamic interpreter arrays;
+- port one MPK/CuTe TMA pipeline and retain a tuned SIMT candidate;
+- tune worker count and SMEM rather than reserving the device maximum;
+- compare body, resources, SASS, traffic, and end-to-end phase time with cuBLASLt.
+
+Exit: isolated owned linear is competitive and one strict segment has no unexplained deficit.
+
+### Phase 2 — phase executor and traffic-removing composites
+
+- implement the compact static `PhaseProgram`;
+- add resource-class entry generation;
+- implement `RECOMPUTE_PER_WORKER` RMSNorm-linear;
+- implement GatedMLP and QKV composite candidates;
+- demonstrate fewer HBM bytes/joins, not merely fewer dispatch cases.
+
+### Phase 3 — precision and prepacking
+
+- add W8A16 and W4A16 prepack descriptors and kernels;
+- measure activation conversion for FP8 plans;
+- add model-quality gates and equivalent quantized baselines;
+- make numerical policy part of artifact selection.
+
+### Phase 4 — hybrid graph backend
+
+- implement stable binding tables and fixed workspaces;
+- build a batched GraCE-style prelude with version guards;
+- connect resource-specific persistent and vendor nodes;
+- accept the hybrid plan only when it beats both static graph and strict persistent alternatives.
+
+### Phase 5 — attention, KV cache, and device-side decode control
+
+- add paged/GQA decode attention and split-KV thresholds;
+- add quantized KV policies;
+- fuse RoPE/KV append where profitable;
+- optionally keep sampling/termination in a conditional or tail-launched graph.
+
+### Phase 6 — continuous batching
+
+- introduce the separate admission scheduler;
+- group compatible tokens so weight tiles serve multiple rows;
+- tune batch wait against service-level latency;
+- consider a dedicated scheduler CTA only after measuring its resource cost.
+
+## 13. Explicit non-goals
+
+- extracting and shipping private cuBLAS cubins;
+- treating an opaque CUDA entry as a callable device subroutine;
+- SASS lifting as a production dependency;
+- a universal maximum-SMEM persistent entry;
+- arbitrary per-worker busy-wait DAGs for fixed buckets;
+- generic interpreted TMA, warp-role, or register-handoff instructions;
+- claiming speedup by hiding copies from profiler counts;
+- presenting quantized or batched throughput as reference batch-one latency;
+- building a general training compiler before the decode vertical slice wins.
+
+## 14. Design invariants
+
+1. Semantics are fixed before execution planning.
+2. Traffic and numerical policy are first-class.
+3. Every candidate declares `DEVICE_CALLABLE`, `GRAPH_NODE`, or `HOST_ONLY`.
+4. Vendor kernels always remain independent grids.
+5. One host submission is never called one GPU grid.
+6. Worker identity means CTA slot, not physical SM identity.
+7. Machine pipelines live in compiled variants.
+8. On-chip forwarding or recomputation requires a compiled contract.
+9. Persistent entries are split when resource classes conflict.
+10. Fixed buckets use phase programs; dynamic schedulers exist only for dynamic serving.
+11. Every invocation copy/reset/lifetime operation is explicit and measured.
+12. Compiled resources and replay measurements may revise the execution plan.
+13. The strongest equivalent measured baseline gates acceptance.
+14. Runtime binds and launches; it does not compile again.
+
+## 15. Bottom line
+
+The best MegaBake architecture is not one enormous kernel containing every operator and a general
+scheduler. It is a small compiler that knows when one grid is valuable, builds excellent
+shape/precision-specific device bodies, recomputes cheap values when that avoids communication,
+splits incompatible resource classes, and uses CUDA Graphs for the remaining boundaries.
+
+For batch-one reference decode, success means approaching the real weight-bandwidth floor while
+removing materializations and joins. For serving throughput, success means reusing those streamed
+weights across multiple tokens under a bounded latency policy. GraCE and private-kernel tracing are
+valuable graph-binding and oracle tools; they are not the source of persistent composability.
