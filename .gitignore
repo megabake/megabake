@@ -1,4 +1,5 @@
 /agent_space
+.venv/
 __pycache__/
 *.pyc
 *.egg-info/

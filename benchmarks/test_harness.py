@@ -10,9 +10,16 @@ Usage:
 
 import argparse
 import statistics
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
+
+# Support direct execution from a source checkout (as documented in README).
+# When this project has not been installed, Python adds ``benchmarks/`` rather
+# than the repository's ``src/`` directory to sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import torch
 import torch.nn as nn

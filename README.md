@@ -90,10 +90,31 @@ Matmul dominates both models. Optimization priority: skinny matvec cp.async pref
 ## Quick start
 
 ```bash
-pip install -e ".[dev]"
+git clone https://github.com/megabake/megabake.git
+cd megabake
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-Requires: Python 3.10+, PyTorch 2.4+, CUDA 12+, CUTLASS headers (ships with PyTorch source or set `CUTLASS_PATH`).
+`requirements.txt` installs all project dependencies into `.venv`, including
+NVIDIA's pinned `nvidia-cutlass` wheel. It supplies the CUTLASS v3.8.0 CuTe
+C++ headers used by MegaBake's CUDA compilation and is discovered
+automatically from the active virtual environment. No `CUTLASS_PATH` export
+or machine-specific PyTorch-source checkout is needed.
+
+NVIDIA GPU. The setup script installs PyTorch 2.6 with CUDA 12.4 support.
+Requires: Python 3.10+, Git, CUDA toolkit 12+ (including `nvcc`), and an
+NVIDIA GPU. The requirements install PyTorch 2.6 with CUDA 12.4 support.
+NVIDIA GPU. The setup script installs PyTorch 2.6 with CUDA 12.4 support.
+
+For an existing CUTLASS checkout, set `CUTLASS_PATH` to its root before
+starting Python. It takes precedence over the project-local dependency:
+
+```bash
+export CUTLASS_PATH=/path/to/cutlass
+```
 
 ```python
 import torch
