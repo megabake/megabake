@@ -36,8 +36,8 @@ Megakernel Launcher        # cuLaunchCooperativeKernel, 1 kernel, all SMs
 
 All SMs execute the same task simultaneously. After each task completes, a
 `cooperative_groups::this_grid().sync()` barrier synchronizes the entire grid
-before the next task begins. This is the same execution model used by
-[Mirage](https://github.com/mirage-project/mirage).
+before the next task begins. MegaBake owns this execution model and its task
+scheduler.
 
 **Matmul: CuTe tensor-core GEMM**
 
@@ -221,7 +221,6 @@ tests/
 
 ## Design references
 
-- [Mirage](https://github.com/mirage-project/mirage) -- Multi-level superoptimizer with persistent megakernels (BSP execution model, CuTe GEMM, WGMMA on Hopper)
 - [Luminal](https://github.com/jafioti/luminal) -- ML compiler with cuBLASLt matmul and egglog-based fusion
 
 ## License

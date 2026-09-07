@@ -1,11 +1,12 @@
 # GraCE, opaque CUDA kernels, and the path to a composable persistent GEMM
 
-Research status: 2026-09-05, revised for the traffic-first MegaBake V2.2 architecture. This document
+Research status: 2026-09-07, revised for the traffic-first MegaBake V2.3 architecture. This document
 supersedes the earlier drafts of this file. It is based on the local
 [GraCE paper](./GraceCE_OSDI_26_CudaGraphPytorchCompile%20%281%29.pdf), the
 [official OSDI page](https://www.usenix.org/conference/osdi26/presentation/ghosh), current and
-archived CUDA documentation, the current MegaBake implementation, and the Mirage MPK/CUTLASS
-implementation paths.
+archived CUDA documentation, the current MegaBake implementation, and public CUTLASS/CuTe
+implementation paths. Measurement details, profiles, and the complete interpretation are preserved
+in the [H200 GPU re-analysis](./MEGABAKE_V2_GPU_REANALYSIS.md).
 
 ## Executive conclusion
 
@@ -40,8 +41,8 @@ This leads to three distinct goals which should not be conflated:
 3. **Execute cuBLAS's implementation inside MegaBake's existing persistent grid.** GraCE does not
    help with this. A CUDA kernel entry point is not a device subroutine. Dynamic parallelism or a
    device-launched CUDA Graph still creates another grid. True one-grid composition requires a
-   device-callable implementation such as cuBLASDx, CUTLASS/CuTe collectives, or an MPK-style task
-   function—or a research-scale SASS lifter.
+   MegaBake-owned device-callable implementation built directly or from cuBLASDx or CUTLASS/CuTe
+   collectives—or a research-scale SASS lifter.
 
 For MegaBake, the highest-probability route to cuBLAS-class performance in an owned persistent
 entry is:
@@ -55,8 +56,8 @@ entry is:
   Graph when the recovered occupancy outweighs the extra grid boundary;
 - use GraCE only as a hybrid fallback or as a diagnostic reference path.
 
-The project README reports that GEMM is 84.8% of Gemma-2B's MegaBake time. That makes this a kernel
-quality and task-mapping problem, not principally a launch-parameter problem.
+The H200 measurements now prove directly that this is a kernel-quality, work-mapping, and entry-
+resource problem, not principally a launch-parameter problem.
 
 There is a second, more fundamental conclusion. Batch-one decode GEMV streams almost every model
 weight once per token. A persistent grid does not keep a multi-gigabyte model in registers, shared
@@ -64,6 +65,77 @@ memory, or the MIG partition's L2. After reference-precision kernel quality is f
 remaining levers are weight-only W8/W4 layouts, reuse of each weight tile across continuously
 batched tokens, and transformer composites that remove activation materialization and joins. Those
 are distinct numerical/service contracts and must be compared with equivalent baselines.
+
+## Measured H200 verdict (V2.3)
+
+This section is one CUDA SM90 backend case study. Its generalizable outputs are compiler contracts
+and failure modes; its timings, resource counts, launch geometry, and kernel-family crossovers are
+not defaults for A100 or any other target.
+
+Environment: H200 3g.71gb MIG, 60 visible SMs, SM90, CUDA 12.8 compiler, PyTorch 2.6.0+cu124, and
+Nsight Compute 2025.1.1. For SmolLM2-135M batch-one, one-token decode:
+
+| Candidate | End-to-end latency | GPU body/events | Interpretation |
+|---|---:|---:|---|
+| ordinary `torch.compile` in the supplied harness | 5,691.4 us | 985.1 us | Useful diagnostic, not strongest low-overhead baseline |
+| `torch.compile(..., mode="reduce-overhead")` through the same export route | 1,781.7 us median | 1,026.2 us summed events | Strongest equivalent baseline measured so far |
+| current MegaBake | 4,845.5 us | 4,748.7 us megakernel | One compute grid, but 2.72x slower end to end than the stronger baseline |
+
+The current “1.17x over torch.compile” headline is therefore not a strict compiler win. The harness
+also reports maximum differences of `0.484375` for ordinary `torch.compile` and `0.195312` for
+MegaBake, so the exact numerical acceptance policy must be stated and passed before any performance
+claim. The result *does* validate that one compute grid nearly eliminates CPU launch gaps once the
+grid is running.
+
+The unfiltered MegaBake timeline contains one compute launch plus five small copy operations. Their
+combined device duration is only about 5.5 us; they should be removed for a clean invocation
+contract, but they do not explain a 4.77-ms body. Nsight Compute instead shows the primary limit:
+
+| Compiled/achieved fact | Current entry |
+|---|---:|
+| threads / grid blocks | 256 / 60 |
+| registers per thread | 184 |
+| dynamic shared memory per CTA | 225,280 bytes |
+| stack frame per thread | 1,072 bytes |
+| resident CTAs and warps per SM | 1 CTA / 8 warps |
+| theoretical / achieved occupancy | 12.5% / 12.5% |
+| DRAM / compute throughput | 2.33% / 6.42% |
+| kernel duration | about 4.77 ms |
+
+The harness's 500-GB/s “peak HBM” constant is not this MIG profile's documented roofline. Full H200
+bandwidth is 4.8 TB/s, and the 3g.71gb profile owns 4/8 memory and L2 slices, implying a 2.4-TB/s
+mathematical share. Thus 269 MB gives a 112-us product-peak floor, not 538 us. This is still only a
+floor: `269 MB / 4.77 ms` is about 56 GB/s semantic effective bandwidth (2.35% of the inferred
+share), consistent with Nsight Compute's 2.33% physical DRAM-throughput reading. Production reports
+must keep semantic end-to-end bandwidth, semantic body bandwidth, and measured physical DRAM
+bandwidth separate.
+
+This is a compiled launch-envelope failure. Decode, prefill, attention, large accumulator arrays,
+and profiling machinery are reachable from one universal entry, so every phase inherits the worst
+register/shared-memory/stack contract. The skinny `float acc[64]` path is a concrete local-storage
+risk; SASS contains local loads/stores, although path-specific counters are still required before
+attributing all of them to decode.
+
+A scheduler A/B test reinforces the priority: replacing the per-SM queue with the simple static
+grid loop reduced the kernel from roughly 4.75 ms to 4.57 ms, about 4%. Worth keeping, but secondary.
+The saved task profile also attributes only part of the body to linears; copies, RoPE, reductions,
+attention, and pointwise work form a substantial tail. Competitive linears are necessary and not
+sufficient.
+
+The immediate architectural correction is:
+
+```text
+one strict runtime grid
+  != one universal binary
+  != one CTA per SM
+  != one logical tile per CTA
+
+strict target = one generated, resource-compatible grid per target/model/bucket
+```
+
+`resident_worker_count` selects cooperative residency. Each worker loops over an independent
+`logical_work_count` derived from exact output/reduction tiling. If the resource envelope permits
+it, the cooperative grid may also use more than one resident CTA per SM.
 
 ## 1. What “signature” means here
 
@@ -632,6 +704,11 @@ examples. The register API is specifically intended for custom epilogues and fus
 [Using cuBLASDx](https://docs.nvidia.com/cuda/cublasdx/using_cublasdx.html) and
 [performance guidance](https://docs.nvidia.com/cuda/cublasdx/performance.html).
 
+It is a distinct MathDx header product, not a way to extract the kernel selected by host cuBLAS, and
+NVIDIA explicitly states that it is not shipped with the CUDA Toolkit. The measured CUDA 12.8
+installation does not contain `cublasdx.hpp`. MegaBake must therefore acquire and pin it as a
+first-class compiler dependency in a compatible toolchain before making any performance claim.
+
 Important limitations:
 
 - it is still Early Access and covers a subset of full cuBLAS;
@@ -644,9 +721,16 @@ Important limitations:
   headers. See [current requirements](https://docs.nvidia.com/cuda/cublasdx/requirements_func.html)
   and [archived 0.4.1 requirements](https://docs.nvidia.com/cuda/archive/13.0.1/cublasdx/0.4.1/requirements_func.html).
 
-For MegaBake, cuBLASDx should be benchmarked as a task-body generator, not called through a host
-adapter. One persistent CTA computes one or more output tiles, looping over K and fusing the epilogue
+For MegaBake, cuBLASDx is a first-class task-body generator, not a host adapter. Every supported
+exact GEMM cell receives cuBLASDx shared-memory, register-accumulator, and pipelined candidates where
+legal. One persistent CTA computes one or more output tiles, looping over K and fusing the epilogue
 before releasing its task.
+
+cuBLASDx, CUTLASS collectives, direct CuTe compositions, and native CUDA mappings share one
+candidate contract. The compiler first measures isolated bodies, then persistent-worker embeddings,
+then separately compiled composite and whole-entry beams. It retains only the winner in the release
+entry so losing alternatives cannot inflate registers, shared memory, occupancy constraints, or
+instruction footprint.
 
 ### 5.2 CUTLASS 3.x/CuTe: use the layer below the host launcher
 
@@ -662,30 +746,18 @@ unchanged whole `GemmUniversal`, because MegaBake already owns block identity an
 The task body must supply the same warp specialization, shared storage, TMA descriptors, pipeline
 state, and epilogue expected by the selected collective.
 
-### 5.3 Mirage MPK is a concrete open implementation of the desired architecture
+### 5.3 MegaBake owns the persistent implementation
 
-Mirage MPK does not extract cuBLAS. It compiles each operator into a device task and executes those
-tasks from persistent worker blocks. Its current Hopper task headers include CuTe warp-specialized
-GEMM implementations, and its GEMM code implements TMA producers, WGMMA consumers, pipelines, K
-iteration, and the epilogue directly inside a `CUTLASS_DEVICE` function. See the
-[MPK repository and branch instructions](https://github.com/mirage-project/mirage),
-[Hopper task header](https://raw.githubusercontent.com/mirage-project/mirage/mpk/include/mirage/persistent_kernel/tasks/hopper/task_header.cuh), and
-[`gemm_ws_mpk.cuh`](https://raw.githubusercontent.com/mirage-project/mirage/mpk/include/mirage/persistent_kernel/tasks/cute/hopper/gemm_ws_mpk.cuh).
+MegaBake compiles each selected operator or composite into a device task executed by its own
+persistent workers. It owns task identity, logical-tile assignment, synchronization, resource
+contracts, pipeline integration, and epilogues. Public CUDA and CUTLASS/CuTe components plus the
+first-class cuBLASDx candidate generator may supply low-level math primitives, but MegaBake defines
+and implements the complete
+persistent architecture.
 
-This is much closer to MegaBake's goal than GraCE:
-
-```text
-opaque cuBLAS plan                  MPK/MegaBake plan
------------------                  -----------------
-host dispatch chooses entry        compiler/autotuner chooses task variant
-new grid owns block IDs             persistent worker owns tile task
-private entry consumes ABI          device function consumes TaskDesc
-kernel writes global output         task may fuse epilogue/next work
-```
-
-The OSDI'26 [Mirage Persistent Kernel paper](https://arxiv.org/abs/2512.22219) and public `mpk`
-branch are an actionable source base. Porting its Hopper linear task or its scheduler choices is a
-higher-value experiment than reverse engineering a cuBLAS cubin.
+The SM90 backend supplies its own TMA/WGMMA task bodies. That does not establish SM80/A100 support;
+the SM80 backend needs its own legal SIMT/`cp.async`/MMA or library-derived bodies and independent
+measurements.
 
 ### 5.4 Resource facts a persistent GEMM must respect
 
@@ -707,22 +779,37 @@ A monolithic kernel pays constraints that independent cuBLAS kernels do not:
 These explain why copying source-level math is insufficient. The task mapping and resource envelope
 must be co-designed with the persistent scheduler.
 
-The present MegaBake implementation makes the worst case global: every cooperative launch requests
-about 220 KiB dynamic shared memory, so Hopper can retain only one 256-thread CTA per SM. That is an
-eight-warp, 12.5% theoretical active-warp ceiling on a 64-warp SM. One CTA per SM can be correct for
-a carefully designed warp-specialized TMA/WGMMA kernel; it should not be the universal launch
-contract for pointwise, reduction, attention, and skinny-streaming code. V2.2 therefore compiles
-resource-class entrypoints and measures the single-grid versus CUDA-Graph-segmented result.
+The present MegaBake implementation makes the worst case global. Nsight Compute measured `184`
+registers/thread, `225,280` bytes dynamic shared memory/CTA, a `1,072`-byte stack frame/thread, one
+resident 256-thread CTA/SM, and 12.5% theoretical and achieved occupancy. One CTA per SM can be
+correct for a carefully designed warp-specialized TMA/WGMMA kernel; it should not be the universal
+launch contract for pointwise, reduction, attention, and skinny-streaming code. V2.3 therefore
+generates bucket-specific entries, records their post-compile `EntryLaunchEnvelope`, and measures
+the strict single-grid result separately from any CUDA-Graph-segmented fallback.
 
 ### 5.5 What “same performance” requires for decode
 
 For a fixed reference-precision `M=1..4` shape, matching the vendor body is primarily an achieved-
-bandwidth, work-mapping, and resource problem:
+bandwidth, work-mapping, and resource problem. `M <= 4` alone does not select the algorithm. The
+H200 vendor traces demonstrate three materially different mappings:
+
+| Exact shape `(M,N,K)` | Vendor family | Grid / block | Key resource result |
+|---|---|---|---|
+| `(1,576,576)` | specialized `gemvx` | 144 / 128 | 162 registers/thread, 528 B dynamic SMEM |
+| `(1,1536,576)` | `gemv2T` | 192 / 128 | 58 registers/thread, 2.56 KiB static SMEM |
+| `(1,49152,576)` | CUTLASS WMMA | 3,072 / 32 | 72 registers/thread, 4.61 KiB dynamic SMEM, 64.25% DRAM throughput |
+
+The matching owned search family is therefore warp-per-output K-parallel reduction, CTA/split-K
+reduction where K or parallelism requires it, and padded-M tensor-core/CuTe for very large N. In
+particular, the vocabulary head proves that a tensor-core formulation can win even at `M=1`.
+
+Implementation requirements:
 
 1. specialize M at compile time, including accumulator-array bounds;
 2. prepack/transpose weights once into the exact access layout;
-3. compare tuned SIMT GEMV with transposed-small-N WGMMA and MPK/CuTe TMA pipelines;
-4. tune active worker count and shared memory on the actual MIG instance;
+3. compare the bounded mapping family above with MegaBake-owned CuTe/CUTLASS TMA/WGMMA bodies;
+4. tune logical work count independently from resident workers and shared memory on the actual MIG
+   instance;
 5. reject spills and dynamically indexed local arrays in hot paths;
 6. separate release code from task-profiling instrumentation;
 7. measure every scheduler, reset, binding, copy, and output operation around the body.
@@ -791,24 +878,28 @@ working launcher as version-locked research infrastructure, not a distributable 
 
 For production MegaBake, use this order:
 
-1. make the benchmark timeline truthful: include every kernel, memcpy, memset, allocation, pointer
-   update, scheduler reset, and output copy;
-2. remove the current per-invocation dependency/tile-counter clones and hidden output clone by
-   introducing preallocated in-entry/epoch state and `RUN_INTO`/borrowed-output contracts;
-3. classify real model linears by `(M,N,K,dtype,layout,epilogue,precision policy)` and time each body
-   against cuBLASLt or the equivalent quantized baseline;
-4. generate distinct M=1, M=2, and M=4 implementations so the compiler never carries an unused
-   `float acc[64]` or runtime-M loop through the skinny path;
-5. compare a tuned coalesced SIMT GEMV, a transposed-small-N WGMMA form, and one pinned MPK/CuTe
-   Hopper implementation;
-6. tune active/resident workers, vector width, tile shape, stages, and dynamic shared memory on the
-   actual H200 MIG partition;
-7. replace the universal maximum-SMEM entry with resource-class entries, while retaining a measured
-   strict single-grid artifact;
-8. use a compact static phase program with static work ranges and only measured atomic cursors;
-9. inspect SASS and counters for TMA/WGMMA issue, achieved bandwidth, memory stalls, registers,
-   local memory, spills, shared memory, and achieved occupancy;
-10. keep a hybrid cuBLAS graph fallback for shapes the owned task does not yet match.
+1. make the benchmark contract truthful: add the strongest equivalent `torch.compile` low-overhead
+   route, define numerical acceptance, and include every kernel/copy/memset/allocation in the
+   unfiltered timeline;
+2. classify real linears by exact `(M,N,K,dtype,layout,epilogue,precision policy)` and record the
+   vendor family, logical grid, resources, traffic, and isolated duration;
+3. generate distinct M=1, M=2, and M=4 bodies so the compiler removes `float acc[64]`, runtime-M
+   loops, unreachable prefill/attention bodies, and profiling code from release decode artifacts;
+4. for every supported shape, search cuBLASDx descriptors, CUTLASS collectives, direct CuTe
+   compositions, and native CUDA warp/CTA/split-K mappings through the same candidate contract;
+5. tune `logical_work_count` independently from `resident_worker_count`, CTA size, vector width,
+   split-K factor, stages, and dynamic shared memory on the actual target;
+6. reject entries with unexplained hot-path local memory or stack traffic, and record the final
+   registers, stack, shared memory, cooperative grid limit, and resident CTAs in an
+   `EntryLaunchEnvelope`;
+7. use a compact static phase loop; keep atomic cursors only for measured imbalance. The measured
+   simple-loop scheduler gain is about 4%, so scheduler refinement follows body/resource repair;
+8. optimize the measured non-linear tail—copies, reductions, RoPE, attention, and pointwise work—
+   after hot linears pass their isolated gates;
+9. eliminate the few microseconds of per-invocation clones/copies through preallocated epoch state
+   and `RUN_INTO`/borrowed-output contracts once the millisecond body gap is closed;
+10. retain a hybrid cuBLAS graph fallback for unsupported shapes, reported separately from strict
+    one-grid results.
 
 A realistic acceptance ladder is:
 
@@ -817,7 +908,8 @@ correctness
   -> isolated owned GEMM >= 80% of cuBLASLt for each hot shape
   -> >= 95% after variant tuning
   -> fused task beats cuBLASLt + separate epilogue
-  -> whole persistent model beats torch.compile on the target workload
+  -> whole generated one-grid model beats the strongest equivalent torch.compile mode
+  -> predeclared cross-model/GPU scorecard demonstrates reliability
 ```
 
 Exact isolated parity is not always necessary. The owned task can win end-to-end by eliminating
@@ -858,11 +950,12 @@ cross-module calls. See [nvJitLink](https://docs.nvidia.com/cuda/nvjitlink/index
 | Desired outcome | Feasible? | Best mechanism | Single persistent grid? | Stability |
 |---|---:|---|---:|---|
 | Change A/B/C on a captured cuBLAS replay | Yes, if node/offset recovery works | GraCE prelude + device node updates | No | Medium, version-test |
+| Extract/bind the captured cuBLAS body into MegaBake using a prelude | **No** | Prelude edits later-node launch parameters only | **No** | Not a supported mechanism |
 | Preserve exact cuBLAS SASS and remove repeated host dispatch | Possibly | Trace once, direct host `CUfunction` launch or graph replay | No | Low/private |
 | Let GPU choose and run exact captured cuBLAS work | Yes in compatible cases | Device-launched graph + tail graph | No | Medium |
 | Launch recovered entry with dynamic parallelism | Experimental | Same-device-link kernel pointer + `cudaLaunchDevice` | No | Very low |
 | Inline unchanged cuBLAS SASS into MegaBake | No supported path | SASS lifting/binary rewriting research | Nominally | Extremely low |
-| Put optimized BLAS math in MegaBake | Yes | cuBLASDx or CUTLASS/CuTe/MPK task | **Yes** | High for owned code |
+| Put optimized BLAS math in MegaBake | Yes | cuBLASDx or MegaBake-owned CUTLASS/CuTe task | **Yes** | High for owned code |
 | Match/exceed cuBLAS on fixed hot shapes | Plausible, not guaranteed | Trace as oracle + autotuned specialized task + fusion | **Yes** | High after validation |
 | Reduce batch-one weight traffic | Yes, under a quantized numerical policy | W8A16/W4A16 prepack + mixed-dtype task | **Yes** | High for owned code; quality-gated |
 | Amortize weight traffic across requests | Yes | Continuous batching + grouped persistent GEMM | **Yes** for owned tasks | High; changes service objective |
@@ -941,7 +1034,7 @@ cleaner than embedding a private cuBLAS image.
 
 Primary sources:
 
-- [GraCE paper and OSDI page](https://www.usenix.org/conference/osdi26/presentation/ghosh)
+- [GraCE paper](https://www.usenix.org/system/files/osdi26-ghosh.pdf) and [OSDI page](https://www.usenix.org/conference/osdi26/presentation/ghosh)
 - [CUDA Runtime Graph API, CUDA 12.8](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-runtime-api/group__CUDART__GRAPH.html)
 - [CUDA Driver execution control](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EXEC.html)
 - [CUDA Driver graph management](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__GRAPH.html)
@@ -958,10 +1051,11 @@ Primary sources:
 - [Nsight Compute profiling guide](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html)
 - [cuBLAS CUDA Graph support](https://docs.nvidia.com/cuda/cublas/index.html#cuda-graphs-support)
 - [cuBLASDx](https://docs.nvidia.com/cuda/cublasdx/)
+- [H200 product bandwidth](https://www.nvidia.com/en-us/data-center/h200/)
+- [H200 MIG profiles](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/supported-mig-profiles.html)
 - [CUTLASS 3.x design](https://developer.nvidia.com/blog/cutlass-3-x-orthogonal-reusable-and-composable-abstractions-for-gemm-kernel-design/)
 - [CUTLASS grouped persistent scheduler](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/grouped_scheduler.html)
 - [CUTLASS Hopper INT4/BF16 example](https://github.com/NVIDIA/cutlass/blob/main/examples/55_hopper_mixed_dtype_gemm/55_hopper_int4_bf16_gemm.cu)
-- [Mirage MPK repository](https://github.com/mirage-project/mirage)
 - [TensorRT-LLM paged attention and in-flight batching](https://nvidia.github.io/TensorRT-LLM/features/paged-attention-ifb-scheduler.html)
 - [TensorRT-LLM attention/XQA](https://nvidia.github.io/TensorRT-LLM/features/attention.html)
 - [NVIDIA matrix-multiplication performance guide](https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html)
@@ -976,15 +1070,13 @@ Useful empirical/research sources, treated as non-contractual:
 
 ## Final answer in one paragraph
 
-GraCE's prelude makes an immutable cuBLAS node *look* as if it accepted pointer-to-pointer arguments
-by storing changing pointers in stable device cells and copying those values into the captured
-node's original parameter slots immediately before execution. The cuBLAS function, signature, SASS,
-resources, and grid never change. A live internal entry and raw ABI may be recovered with graph
-queries or CUPTI and replayed as a frozen host-side research plan, but there is no supported bridge
-from that opaque `CUfunction` to an inline MegaBake device call. A production persistent path must
-use owned cuBLASDx/CUTLASS/CuTe/MPK-style code, specialize M/layout/precision, and tune resources
-against the traced vendor oracle. The larger architecture must then attack the real decode costs:
-streamed weight bytes, resource-wide occupancy, intermediate materialization, phase joins, KV
-traffic, per-call resets/copies, and—under a distinct service contract—lack of multi-token weight
-reuse. GraCE remains a strong hybrid graph-binding technique, not the mechanism that creates
-persistent composability.
+GraCE's prelude copies changing values into an immutable captured node's existing parameter slots;
+the cuBLAS function, signature, SASS, resources, and grid never change. A live entry and raw ABI may
+be recovered with CUPTI/interposition and replayed as a frozen host-side research plan, but there is
+no supported bridge from that opaque `CUfunction` to an inline MegaBake call. In the H200 backend,
+the replacement path is a portfolio of exact-shape cuBLASDx and MegaBake-owned CUTLASS/CuTe bodies. In a
+generic compiler, each target backend supplies its own feature-legal body portfolio, compiles lean
+resource-compatible entries, maps logical work independently from residency, and selects one grid
+per target/model/bucket using exact-device measurements. That grid must beat the target's strongest
+equivalent low-overhead baseline across a predeclared scorecard; a hybrid vendor graph remains
+useful but is not a strict one-grid success.
