@@ -7,7 +7,10 @@ import struct as _struct
 import torch
 from torch.export import export
 
-from megabake.data_types import TaskDesc, OpType, ElemCode, ReduceCode, UopCode, UNUSED_BUFFER, pack_uop
+from megabake.data_types import (
+    TaskDesc, OpType, ElemCode, ReduceCode, UopCode, UNUSED_BUFFER, pack_uop,
+    EPILOGUE_SILU, EPILOGUE_GELU, EPILOGUE_GELU_TANH, EPILOGUE_BIAS, EPILOGUE_RESIDUAL,
+)
 from megabake.schedule_compiler.op_table import ATEN_OP_MAP
 from megabake.schedule_compiler.shape_ops import (
     StridedView, contiguous_strides,
@@ -18,6 +21,7 @@ from megabake.schedule_compiler.shape_ops import (
 from megabake.schedule_compiler.buffer_planner import plan_buffers
 from megabake.schedule_compiler.tiling import compute_tiles
 from megabake.schedule_compiler.serializer import write_schedule
+from megabake.schedule_compiler.inductor_passes import optimize_graph
 
 
 @dataclass
@@ -28,6 +32,7 @@ class CompiledModel:
     output_shape: list[int] = field(default_factory=list)
     num_buffers: int = 0
     folded_constants: dict[int, torch.Tensor] = field(default_factory=dict)
+    unsupported_ops: list[str] = field(default_factory=list)
 
 
 _numel = math.prod
@@ -145,9 +150,9 @@ def _extract_dimensions(op_type: int, node, out_shape: list[int]) -> list[int]:
 
 
 _EPILOGUE_FUSE = {
-    ElemCode.SILU: OpType.MATMUL_SILU,
-    ElemCode.GELU: OpType.MATMUL_GELU,
-    ElemCode.GELU_TANH: OpType.MATMUL_GELU_TANH,
+    ElemCode.SILU: EPILOGUE_SILU,
+    ElemCode.GELU: EPILOGUE_GELU,
+    ElemCode.GELU_TANH: EPILOGUE_GELU_TANH,
 }
 
 
@@ -163,31 +168,85 @@ def _read_counts(tasks: list[TaskDesc]) -> dict[int, int]:
 def _fuse_tasks(
     tasks: list[TaskDesc], buffer_sizes: dict[int, int]
 ) -> list[TaskDesc]:
-    """Fuse adjacent MATMUL + unary ELEMENTWISE into a single fused op."""
+    """Fuse MATMUL + bias ADD + unary activation into fewer tasks via epilogue flags."""
     read_counts = _read_counts(tasks)
 
     fused: list[TaskDesc] = []
-    skip = False
-    for i, task in enumerate(tasks):
-        if skip:
-            skip = False
-            continue
+    i = 0
+    while i < len(tasks):
+        task = tasks[i]
+        consumed = 0
 
-        if (
-            task.op_type == OpType.MATMUL
-            and i + 1 < len(tasks)
-            and tasks[i + 1].op_type == OpType.ELEMENTWISE
-            and tasks[i + 1].op_code in _EPILOGUE_FUSE
-        ):
-            nxt = tasks[i + 1]
-            mid_buf = task.buffer_indices[0]
-            if nxt.buffer_indices[1] == mid_buf and read_counts.get(mid_buf, 0) == 1:
-                task.op_type = _EPILOGUE_FUSE[nxt.op_code]
-                task.buffer_indices[0] = nxt.buffer_indices[0]
-                buffer_sizes.pop(mid_buf, None)
-                skip = True
+        if task.op_type == OpType.MATMUL:
+            j = i + 1
+
+            # Fuse bias: MATMUL → ADD where other input is 1D bias matching N
+            if (j < len(tasks)
+                and tasks[j].op_type == OpType.ELEMENTWISE
+                and tasks[j].op_code == ElemCode.ADD
+                and tasks[j].buffer_indices[2] != UNUSED_BUFFER):
+                nxt = tasks[j]
+                mid_buf = task.buffer_indices[0]
+                if nxt.buffer_indices[1] == mid_buf:
+                    bias_buf = nxt.buffer_indices[2]
+                elif nxt.buffer_indices[2] == mid_buf:
+                    bias_buf = nxt.buffer_indices[1]
+                else:
+                    bias_buf = UNUSED_BUFFER
+
+                if (bias_buf != UNUSED_BUFFER
+                    and read_counts.get(mid_buf, 0) == 1):
+                    bias_bytes = buffer_sizes.get(bias_buf, 0)
+                    N = task.dimensions[1]
+                    if N > 0 and bias_bytes == N * 2:
+                        task.strides[1] |= EPILOGUE_BIAS
+                        task.buffer_indices[3] = bias_buf
+                        task.buffer_indices[0] = nxt.buffer_indices[0]
+                        buffer_sizes.pop(mid_buf, None)
+                        consumed += 1
+                        j += 1
+
+            # Fuse activation: MATMUL → SILU/GELU/GELU_TANH
+            if (j < len(tasks)
+                and tasks[j].op_type == OpType.ELEMENTWISE
+                and tasks[j].op_code in _EPILOGUE_FUSE):
+                nxt = tasks[j]
+                mid_buf = task.buffer_indices[0]
+                if (nxt.buffer_indices[1] == mid_buf
+                    and read_counts.get(mid_buf, 0) == 1):
+                    task.strides[1] |= _EPILOGUE_FUSE[nxt.op_code]
+                    task.buffer_indices[0] = nxt.buffer_indices[0]
+                    buffer_sizes.pop(mid_buf, None)
+                    consumed += 1
+                    j += 1
+
+            # Fuse residual: MATMUL [+bias] [+act] → ADD where other input matches output size
+            if (j < len(tasks)
+                and tasks[j].op_type == OpType.ELEMENTWISE
+                and tasks[j].op_code == ElemCode.ADD
+                and tasks[j].buffer_indices[2] != UNUSED_BUFFER):
+                nxt = tasks[j]
+                mid_buf = task.buffer_indices[0]
+                if nxt.buffer_indices[1] == mid_buf:
+                    res_buf = nxt.buffer_indices[2]
+                elif nxt.buffer_indices[2] == mid_buf:
+                    res_buf = nxt.buffer_indices[1]
+                else:
+                    res_buf = UNUSED_BUFFER
+
+                if (res_buf != UNUSED_BUFFER
+                    and read_counts.get(mid_buf, 0) == 1):
+                    out_bytes = buffer_sizes.get(mid_buf, 0)
+                    res_bytes = buffer_sizes.get(res_buf, 0)
+                    if res_bytes == out_bytes and res_bytes > 0:
+                        task.strides[1] |= EPILOGUE_RESIDUAL
+                        task.buffer_indices[4] = res_buf
+                        task.buffer_indices[0] = nxt.buffer_indices[0]
+                        buffer_sizes.pop(mid_buf, None)
+                        consumed += 1
 
         fused.append(task)
+        i += 1 + consumed
 
     return fused
 
@@ -222,19 +281,23 @@ def _is_fusable_elem(task: TaskDesc) -> bool:
     if task.op_code in _FUSABLE_BINARY:
         if task.buffer_indices[2] == UNUSED_BUFFER:
             return False
-        if task.dimensions[2] != 0 or task.dimensions[3] != 0:
-            return False
         return True
     return False
 
 
 def _fuse_elementwise_chains(
     tasks: list[TaskDesc], buffer_sizes: dict[int, int], sm_version: int,
-    num_sms: int = 0,
-) -> list[TaskDesc]:
+    num_sms: int = 0, next_buffer_id: int = 0,
+) -> tuple[list[TaskDesc], dict[int, list[int]], int]:
     """Fuse consecutive same-numel ELEMENTWISE tasks into a single FUSED_ELEMENTWISE
-    with a micro-op program interpreted on-GPU."""
+    with a micro-op program interpreted on-GPU.
+
+    Returns (tasks, program_buffers, updated_next_buffer_id).
+    program_buffers maps buffer_id → list of packed uint32 uops (overflow beyond 8).
+    """
     read_counts = _read_counts(tasks)
+    prog_bufs: dict[int, list[int]] = {}
+    current_bid = next_buffer_id
 
     chains: list[list[int]] = []
     i = 0
@@ -261,7 +324,7 @@ def _fuse_elementwise_chains(
             i += 1
 
     if not chains:
-        return tasks
+        return tasks, prog_bufs, current_bid
 
     skip_indices: set[int] = set()
     fused_at: dict[int, TaskDesc] = {}
@@ -278,8 +341,9 @@ def _fuse_elementwise_chains(
         buf_to_reg: dict[int, int] = {}
         uops: list[int] = []
         next_reg = 0
+        bc_info_list: list[tuple[int, int]] = []
 
-        def _ensure_loaded(buf: int) -> int:
+        def _ensure_loaded(buf: int, bc_numel: int = 0, bc_repeat: int = 0) -> int:
             nonlocal next_reg
             if buf in buf_to_reg:
                 return buf_to_reg[buf]
@@ -287,7 +351,13 @@ def _fuse_elementwise_chains(
                 buf_to_slot[buf] = len(buffer_slots)
                 buffer_slots.append(buf)
             reg = next_reg; next_reg += 1
-            uops.append(pack_uop(UopCode.LOAD, dst=reg, src1=buf_to_slot[buf]))
+            if bc_numel > 0:
+                bc_idx = len(bc_info_list)
+                bc_info_list.append((bc_numel, bc_repeat))
+                uops.append(pack_uop(UopCode.LOAD_BROADCAST,
+                                     dst=reg, src1=buf_to_slot[buf], src2=bc_idx))
+            else:
+                uops.append(pack_uop(UopCode.LOAD, dst=reg, src1=buf_to_slot[buf]))
             buf_to_reg[buf] = reg
             return reg
 
@@ -295,7 +365,9 @@ def _fuse_elementwise_chains(
             s1_reg = _ensure_loaded(ct.buffer_indices[1])
 
             if ct.op_code in _FUSABLE_BINARY:
-                s2_reg = _ensure_loaded(ct.buffer_indices[2])
+                bc_numel = ct.dimensions[2]
+                bc_repeat = ct.dimensions[3]
+                s2_reg = _ensure_loaded(ct.buffer_indices[2], bc_numel, bc_repeat)
                 dst_reg = next_reg; next_reg += 1
                 uops.append(pack_uop(_ELEM_TO_UOP[ct.op_code],
                                      dst=dst_reg, src1=s1_reg, src2=s2_reg))
@@ -309,12 +381,26 @@ def _fuse_elementwise_chains(
         uops.append(pack_uop(UopCode.STORE, dst=0,
                               src1=buf_to_reg[final_output]))
 
-        if len(uops) > 8 or len(buffer_slots) > 8 or next_reg > 8:
+        if (len(uops) > 32 or len(buffer_slots) > 8 or next_reg > 16
+                or len(bc_info_list) > 5):
             continue
 
         buf_indices = buffer_slots + [UNUSED_BUFFER] * (8 - len(buffer_slots))
         dims = [numel, len(uops)] + [0] * 6
-        strides = uops + [0] * (8 - len(uops))
+
+        # Pack broadcast info into dimensions[3..7]
+        for bi, (bc_n, bc_r) in enumerate(bc_info_list):
+            dims[3 + bi] = (bc_n << 16) | (bc_r & 0xFFFF)
+
+        if len(uops) <= 8:
+            strides = uops + [0] * (8 - len(uops))
+        else:
+            strides = list(uops[:8])
+            overflow = uops[8:]
+            pbid = current_bid; current_bid += 1
+            buffer_sizes[pbid] = len(overflow) * 4
+            prog_bufs[pbid] = overflow
+            dims[2] = pbid
 
         fused_task = TaskDesc(
             op_type=OpType.FUSED_ELEMENTWISE,
@@ -339,7 +425,7 @@ def _fuse_elementwise_chains(
             result.append(fused_at[i])
         else:
             result.append(task)
-    return result
+    return result, prog_bufs, current_bid
 
 
 def _eliminate_redundant_copies(
@@ -754,17 +840,6 @@ def _find_rope_patterns(graph, users=None):
     return patterns
 
 
-def _decompose(ep):
-    decomp_table = torch._decomp.core_aten_decompositions()
-    preserve_ops = [
-        torch.ops.aten.scaled_dot_product_attention.default,
-        torch.ops.aten.silu.default,
-        torch.ops.aten.gelu.default,
-    ]
-    for op in preserve_ops:
-        decomp_table.pop(op, None)
-    return ep.run_decompositions(decomp_table)
-
 
 def compile_model(
     model: torch.nn.Module,
@@ -781,7 +856,7 @@ def compile_model(
         example_args = tuple(example_input)
 
     ep = export(model, example_args, strict=False)
-    ep = _decompose(ep)
+    ep = optimize_graph(ep)
 
     return compile_from_ep(
         ep, sm_version,
@@ -1014,6 +1089,12 @@ def compile_from_ep(
             elif mapping is None:
                 op_name = getattr(target, "__name__", str(target))
                 unsupported_ops.append(op_name)
+                out_meta = node.meta.get("val")
+                if out_meta is not None:
+                    if isinstance(out_meta, (tuple, list)):
+                        out_meta = out_meta[0]
+                    if isinstance(out_meta, torch.Tensor):
+                        alloc_buffer(node.name, [int(s) for s in out_meta.shape], out_meta.dtype)
 
             elif isinstance(mapping, tuple):
                 op_type, op_code = mapping
@@ -1138,6 +1219,7 @@ def compile_from_ep(
                                 bias_arg = node.args[0]
                                 if hasattr(bias_arg, "name") and bias_arg.name in buffer_map:
                                     task.buffer_indices[3] = buffer_map[bias_arg.name]
+                                    task.strides[1] |= EPILOGUE_BIAS
                     else:
                         b_arg = node.args[1] if len(node.args) > 1 else None
 
@@ -1225,12 +1307,20 @@ def compile_from_ep(
 
     if unsupported_ops:
         unique = sorted(set(unsupported_ops))
-        raise RuntimeError(
-            f"Unsupported ATen ops ({len(unique)}): {', '.join(unique)}"
+        import warnings
+        warnings.warn(
+            f"Unsupported ATen ops ({len(unique)}): {', '.join(unique)}. "
+            f"Falling back to eager execution at runtime.",
+            stacklevel=2,
         )
 
     tasks = _fuse_tasks(tasks, buffer_sizes)
-    tasks = _fuse_elementwise_chains(tasks, buffer_sizes, sm_version, num_sms)
+    tasks, prog_bufs, next_buffer_id = _fuse_elementwise_chains(
+        tasks, buffer_sizes, sm_version, num_sms, next_buffer_id)
+    for pbid, uop_data in prog_bufs.items():
+        weight_buffers.add(pbid)
+        weight_names[pbid] = f"__folded__.__uop_prog_{pbid}"
+        folded_weight_tensors[pbid] = torch.tensor(uop_data, dtype=torch.int32).cuda()
     tasks = _eliminate_redundant_copies(tasks, buffer_sizes)
 
     placements, total_workspace = plan_buffers(tasks, buffer_sizes, weight_buffers)
@@ -1255,6 +1345,7 @@ def compile_from_ep(
         output_shape=output_shape,
         num_buffers=next_buffer_id,
         folded_constants=folded_weight_tensors,
+        unsupported_ops=sorted(set(unsupported_ops)),
     )
 
 

@@ -1,5 +1,6 @@
 """Compile CUDA sources into a cubin and launch the megakernel."""
 
+import importlib.util
 import os
 import subprocess
 import tempfile
@@ -10,11 +11,43 @@ from megabake.runtime import get_sm_version
 _CUDA_SRC_DIR = Path(__file__).resolve().parent.parent.parent / "cuda"
 _COMPILED_CACHE: dict[str, str] = {}
 
-_CUTLASS_INCLUDE = Path("/home/devuser/pytorch/third_party/cutlass/include")
-if not _CUTLASS_INCLUDE.exists():
-    _env = os.environ.get("CUTLASS_PATH")
-    if _env:
-        _CUTLASS_INCLUDE = Path(_env) / "include"
+
+def _resolve_cutlass_include() -> Path:
+    """Find a complete CUTLASS/CuTe header tree for nvcc.
+
+    PyTorch binary wheels deliberately do not ship PyTorch's source-tree
+    dependencies. Prefer an explicit override, then the pinned
+    ``nvidia-cutlass`` package installed in the active virtual environment,
+    before retaining the legacy PyTorch-source location for developers who
+    build PyTorch from source.
+    """
+    candidates: list[Path] = []
+
+    if cutlass_path := os.environ.get("CUTLASS_PATH"):
+        candidates.append(Path(cutlass_path) / "include")
+
+    cutlass_spec = importlib.util.find_spec("cutlass_library")
+    if cutlass_spec and cutlass_spec.submodule_search_locations:
+        package_dir = Path(next(iter(cutlass_spec.submodule_search_locations)))
+        candidates.append(package_dir / "source" / "include")
+
+    candidates.extend((
+        Path("/home/devuser/pytorch/third_party/cutlass/include"),
+    ))
+
+    for include_dir in candidates:
+        if (include_dir / "cute" / "tensor.hpp").is_file():
+            return include_dir
+
+    checked = "\n  ".join(str(path) for path in candidates)
+    raise RuntimeError(
+        "CUTLASS/CuTe headers were not found. Install the project's "
+        "requirements, or set CUTLASS_PATH to a CUTLASS checkout containing "
+        "include/cute/tensor.hpp. Checked:\n  " + checked
+    )
+
+
+_CUTLASS_INCLUDE = _resolve_cutlass_include()
 
 
 def _compile_megakernel(force: bool = False, portable: bool = False) -> str:

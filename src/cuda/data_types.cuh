@@ -9,10 +9,22 @@
 #define OP_INDEX        0x06
 #define OP_COPY         0x07
 #define OP_ROPE         0x08
-#define OP_MATMUL_SILU        0x09
-#define OP_MATMUL_GELU        0x0A
 #define OP_FUSED_ELEMENTWISE  0x0B
-#define OP_MATMUL_GELU_TANH   0x0C
+
+#define EPILOGUE_SILU      0x01
+#define EPILOGUE_GELU      0x02
+#define EPILOGUE_GELU_TANH 0x04
+#define EPILOGUE_BIAS      0x08
+#define EPILOGUE_RESIDUAL  0x10
+
+#define SMEM_PAGE_SIZE   (14 * 1024)
+#define SMEM_NUM_PAGES   15
+#define QFLAG_HANDOFF    (1u << 31)
+#define TILE_ID_MASK     0x7FFFFFFFu
+#define DISPATCH_PREFETCHED 0x01
+#define DISPATCH_HANDOFF    0x02
+// Handoff: fixed 4KB region at offset 92KB (safe for both SM80 96KB and SM90 220KB SMEM)
+#define HANDOFF_SMEM_OFFSET (92 * 1024)
 
 // Micro-op codes for fused elementwise interpreter
 #define UOP_LOAD    0x00
@@ -31,7 +43,11 @@
 #define UOP_RSQRT   0x0D
 #define UOP_LOG     0x0E
 #define UOP_ABS     0x0F
-#define UOP_GELU_TANH 0x10
+#define UOP_GELU_TANH      0x10
+#define UOP_LOAD_BROADCAST 0x11
+#define UOP_REDUCE_SUM     0x12
+#define UOP_REDUCE_MAX     0x13
+#define UOP_REDUCE_MEAN    0x14
 
 #define ELEM_ADD          0x00
 #define ELEM_MUL          0x01
@@ -105,6 +121,15 @@ struct __align__(4) WeightMapping {
     uint16_t _pad;
 };
 
+#define CACHE_LINE_INTS 32
+
+struct __align__(16) SMQueueEntry {
+    uint32_t task_id;
+    uint32_t tile_id;
+    uint32_t prefetch_buf_idx;
+    uint32_t prefetch_bytes;
+};
+
 struct ScheduleHeader {
     uint32_t magic;
     uint32_t version;
@@ -119,6 +144,10 @@ struct ScheduleHeader {
     uint32_t sm_version;
     uint16_t compute_dtype;
     uint16_t _padding;
+    uint32_t num_sms;
+    uint32_t max_queue_len;
+    uint32_t num_edges;
+    uint32_t scheduler_type;
 };
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {

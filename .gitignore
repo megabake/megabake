@@ -1,7 +1,9 @@
 /agent_space
+.venv/
 __pycache__/
 *.pyc
 *.egg-info/
 .agents/
 .pytest_cache/
 skills-lock.json
+benchmarks/baselines/

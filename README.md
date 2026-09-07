@@ -36,8 +36,8 @@ Megakernel Launcher        # cuLaunchCooperativeKernel, 1 kernel, all SMs
 
 All SMs execute the same task simultaneously. After each task completes, a
 `cooperative_groups::this_grid().sync()` barrier synchronizes the entire grid
-before the next task begins. This is the same execution model used by
-[Mirage](https://github.com/mirage-project/mirage).
+before the next task begins. MegaBake owns this execution model and its task
+scheduler.
 
 **Matmul: CuTe tensor-core GEMM**
 
@@ -48,31 +48,73 @@ LDSM register fills. Runs on SM80+ (Ampere, Hopper).
 
 ## Benchmarks
 
-Megabake vs `torch.compile` (inductor) on NVIDIA H200 MIG 2g.35gb (32 SMs):
+Megabake vs `torch.compile` (inductor) on NVIDIA H200 MIG 2g.35gb (32 SMs).
+Source of truth: `benchmarks/results.json` (regenerate with `python benchmarks/bench_compare.py --output benchmarks/results.json`).
 
 ```
 Model                megabake     torch.compile   Speedup   Kernels
 -----------------------------------------------------------------
-linear_256x512         68.7us          62.0us       0.90x    1 vs 1
-linear_512x1024        81.7us          69.8us       0.85x    1 vs 1
-mlp_silu              104.7us          95.5us       0.91x    1 vs 3
-mlp_gelu               90.4us         101.5us       1.12x    1 vs 3
-mlp_3layer             94.2us         122.5us       1.30x    1 vs 5
-rmsnorm_mlp           116.4us         113.2us       0.97x    1 vs 4
-layernorm_mlp          95.3us         124.5us       1.31x    1 vs 4
-llama_decoder         272.6us         441.8us       1.62x    1 vs 13
+linear_256x512         61.1us          63.5us       1.04x    1 vs 1
+linear_512x1024        67.7us          68.8us       1.02x    1 vs 1
+mlp_silu                FAIL         101.8us         —       — vs 3
+mlp_gelu               62.5us          95.4us       1.53x    1 vs 3
+mlp_3layer             69.5us         119.6us       1.72x    1 vs 5
+rmsnorm_mlp             FAIL         111.8us         —       — vs 4
+layernorm_mlp           FAIL         114.9us         —       — vs 4
+llama_decoder         129.7us         437.9us       3.38x    1 vs 13
 ```
 
-Megabake's single-kernel advantage compounds with model complexity.
-The llama decoder layer (13 kernels in torch.compile) runs **1.6x faster**.
+Three models fail due to weight-loading bugs (`mlp_silu`: missing `fc1.weight`, `rmsnorm_mlp`/`layernorm_mlp`: missing `norm.weight`).
+On working models, megabake's single-kernel advantage compounds with complexity — the llama decoder layer runs **3.4x faster**.
+
+### Real Model Benchmarks (decode, batch=1, seq=1)
+
+```
+Model                   megabake     torch.compile   Speedup   Kernels
+----------------------------------------------------------------------
+SmolLM2-135M             7238us          6929us       0.96x    1 vs 424
+gemma-2b                28190us          7580us       0.27x    1 vs 256
+```
+
+SmolLM2-135M is near parity (0.96x). gemma-2b is 0.27x -- dominated by matmul (84.8% of megakernel time). Bandwidth utilization is 7.4% (SmolLM2) and 35.6% (gemma-2b) vs theoretical floor.
+
+Per-task profile breakdown (run with `--task-profile`):
+
+| Model | Tasks | MATMUL | MATMUL_SILU/GELU | ATTENTION | REDUCE | Other |
+|-------|-------|--------|-----------------|-----------|--------|-------|
+| SmolLM2-135M | 523 | 78.4% | 11.0% | 1.3% | 2.5% | 6.8% |
+| gemma-2b | 320 | 84.8% | 12.4% | 0.4% | 0.7% | 1.7% |
+
+Matmul dominates both models. Optimization priority: skinny matvec cp.async prefetch (bandwidth), then scheduler (barrier elimination), then attention (tensor cores).
 
 ## Quick start
 
 ```bash
-pip install -e ".[dev]"
+git clone https://github.com/megabake/megabake.git
+cd megabake
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-Requires: Python 3.10+, PyTorch 2.4+, CUDA 12+, CUTLASS headers (ships with PyTorch source or set `CUTLASS_PATH`).
+`requirements.txt` installs all project dependencies into `.venv`, including
+NVIDIA's pinned `nvidia-cutlass` wheel. It supplies the CUTLASS v3.8.0 CuTe
+C++ headers used by MegaBake's CUDA compilation and is discovered
+automatically from the active virtual environment. No `CUTLASS_PATH` export
+or machine-specific PyTorch-source checkout is needed.
+
+NVIDIA GPU. The setup script installs PyTorch 2.6 with CUDA 12.4 support.
+Requires: Python 3.10+, Git, CUDA toolkit 12+ (including `nvcc`), and an
+NVIDIA GPU. The requirements install PyTorch 2.6 with CUDA 12.4 support.
+NVIDIA GPU. The setup script installs PyTorch 2.6 with CUDA 12.4 support.
+
+For an existing CUTLASS checkout, set `CUTLASS_PATH` to its root before
+starting Python. It takes precedence over the project-local dependency:
+
+```bash
+export CUTLASS_PATH=/path/to/cutlass
+```
 
 ```python
 import torch
@@ -91,6 +133,29 @@ output = megabake.run(compiled, model, x)
 python benchmarks/bench_compare.py
 python benchmarks/bench_compare.py --models mlp_silu,llama_decoder
 python benchmarks/bench_compare.py --backend megabake
+```
+
+## Per-task profiling
+
+Profile cycle-level timing for every task inside the megakernel — see which ops dominate, SM utilization per task, and barrier overhead:
+
+```bash
+python benchmarks/test_harness.py mlp_silu --task-profile
+python benchmarks/test_harness.py llama_decoder --task-profile
+python benchmarks/test_harness.py HuggingFaceTB/SmolLM2-135M --mode decode --task-profile
+```
+
+Output shows per-task breakdown (median/max cycles, active/idle SMs, barrier wait) and a summary grouped by op type. Results auto-save to `benchmarks/baselines/<model>_profile.json`.
+
+Profiling can also be used from Python directly:
+
+```python
+import megabake
+from megabake.runtime.profiler import profile_model, analyze, print_report
+
+compiled = megabake.compile(model, x)
+tasks, cycles = profile_model(compiled, model, x)
+print_report(analyze(tasks, cycles), num_sms=32)
 ```
 
 ## Run tests
@@ -131,6 +196,7 @@ src/
       cuda_compiler.py         # nvcc compilation pipeline
       launcher.py              # cuLaunchCooperativeKernel
       loader.py                # Schedule loading + cached execution
+      profiler.py              # Per-task cycle-level profiling
 benchmarks/
   bench_compare.py             # megabake vs torch.compile harness
   models.py                    # Benchmark workload definitions
@@ -155,7 +221,6 @@ tests/
 
 ## Design references
 
-- [Mirage](https://github.com/mirage-project/mirage) -- Multi-level superoptimizer with persistent megakernels (BSP execution model, CuTe GEMM, WGMMA on Hopper)
 - [Luminal](https://github.com/jafioti/luminal) -- ML compiler with cuBLASLt matmul and egglog-based fusion
 
 ## License

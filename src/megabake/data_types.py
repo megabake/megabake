@@ -12,10 +12,14 @@ class OpType(IntEnum):
     INDEX              = 0x06
     COPY               = 0x07
     ROPE               = 0x08
-    MATMUL_SILU        = 0x09
-    MATMUL_GELU        = 0x0A
     FUSED_ELEMENTWISE  = 0x0B
-    MATMUL_GELU_TANH   = 0x0C
+
+
+EPILOGUE_SILU      = 0x01
+EPILOGUE_GELU      = 0x02
+EPILOGUE_GELU_TANH = 0x04
+EPILOGUE_BIAS      = 0x08
+EPILOGUE_RESIDUAL  = 0x10
 
 
 class ElemCode(IntEnum):
@@ -60,7 +64,11 @@ class UopCode(IntEnum):
     RSQRT   = 0x0D
     LOG     = 0x0E
     ABS     = 0x0F
-    GELU_TANH = 0x10
+    GELU_TANH      = 0x10
+    LOAD_BROADCAST = 0x11
+    REDUCE_SUM     = 0x12
+    REDUCE_MAX     = 0x13
+    REDUCE_MEAN    = 0x14
 
 
 def pack_uop(opcode: int, dst: int = 0, src1: int = 0, src2: int = 0) -> int:
@@ -172,7 +180,38 @@ class WeightMapping:
 
 
 SCHEDULE_MAGIC = 0x4D454741  # "MEGA"
-SCHEDULE_VERSION = 1
+SCHEDULE_VERSION = 3
+
+CACHE_LINE_INTS = 32
+
+SMEM_PAGE_SIZE = 14 * 1024
+QFLAG_HANDOFF = 1 << 31
+TILE_ID_MASK = 0x7FFFFFFF
+DISPATCH_PREFETCHED = 0x01
+DISPATCH_HANDOFF = 0x02
+
+
+@dataclass
+class SMQueueEntry:
+    task_id: int = 0
+    tile_id: int = 0
+    prefetch_buf_idx: int = UNUSED_BUFFER
+    prefetch_bytes: int = 0
+
+    STRUCT_FORMAT = "<IIII"
+    STRUCT_SIZE = 16
+
+    def to_bytes(self) -> bytes:
+        return struct.pack(self.STRUCT_FORMAT, self.task_id, self.tile_id,
+                           self.prefetch_buf_idx, self.prefetch_bytes)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "SMQueueEntry":
+        task_id, tile_id, prefetch_buf_idx, prefetch_bytes = struct.unpack(
+            cls.STRUCT_FORMAT, data)
+        return cls(task_id=task_id, tile_id=tile_id,
+                   prefetch_buf_idx=prefetch_buf_idx,
+                   prefetch_bytes=prefetch_bytes)
 
 
 @dataclass
@@ -189,9 +228,13 @@ class ScheduleHeader:
     seq_max: int = 0
     sm_version: int = 0
     compute_dtype: int = 0
+    num_sms: int = 0
+    max_queue_len: int = 0
+    num_edges: int = 0
+    scheduler_type: int = 0
 
-    STRUCT_FORMAT = "<IIIIQ IIIII IHxx"
-    STRUCT_SIZE = struct.calcsize(STRUCT_FORMAT)  # 52
+    STRUCT_FORMAT = "<IIIIQ IIIII IHxx IIII"
+    STRUCT_SIZE = struct.calcsize(STRUCT_FORMAT)
 
     def to_bytes(self) -> bytes:
         return struct.pack(
@@ -200,6 +243,8 @@ class ScheduleHeader:
             self.workspace_bytes, self.num_weight_mappings,
             self.batch_min, self.batch_max, self.seq_min, self.seq_max,
             self.sm_version, self.compute_dtype,
+            self.num_sms, self.max_queue_len, self.num_edges,
+            self.scheduler_type,
         )
 
     @classmethod
@@ -212,4 +257,6 @@ class ScheduleHeader:
             batch_min=vals[6], batch_max=vals[7],
             seq_min=vals[8], seq_max=vals[9],
             sm_version=vals[10], compute_dtype=vals[11],
+            num_sms=vals[12], max_queue_len=vals[13],
+            num_edges=vals[14], scheduler_type=vals[15],
         )

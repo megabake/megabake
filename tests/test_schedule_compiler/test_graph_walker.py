@@ -66,7 +66,7 @@ class TestSimpleModels:
         model = torch.nn.Linear(64, 128).cuda().half().eval()
         x = torch.randn(1, 64, device=DEVICE, dtype=torch.float16)
         data = compile_schedule(model, x, sm_version=90)
-        _, _, _, _, weights = load_schedule(data)
+        _, _, _, _, weights, *_ = load_schedule(data)
         weight_values = list(weights.values())
         assert any("weight" in w for w in weight_values), \
             f"Expected 'weight' in weight names, got: {weight_values}"

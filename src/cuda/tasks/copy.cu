@@ -2,7 +2,7 @@
 #include <cuda_fp16.h>
 
 __device__ void task_copy(const TaskDesc& task, void** buffers,
-                           const int* dyn_dims, int tile_id) {
+                           const int* dyn_dims, int tile_id, uint32_t dispatch_flags) {
     __half* out = (__half*)buffers[task.buffer_indices[0]];
 
     const uint32_t total_elems = task.dimensions[0];

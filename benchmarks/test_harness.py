@@ -10,16 +10,23 @@ Usage:
 
 import argparse
 import statistics
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
+
+# Support direct execution from a source checkout (as documented in README).
+# When this project has not been installed, Python adds ``benchmarks/`` rather
+# than the repository's ``src/`` directory to sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import torch
 import torch.nn as nn
 import torch.profiler
 
 from megabake.integrations.transformers import _CausalLMWrapper
-from megabake.schedule_compiler.graph_walker import _decompose
+from megabake.schedule_compiler.inductor_passes import optimize_graph
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +226,7 @@ def _compile_via_export(model, inputs):
     """Export then compile via inductor — avoids dynamo graph breaks on HF v5."""
     from torch.export import export
     ep = export(model, inputs, strict=False)
-    ep = _decompose(ep)
+    ep = optimize_graph(ep)
     return torch.compile(ep.module(), backend="inductor")
 
 
@@ -432,6 +439,22 @@ def print_results(results: list[Result], display_name: str, model: nn.Module,
 # Main
 # ---------------------------------------------------------------------------
 
+def _run_task_profile(model, inputs, model_name):
+    import megabake
+    from megabake.runtime.profiler import profile_model, analyze, print_report, save_json
+
+    example = inputs[0] if len(inputs) == 1 else tuple(inputs)
+    compiled = megabake.compile(model, example)
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+
+    tasks, cycles = profile_model(compiled, model, *inputs)
+    stats = analyze(tasks, cycles)
+    print_report(stats, num_sms)
+
+    name = model_name.replace("/", "_")
+    save_json(stats, f"benchmarks/baselines/{name}_profile.json")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Megabake test harness: benchmark any model",
@@ -453,6 +476,10 @@ def main():
     parser.add_argument(
         "--backends", type=str, default="eager,torch.compile,megabake",
         help="Comma-separated backends (default: eager,torch.compile,megabake)",
+    )
+    parser.add_argument(
+        "--task-profile", action="store_true",
+        help="Per-task cycle-level profiling inside the megakernel",
     )
     args = parser.parse_args()
 
@@ -483,6 +510,10 @@ def main():
 
     print(f"Loading model: {args.model} ...")
     model, inputs, display_name = load_model(args.model, batch_size, seq_len)
+
+    if args.task_profile:
+        _run_task_profile(model, inputs, args.model)
+        return
 
     eager_ref = None
     results: list[Result] = []

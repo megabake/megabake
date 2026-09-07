@@ -5,8 +5,9 @@ __version__ = "0.1.0"
 import torch
 
 from megabake.schedule_compiler.graph_walker import (
-    compile_model, compile_from_ep, _decompose, CompiledModel,
+    compile_model, compile_from_ep, CompiledModel,
 )
+from megabake.schedule_compiler.inductor_passes import optimize_graph
 from megabake.runtime.loader import execute_model
 
 
@@ -30,7 +31,7 @@ def compile_fx(
     num_sms = props.multi_processor_count
 
     if isinstance(graph, ExportedProgram):
-        ep = _decompose(graph)
+        ep = optimize_graph(graph)
         return compile_from_ep(ep, sm_version, dtype=dtype, num_sms=num_sms)
 
     if isinstance(graph, torch.fx.GraphModule):
@@ -48,7 +49,7 @@ def compile_fx(
         ShapeProp(graph).propagate(*example_args)
 
         ep = torch.export.export(graph, example_args, strict=False)
-        ep = _decompose(ep)
+        ep = optimize_graph(ep)
         return compile_from_ep(ep, sm_version, dtype=dtype, num_sms=num_sms)
 
     raise TypeError(
@@ -77,7 +78,19 @@ def run(
     compiled: CompiledModel,
     model_or_state_dict,
     *inputs: torch.Tensor,
+    task_timings_ptr: int = 0,
 ) -> torch.Tensor:
+    # ponytail: full eager fallback when unsupported ops exist.
+    # graph splitting with segments if partial acceleration matters.
+    if compiled.unsupported_ops:
+        if not isinstance(model_or_state_dict, torch.nn.Module):
+            raise RuntimeError(
+                f"Model has unsupported ops ({', '.join(compiled.unsupported_ops)}) "
+                f"and requires the original model (not a state_dict) for eager fallback."
+            )
+        with torch.no_grad():
+            return model_or_state_dict(*inputs)
+
     if isinstance(model_or_state_dict, dict):
         sd = model_or_state_dict
     else:
@@ -90,4 +103,4 @@ def run(
                     sd[name] = buf
             _cached_state_dict[model_id] = sd
         sd = _cached_state_dict[model_id]
-    return execute_model(compiled, sd, list(inputs))
+    return execute_model(compiled, sd, list(inputs), task_timings_ptr=task_timings_ptr)

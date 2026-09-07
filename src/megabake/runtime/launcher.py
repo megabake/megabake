@@ -49,15 +49,15 @@ def _load_module():
     if err != 0:
         raise RuntimeError(f"cuModuleGetFunction failed with error {err}")
 
-    if get_sm_version() >= 90:
-        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8
-        err = _cuda_driver.cuFuncSetAttribute(
-            _kernel,
-            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            102400,
-        )
-        if err != 0:
-            raise RuntimeError(f"cuFuncSetAttribute failed with error {err}")
+    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8
+    smem_limit = 225280 if get_sm_version() >= 90 else 102400
+    err = _cuda_driver.cuFuncSetAttribute(
+        _kernel,
+        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        smem_limit,
+    )
+    if err != 0:
+        raise RuntimeError(f"cuFuncSetAttribute failed with error {err}")
 
 
 def run_single_task(
@@ -135,31 +135,49 @@ def _launch_cooperative(
     d_buffers_ptr: int,
     d_dyn_dims_ptr: int,
     num_sms: int,
+    task_timings_ptr: int = 0,
+    sm_queues_ptr: int = 0,
+    sm_queue_lens_ptr: int = 0,
+    dep_count_ptr: int = 0,
+    tile_remaining_ptr: int = 0,
+    succ_list_ptr: int = 0,
+    succ_offset_ptr: int = 0,
+    max_queue_len: int = 0,
+    scheduler_type: int = 0,
 ):
     """Launch megakernel via cuLaunchCooperativeKernel."""
     _load_module()
 
-    if get_sm_version() >= 90:
-        smem_bytes = 102400
-    else:
-        default_smem = ctypes.c_int()
-        _cuda_driver.cuDeviceGetAttribute(
-            ctypes.byref(default_smem),
-            8,  # CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK
-            0,
-        )
-        smem_bytes = default_smem.value
+    smem_bytes = 225280 if get_sm_version() >= 90 else 102400
 
     arg_tasks = ctypes.c_void_p(d_tasks_ptr)
     arg_num_tasks = ctypes.c_int(num_tasks)
     arg_buffers = ctypes.c_void_p(d_buffers_ptr)
     arg_dyn_dims = ctypes.c_void_p(d_dyn_dims_ptr)
+    arg_timings = ctypes.c_void_p(task_timings_ptr)
+    arg_sm_queues = ctypes.c_void_p(sm_queues_ptr)
+    arg_sm_queue_lens = ctypes.c_void_p(sm_queue_lens_ptr)
+    arg_dep_count = ctypes.c_void_p(dep_count_ptr)
+    arg_tile_remaining = ctypes.c_void_p(tile_remaining_ptr)
+    arg_succ_list = ctypes.c_void_p(succ_list_ptr)
+    arg_succ_offset = ctypes.c_void_p(succ_offset_ptr)
+    arg_max_queue_len = ctypes.c_int(max_queue_len)
+    arg_scheduler_type = ctypes.c_int(scheduler_type)
 
-    args = (ctypes.c_void_p * 4)(
+    args = (ctypes.c_void_p * 13)(
         ctypes.cast(ctypes.pointer(arg_tasks), ctypes.c_void_p),
         ctypes.cast(ctypes.pointer(arg_num_tasks), ctypes.c_void_p),
         ctypes.cast(ctypes.pointer(arg_buffers), ctypes.c_void_p),
         ctypes.cast(ctypes.pointer(arg_dyn_dims), ctypes.c_void_p),
+        ctypes.cast(ctypes.pointer(arg_timings), ctypes.c_void_p),
+        ctypes.cast(ctypes.pointer(arg_sm_queues), ctypes.c_void_p),
+        ctypes.cast(ctypes.pointer(arg_sm_queue_lens), ctypes.c_void_p),
+        ctypes.cast(ctypes.pointer(arg_dep_count), ctypes.c_void_p),
+        ctypes.cast(ctypes.pointer(arg_tile_remaining), ctypes.c_void_p),
+        ctypes.cast(ctypes.pointer(arg_succ_list), ctypes.c_void_p),
+        ctypes.cast(ctypes.pointer(arg_succ_offset), ctypes.c_void_p),
+        ctypes.cast(ctypes.pointer(arg_max_queue_len), ctypes.c_void_p),
+        ctypes.cast(ctypes.pointer(arg_scheduler_type), ctypes.c_void_p),
     )
 
     stream = torch.cuda.current_stream().cuda_stream
@@ -168,7 +186,7 @@ def _launch_cooperative(
         _kernel,
         num_sms, 1, 1,   # grid
         256, 1, 1,        # block
-        smem_bytes,       # dynamic shared memory (48KB default)
+        smem_bytes,       # dynamic shared memory
         ctypes.c_void_p(stream),
         args,
     )
