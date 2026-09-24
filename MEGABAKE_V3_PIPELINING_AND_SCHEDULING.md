@@ -1,26 +1,30 @@
 # MegaBake V3: pipelining, fusion, movement and progress
 
-Status: normative proposed design, 2026-09-09; no implementation or GPU validation. This document
+Status: normative proposed design, 2026-09-09; backend boundary revised 2026-09-24; no
+implementation or GPU validation. This document
 owns the scheduling/lifetime protocol. [Architecture](MEGABAKE_V3_ARCHITECTURE.md) owns scope,
 [IR](MEGABAKE_V3_IR_AND_REUSE_PLAN.md) owns the plan schema, and
 [performance](MEGABAKE_V3_PERFORMANCE_MODEL.md) owns the quantitative model and ablations.
 
 ## 1. The optimization unit
 
-An operator is too coarse for readiness. A machine instruction is unnecessarily fine for this
-compiler's first backend. Use a **device-body tile with declared stages and footprints**.
-ExecutionPlan represents those stages directly; this is not a fourth program IR.
+An operator is too coarse for readiness. A machine instruction is unnecessarily fine for the
+common planner. Use a **logical body tile with declared capabilities and exact footprints**.
+`LogicalExecutionPlan` represents target-independent actions and conditions;
+`TargetExecutionPlan` binds them to device-body stages and mechanisms. Neither is a general
+machine-instruction IR.
 
 A tile can publish less than an entire tensor, but never more than it has actually computed.
 A load can start before all computation inputs are ready when its own address/data dependencies
 are ready. Output visibility and scratch reuse are different events. These three distinctions
 are the minimum information needed to optimize more than launches.
 
-The first backend supports finite, statically bounded pipelined regions. Templates generate worker
-instruction sequences, or producer/consumer cohorts, from graph structure and shape facts. They
-are not hand-written engines selected by checkpoint name. The barrier-control lowering remains
-available for every supported region. A generic task queue, distributed work stealing, paged
-scratch allocator and multi-token controller are not prerequisites.
+The common planner supports finite, statically bounded pipelined regions. Templates generate
+partial orders, placement relations and producer/consumer cohort requirements from graph structure
+and shape facts. They are not hand-written engines selected by checkpoint name. A backend resolves
+them to target worker programs only when its execution/progress model supports them. The first CUDA
+backend retains a barrier-control lowering for every supported region. A generic task queue,
+distributed work stealing, paged scratch allocator and multi-token controller are not prerequisites.
 
 ## 2. Actions and capability contracts
 
@@ -34,7 +38,7 @@ The names below describe compiler contracts, not existing callable APIs:
 | `reduce_begin(owner)` | Accumulator storage available | Initialized accumulator continuation |
 | `reduce_update(owner, k_chunk)` | This chunk ready; predecessor update complete | Updated, still private accumulator |
 | `reduce_finalize(owner)` | All required chunks incorporated exactly once | Final cast/epilogue and output |
-| `publish(region)` | Writers joined; required stores fully visible | Cross-worker data-ready token |
+| `publish(region)` | Writers joined; required stores visible at the selected target scope | Cross-worker data-ready token |
 | `release(slot)` | Every operation accessing this storage has finished its access | Slot can be overwritten |
 | `join(region)` | All required work, readers and async operations completed | Safe coarse boundary/reuse point |
 
@@ -55,16 +59,18 @@ report states which capability prevents a proposed overlap.
 
 ### Separate completion events
 
-Example: an async shared-to-global store can finish reading its shared source before its global
-destination is ready for a consumer. The former can release source staging; it cannot publish the
-destination. PTX explicitly distinguishes read completion from full bulk-group completion.
+The common rule is that an asynchronous movement can finish accessing its source before its
+destination is visible to a consumer. The former can release source staging; it cannot publish the
+destination. Each adapter supplies distinct completion tokens when its mechanism distinguishes
+these points. In the first CUDA adapter, PTX explicitly distinguishes read completion from full
+bulk-group completion.
 [PTX async bulk wait contract](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-wait-group)
 
 Load completion, MMA completion, output visibility and source retirement can likewise differ.
-Each backend adapter must supply the required joins, barriers and generic/async-proxy ordering
-for its instructions. Device acquire/release atomics alone do not complete an outstanding TMA
-store or make unsafe shared-memory reuse legal. Do not replace an instruction-specific protocol
-with a generic `__syncthreads()` assumption.
+Each backend adapter must supply the required joins, barriers, visibility operations and progress
+rules for its instructions. In CUDA, device acquire/release atomics alone do not complete an
+outstanding TMA store or make unsafe shared-memory reuse legal. Do not replace an
+instruction-specific protocol with a generic barrier assumption.
 
 ## 3. Joint bounded planning
 
@@ -73,13 +79,15 @@ For each recognized region, retain a small menu of alternative semantic covers. 
 1. Enumerate a few compatible bodies and logical tile shapes, including the unfused alternative.
 2. Derive input/output and reduction footprints. Partition outputs by **consumer readiness**:
    complete head groups and hidden K chunks, not arbitrary equal counts of FX nodes.
-3. Choose edge transport: view, local forwarding, global staging, or explicit pure recomputation.
-   Propagate layout requirements; price conversions and duplicate loads.
+3. Choose logical edge transport: view, local forwarding, materialization, collective/remote
+   movement where required, or explicit pure recomputation. Ask the adapter for physical spaces
+   and protocols; propagate layout requirements and price conversions and duplicate loads.
 4. Instantiate bounded schedules: barrier control, weight lookahead, and supported producer/consumer
    overlap. Search only a few cohort splits and staging depths, initially zero/one/two lookahead
    slots where legal; internal body stages are separate and also consume storage.
-5. Allocate storage against the schedule's possible overlap, insert publication/release operations,
-   and check semantic, memory, participation and progress obligations.
+5. Derive logical lifetimes against possible overlap, then ask the adapter to allocate physical
+   storage and insert target publication/release operations. Check semantic, memory, participation
+   and progress obligations in both forms.
 6. Rank by a resource-constrained makespan estimate and uncertainty. Compile a bounded set of
    finalists; use actual entry resources to reject or revise choices. Measure survivors later.
 
@@ -198,13 +206,15 @@ matrix into shared memory, or reusing different layers' distinct weights. A next
 still waits for its preceding reduction/norm. Cross-layer lookahead is an architectural capability
 now, with bounded depth and measured selection, not a promise that every layer boundary hides work.
 
-Start with explicit, fixed staging slots. On supported targets, the adapter can use asynchronous
-global-to-shared transfers; alignment, completion and participating-thread rules remain mandatory.
-An API named async can fall back to synchronous movement for unsupported cases.
+Start with explicit, fixed logical staging slots. A backend binds them to reachable physical spaces
+and may use asynchronous movement; alignment, completion, visibility, participation and capacity
+rules remain mandatory. The first CUDA adapter considers global-to-shared transfers.
+An API named async can fall back to synchronous movement only when the target plan records the
+different mechanism and preserves the logical completion/retirement conditions.
 [CUDA asynchronous copies](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html)
 
-Compare unified loading by compute participants against supported loader/consumer warp roles.
-Dedicated loader warps are a choice with a resource cost, not a universal requirement. CUDA's
+For CUDA, compare unified loading by compute participants against supported loader/consumer warp roles.
+Dedicated loader warps are a target choice with a resource cost, not a logical-plan requirement. CUDA's
 pipeline interface makes stage acquire/release and warp-converged commit behavior explicit.
 [CUDA pipelines](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/pipelines.html)
 
@@ -239,18 +249,21 @@ Allocate against the plan's partial order. Two storage uses may overlay only whe
 executions enforce release-before-reuse. A fast-looking simulated timeline is not a safety proof.
 Conservatively treat incomparable lifetimes as potentially overlapping.
 
-Per-CTA staging accounts for current body internal stages, next-tile lookahead, output stores,
-barriers/metadata, alignment and padding. Accumulators have independent live ranges. A full entry
-reserves its compiled shared/register envelope throughout the launch. Variable logical roles do
-not automatically grant phase-local occupancy or erase registers compiled for another path.
+Physical local staging accounts for current body internal stages, next-tile lookahead, output
+stores, synchronization metadata, alignment and padding. Accumulators have independent live ranges.
+The backend must account for the complete compiled resource envelope under its execution model;
+variable logical roles do not automatically recover physical capacity. In CUDA, this means per-CTA
+staging and a shared/register envelope reserved throughout the launch rather than phase-local occupancy.
 
 Initially:
 
-- Per-CTA preload rings have a small static slot count, explicit release and phase/generation
-  state where slots cycle. Reuse waits for all previous async readers of that slot.
-- Inter-CTA activation chunks use unique addresses during a region; coarse verified joins allow
-  whole-region arena reuse across layers.
-- A later inter-CTA ring needs acknowledgements from **every** consumer, bounded credits and
+- Per-local-group preload rings have a small static slot count, explicit release and phase/generation
+  state where slots cycle. Reuse waits for all previous async readers of that slot. The CUDA
+  realization uses per-CTA storage.
+- Cross-worker activation chunks use unique remotely reachable addresses during a region; coarse
+  verified joins allow whole-region arena reuse across layers. The CUDA realization uses global
+  address-space chunks between CTAs.
+- A later cross-worker ring needs acknowledgements from **every** consumer, bounded credits and
   generation validation. Producer completion alone never permits overwriting a published chunk.
 - Inputs, output retention and session state cannot alias scratch merely because graph execution
   has advanced to the next operator.
@@ -259,11 +272,18 @@ Static slot assignment avoids a general page allocator while capturing bounded o
 release can improve the schedule; it is accepted only when the body exposes a verifiable access
 completion point. This is a performance/correctness interface, not guessed liveness from source.
 
-## 9. Cross-worker publication protocol
+## 9. Cross-worker publication and the first CUDA protocol
 
-This is a conservative initial protocol to implement and test, not a claim of existing verification.
-Use correctly aligned device-scope atomic objects in device memory, in one compatible memory
-synchronization domain. Every event has a finite, checked set of unique producer contributions.
+The logical contract requires a finite checked producer set, destination visibility before
+publication, acquisition before consumption, invocation-safe initialization/generation and a
+separate last-reader condition for reclamation. It does not prescribe atomics, polling, semaphores
+or a particular memory scope. The adapter must choose a mechanism whose scope contains every
+declared producer/consumer and must expose the mechanism's progress requirements.
+
+The following is the conservative first CUDA protocol to implement and test, not a claim of
+existing verification. Use correctly aligned device-scope atomic objects in device memory, in one
+compatible memory synchronization domain. Every event has a finite, checked set of unique producer
+contributions.
 
 1. The session serializes invocations. The new grid initializes its own event counters to zero,
    then every worker reaches a cooperative grid barrier before using them. This work is timed.
@@ -294,20 +314,26 @@ Acyclic tensor dependencies do not prove a schedule deadlock-free. For example, 
 for a consumer assigned behind blocked work on worker B while B waits for a resource held by A.
 An early prefetch can also consume the only slot needed by a prerequisite task.
 
-Verify the augmented ordering/wait-for graph, including worker instruction order, stage ownership,
-resource credits and collective participation. For the initial templates:
+The logical verifier checks the augmented ordering/wait-for graph, including abstract participant
+order, stage ownership, resource credits and collective participation. Target lowering then adds
+physical worker order, primitive participation, placement/residency and backend progress edges and
+checks the combined graph again. A logical proof alone cannot certify a target whose workers or
+collectives do not have the assumed progress behavior. For the initial templates:
 
 - Every blocked consumer has a producer that can run in the admitted resident worker/cohort set.
 - A waiting continuation does not hold a slot needed by that producer; dedicated accumulator
   ownership is included in the capacity proof.
 - Per-worker generated order plus dependency edges has no wait cycle. For cyclic buffer reuse,
   prove the bounded credit protocol or reject the template.
-- Waits occur only at legal stage boundaries. One warp must not wait for a CTA-wide operation
-  that requires that same warp to proceed first.
-- All required cooperative-grid joins occur in a uniform sequence; idle workers do not return
-  early. No ordinary oversubscribed grid is substituted for the validated cooperative launch.
+- Waits occur only at body-declared stage boundaries and cannot prevent required participants from
+  reaching the waited-on operation.
+- All required all-worker joins occur in a backend-legal uniform sequence; workers required by a
+  collective do not exit early.
 
-The CUDA execution model provides eventual progress for threads in a cooperative grid once a
+For the first CUDA lowering, one warp must not wait for a CTA-wide operation that requires that
+same warp to proceed first. All cooperative-grid joins are uniform, idle CTAs do not return early,
+and no ordinary oversubscribed grid substitutes for the validated cooperative launch. The CUDA
+execution model provides eventual progress for threads in a cooperative grid once a
 device thread makes progress; ordinary grids do not provide that same whole-grid guarantee.
 This does not cure a logical circular wait. Use documented atomic/synchronization polling and
 validate the actual cooperative entry's residency and target support.
@@ -315,7 +341,9 @@ validate the actual cooperative entry's residency and target support.
 
 Those CCCL pages are moving `unstable` documentation accessed 2026-09-09, not the project's pinned
 implementation toolchain. Before implementation, verify the applicable contract against the
-selected CUDA/CCCL release. The initial design does not rely on ordinary-grid scheduling fairness.
+selected CUDA/CCCL release. The CUDA design does not rely on ordinary-grid scheduling fairness.
+A future backend must supply and test its own corresponding progress argument; it does not inherit
+CUDA's cooperative-grid guarantee through the common abstraction.
 
 ## 11. Required validation and mechanism evidence
 

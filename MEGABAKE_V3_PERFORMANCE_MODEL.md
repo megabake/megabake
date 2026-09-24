@@ -1,6 +1,7 @@
 # MegaBake V3: performance bounds, budgets and measurement
 
-Status: analysis and proposed protocol, 2026-09-09. All illustrative values below are explicitly
+Status: analysis and proposed protocol, 2026-09-09; backend terminology revised 2026-09-24. All
+illustrative values below are explicitly
 conditional. No V3 GPU latency has been measured.
 
 ## 1. What can and cannot be proved
@@ -22,7 +23,8 @@ lower bound does not prove that an implementation achieving it exists.
 
 ## 2. Model execution first, use break-even accounting second
 
-The primary model is the resource-constrained makespan of ExecutionPlan's action graph:
+The primary model is the resource-constrained makespan of `LogicalExecutionPlan` realized with
+the resources and costs of one `TargetExecutionPlan`:
 
 ```text
 T_m = T_bind + T_entry + T_return
@@ -32,8 +34,8 @@ T_entry = T_initialize_and_join + makespan(actions, dependencies, resources) + T
 Put each cost in exactly one term. Initialization/drain that overlap scheduled work belong inside
 the makespan instead of being charged again. Binding/output costs use the actual ownership contract.
 The action graph includes load, compute/update, publication, retirement and retained joins.
-Resources include worker/cohort capacity, compatible thread roles, live staging/accumulators,
-and shared bandwidth/compute limits. Dependencies include address readiness, data readiness,
+Resources include target worker/cohort capacity, compatible participation roles, live physical
+staging/accumulators, and shared bandwidth/compute limits. Dependencies include address readiness, data readiness,
 reduction order and resource release; different token types cannot be substituted.
 
 There are two useful levels of estimates:
@@ -283,6 +285,10 @@ improvement), with the specific incremental controls that explain the latter. A 
 remains a valid scoped result, but does not satisfy the revised mechanism objective.
 
 ## 7. Measurement protocol
+
+The claim structure is backend-neutral, but the concrete protocol below is for V3's CUDA target.
+A future backend must supply equivalent target-correct timing, completion, counter and baseline
+methods; it cannot reuse CUDA events or stream terminology by analogy.
 
 ### Contract first
 

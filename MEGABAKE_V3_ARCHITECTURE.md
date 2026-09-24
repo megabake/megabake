@@ -1,16 +1,19 @@
 # MegaBake V3 architecture
 
-Status: pipeline-first revision, 2026-09-09; proposed, not implemented or benchmarked. Start with the
+Status: pipeline-first revision, 2026-09-09; backend boundary revised 2026-09-24; proposed, not
+implemented or benchmarked. Start with the
 [document index](MEGABAKE_V3_README.md) and [evidence audit](MEGABAKE_V3_GPU_REANALYSIS.md).
 
 ## 1. Decision
 
-Build a generic FX-to-persistent-kernel compiler that jointly optimizes **math, tile readiness,
+Build a target-extensible FX-to-megakernel compiler that jointly optimizes **math, tile readiness,
 data movement and execution order**. Its output is a tile-level compute-and-movement program,
 not a concatenation of complete operator kernels. Competitive device bodies remain necessary;
 the compiler must also expose the opportunities that a sequence of opaque bodies would hide.
-The first backend targets single-GPU inference with fixed shape buckets and specializes each
-compatible workload/target combination.
+The first and only implementation in this plan is a specialized CUDA backend for single-GPU
+inference with fixed shape buckets. Extensibility means that common semantic/planning contracts do
+not require CUDA execution concepts; it does not add a TPU implementation, a portability release
+gate or a second-target benchmark to the current work.
 
 Four mechanisms are part of the primary architecture: consumer-aligned fusion, staged loads
 across task boundaries, producer/consumer tile overlap, and tail-aware work assignment. Removing
@@ -27,24 +30,37 @@ memory, zero launch cost, or a kernel that stays alive across every generated to
 The initial invocation is **one cached autoregressive step**. A long-lived multi-token controller
 is deferred. The existing uncached sequence-one forward remains a diagnostic benchmark.
 
-## 2. The three representations
+## 2. Compiler representations and the backend boundary
 
 | Representation | New decisions it enables | What it must preserve |
 |---|---|---|
 | Normalized FX + `TensorFacts` | Functionalization, selected decomposition, shape/alias/effect analysis | Original outputs, state transitions, guards, numerical semantics |
 | `SemanticGraph` | FatOp recognition, implementation-independent composites, attention/state distinctions | Executable reference semantics and all live boundary values |
-| `ExecutionPlan` | Body capabilities, tile actions, reduction continuations, readiness/release tokens, transport, placement and launch configuration | SemanticGraph behavior, progress and storage safety under explicit guards |
+| `LogicalExecutionPlan` | Logical tiles/actions, exact footprints, reductions, readiness/release conditions, state effects and schedule constraints | SemanticGraph behavior independent of CUDA thread, memory and launch vocabulary |
+| `TargetExecutionPlan` | Concrete bodies, layouts, memory spaces, movement/synchronization primitives, worker placement and invocation configuration | Logical plan behavior, progress and storage safety for one explicit target/backend |
 
 `SemanticGraph` should initially remain an FX graph using a MegaBake operation dialect plus
 ordinary ATen regions. There is no need for a second graph library or an MLIR infrastructure project.
-The separation is semantic, not a demand for three storage formats.
+The separation is contractual, not a demand for four unrelated graph libraries or one heap object
+per action. The two plan forms may share dataclasses and a candidate record, but the serialized
+boundary must make it impossible for an unresolved logical plan to masquerade as launchable.
 
 `LayerSummary`, `TargetProfile`, candidate records, buffer allocation, resource reports, and
-benchmark results are analyses or plan fields. They are not independent IRs. CUDA/CuTe is the
-backend's existing machine-level representation; a general Tile IR is deferred until another
-backend or transformation demonstrates a concrete need. Tile actions and movement are explicit
-inside ExecutionPlan now; deferring a general instruction-level Tile IR does not defer tiling or
-fine-grained scheduling.
+benchmark results are analyses or plan fields. They are not independent IRs. CUDA/CuTe is the first
+backend's existing machine-level representation. `TargetExecutionPlan` is a checked lowering
+contract, not a new general instruction IR: it may name CUDA bodies and primitives without making
+them legal in `LogicalExecutionPlan`. A universal Tile IR or hardware DSL remains deferred until
+two implemented backends demonstrate transformations that cannot be shared through the logical
+plan and adapter contracts. Backend-neutral tile actions and movement intent are explicit now;
+deferring an instruction-level IR does not defer tiling or fine-grained scheduling.
+
+The boundary is also not a promise that target selection is a single irreversible pass. Body,
+tile, layout and schedule choices remain coupled. The common search asks a `BackendAdapter` for
+body alternatives, legality, resource realization, costs and lowering results; it may revise the
+logical candidate when target feedback rejects or reprices it. Once selected, however, all physical
+choices live in `TargetExecutionPlan`. A future TPU adapter would provide TPU bodies, memory spaces,
+DMA/semaphore rules, mesh placement, code generation and runtime integration without changing FX,
+FatOp semantics, exact footprint analysis or the logical action vocabulary.
 
 Detailed contracts live in [IR and reuse](MEGABAKE_V3_IR_AND_REUSE_PLAN.md).
 
@@ -97,11 +113,13 @@ The precise example is discussed in the [IR document](MEGABAKE_V3_IR_AND_REUSE_P
 
 ## 5. Target knowledge
 
-Use one small `TargetProfile`, populated from CUDA queries and a documented architecture feature
-table, then augmented by optional calibration. Separate legality from cost:
+Use one small backend-qualified `TargetProfile`. The common schema records identity, abstract
+capabilities, address spaces, movement/synchronization mechanisms, topology and provenance. The
+CUDA adapter populates its first implementation from CUDA queries and a documented architecture
+feature table, then augments it with optional calibration. Separate legality from cost:
 
-- Legality: instruction availability, launch limits, cooperative support, memory scope, alignment,
-  and actual compiled resources.
+- Legality: body/instruction availability, invocation and residency limits, synchronization and
+  memory scopes, alignment, topology, and actual compiled resources.
 - Cost: exact-shape/stage latency, joint bandwidth and compute contention, publication cost,
   usable prefetch lead time, tail behavior, and whole-entry composition penalty.
 
@@ -126,7 +144,7 @@ makespan, then compile legal finalists and measure the complete entry. Do not se
 isolated GEMM first and hope it leaves room for a pipeline. Unknown costs retain exploratory
 alternatives; they cannot certify a winner.
 
-One ExecutionPlan has two lowering policies:
+The CUDA `TargetExecutionPlan` has two schedule policies derived from the same logical plan:
 
 - **Barrier control:** complete an operator/region, then a cooperative grid barrier. This provides
   a simple reference and a matched-body control for launch-only composition.
@@ -139,7 +157,7 @@ and small producer/consumer cohorts, not a universal central task queue. The com
 the chosen worker order and buffer credits cannot create a wait cycle. Data-DAG acyclicity alone
 is insufficient. An optional ready-task dispatcher is an extension of this plan, not a second IR.
 
-A cooperative grid contains `P` resident worker CTAs. Logical tiles are independent of `P`; a
+For the CUDA backend, a cooperative grid contains `P` resident worker CTAs. Logical tiles are independent of `P`; a
 60-worker grid may execute thousands. `blockIdx.x` identifies a worker, not a physical SM. All
 workers reach each retained grid join, even if they have no arithmetic in that region. Actual
 compiled resources and cooperative-launch support bound `P` before launch.
@@ -162,15 +180,35 @@ use the same continuation mechanism only with its own supported body and footpri
 The detailed action/lifetime protocol, worked schedules, progress conditions and validation cases
 are normative in [pipelining and scheduling](MEGABAKE_V3_PIPELINING_AND_SCHEDULING.md).
 
-## 7. Device bodies and resource compatibility
+## 7. Backend adapters, device bodies and resource compatibility
 
-The first linear portfolio has a coalesced warp/CTA reduction GEMV and one supported tensor-core
+A backend adapter owns five target-specific boundaries:
+
+1. **Profile:** obtain versioned capabilities, spaces, topology, primitive contracts and measured
+   costs without converting missing facts into support.
+2. **Bodies:** enumerate implementations of logical body capabilities and return exact target
+   participation, layout, scratch, accumulator and stage contracts.
+3. **Legalization/lowering:** realize logical transports, events, buffers, cohorts and joins using
+   target mechanisms, or reject them with a stable reason that the common search can use.
+4. **Code generation and compilation:** emit only selected bodies and the resolved entry, preserving
+   target/toolchain identity and numerical policy in artifact keys.
+5. **Runtime and evidence:** admit and invoke the actual compiled entry, bind state/output ownership,
+   and collect target-correct timing/resource evidence.
+
+The common planner owns semantic coverage, exact logical footprints, producer/consumer and
+reduction dependencies, state/effect order, partial-order lifetimes, bounded candidate search and
+target-independent counterexamples. It must not import a CUDA driver or infer a TPU semaphore.
+Backend adapters must not rewrite unsupported semantics merely to make a target body fit.
+
+The first CUDA linear portfolio has a coalesced warp/CTA reduction GEMV and one supported tensor-core
 family. Evaluate cuBLASDx early as a candidate; use adapted CUTLASS/CuTe where its controls are
 needed. Exact shapes select algorithms. `M=1` alone neither mandates SIMT nor rules out tensor cores.
 
-Code reuse stops below a host launcher. A candidate must declare its participating threads,
-shared storage, scratch lifetime, asynchronous operations, output ownership, and logical tile
+Code reuse stops below a host launcher. A target body must declare its target participation roles,
+physical storage, scratch lifetime, asynchronous operations, output ownership, and logical tile
 interface. It additionally declares atomic-tile, preloadable and/or streamed-reduction capability.
+The neutral capability contract does not call those roles threads/warps or that storage CUDA shared
+memory. The CUDA body provider resolves them to participating threads, warp roles and CTA storage.
 An internal GEMM pipeline does not automatically expose a cross-operator pipeline interface.
 A callable C++ function is not enough if it relies on an incompatible block or scheduler.
 The [kernel reuse document](MEGABAKE_V3_KERNEL_REUSE.md) defines this boundary, including current
@@ -198,18 +236,21 @@ fallback, not a way to meet the single-grid constraint.
 
 ## 8. Storage, fusion, and state
 
-Represent an edge's selected transport as a view, global allocation, CTA-local forwarding, or
-pure recomputation. Global address-space traffic is not automatically physical HBM traffic;
-intermediates can hit L2. Use counters to substantiate physical-byte savings.
+Represent a logical edge's transport requirement as alias/view, materialization, local forwarding,
+remote/collective movement where supported, or pure recomputation. The target plan selects a
+physical space and protocol. In CUDA, global-address-space traffic is not automatically physical
+HBM traffic because intermediates can hit L2. Use target-appropriate counters to substantiate
+physical-byte savings.
 
 Choose tiles with consumers in mind: finish complete head groups, pair corresponding gate/up
 chunks, and preserve useful weight access patterns. A layout that reduces one instruction count
 but scatters the next consumer's loads can lose the end-to-end comparison. Pack stable weights
 at session setup only with explicit space/setup accounting; dynamic activation conversion is timed.
 
-Register/shared-memory forwarding requires compatible ownership and lifetime inside the same
-CTA, or an explicitly supported cluster protocol. A producer finishing on one worker cannot hand
-its registers or CTA shared memory to an arbitrary different worker.
+Local forwarding requires compatible ownership, reachability and lifetime in the target execution
+domain. In CUDA, register/shared-memory forwarding requires the same CTA or an explicitly supported
+cluster protocol; a producer finishing on one worker cannot hand its registers or CTA shared memory
+to an arbitrary different worker. Other backends must state an equivalent concrete restriction.
 
 RMSNorm replication is an option, not a default. Recomputing the norm per logical tile can multiply
 its cost badly for a large vocabulary head. Consider computing the statistic once, retaining the
@@ -284,7 +325,9 @@ The first deliverable is a vertical experiment, not a large compiler framework:
 5. Accept a strict win only after unprofiled end-to-end measurement and complete state validation.
 
 Use whichever suitable GPU becomes available first; the H200 records are priors, not a requirement
-to obtain the same partition. Portability needs a second real target after the first useful result.
+to obtain the same partition. The contracts and source layout preserve a future backend seam, but
+the current success gate remains CUDA-only. A portability claim requires implementing and measuring
+a second backend; neutral names and mocked profiles alone are not portability evidence.
 
 Pipelining is inside the initial vertical path; it is not gated on a static model already winning.
 Once that path is measurable, extend its limiting dimension. Prefill, recurrent state,
@@ -294,10 +337,15 @@ addition needs an observed bottleneck or a stated new workload; none is a univer
 ## 12. Invariants
 
 - Graph semantics do not depend on model names or GPU product strings.
+- Logical plans do not contain CUDA thread hierarchy, address-space names, primitive names or
+  launch fields; those appear only after backend lowering.
+- Every target plan names its backend, target profile, body/provider versions, physical topology,
+  memory spaces, synchronization/movement protocols and invocation contract.
 - Every FatOp has a reference definition; every transformation preserves live outputs and effects.
-- Only compatible device bodies enter a strict entry; no hidden external grids.
+- Only compatible target bodies enter a strict entry; no hidden backend work. CUDA bodies may not
+  hide external or child grids.
 - Logical tiling and worker residency are independent.
-- Resource legality is checked after compilation and before launch.
+- Resource legality is checked after compilation and before target invocation.
 - Buffers are reused according to the selected execution order and asynchronous lifetimes.
 - Publication, scratch release and reduction finalization have distinct, verified meanings.
 - Wait-for progress includes worker order and resource credits, not only tensor dependencies.

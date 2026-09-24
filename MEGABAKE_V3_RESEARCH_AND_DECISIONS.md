@@ -1,7 +1,8 @@
 # MegaBake V3: research provenance and decision ledger
 
-Research date: 2026-09-09; revised for pipeline-first compilation. Repository base:
-`3695f06de14322fd8ac3e111c693612d53b56319`.
+Research date: 2026-09-09; revised 2026-09-24 for an explicit backend boundary. Original source
+audit base: `3695f06de14322fd8ac3e111c693612d53b56319`; portability revision base:
+`e84001d56df1535d5cc9d033cda435bd04f74630`.
 Scope: read-only code/history/reference research plus new V3 documentation. No GPU execution,
 model-weight download, compiler implementation, dependency change or benchmark repair was performed.
 
@@ -70,8 +71,9 @@ Importantly, §6.6 reports a 1.2–1.3x cross-task-pipelining ablation for Qwen3
 layer on B200. That is a **region-level** benefit, not a whole-model prediction. It substantiates
 the opportunity beyond launch removal, while leaving V3's exact body/stage integration untested.
 
-V3 adopts explicit readiness and staged movement in its primary ExecutionPlan, with generated
-bounded schedules rather than requiring the entire MPK runtime. Current source integration is audited in
+V3 adopts explicit readiness and staged movement in its logical and target execution-plan
+contracts, with generated bounded schedules rather than requiring the entire MPK runtime. Current
+source integration is audited in
 [kernel reuse](MEGABAKE_V3_KERNEL_REUSE.md#5-mirage-mpk-useful-device-code-not-a-free-generic-fx-frontend).
 
 ### Stanford Hazy / ThunderKittens megakernel work
@@ -117,6 +119,36 @@ The published PDF and local file are separate artifacts; identical filenames/tit
 establish byte-identical versions. The prior [grace_hack.md](grace_hack.md) was reviewed as project
 analysis, not elevated above the primary API contract.
 
+### Inferact TPU megakernels and the portability boundary
+
+The later [Inferact TPU megakernels repository](https://github.com/Inferact/tpu-megakernels/tree/aa0094ef9add6a1f21b1697fc7371ffccf68e8ea)
+was cloned and source-inspected after the original V3 planning commit. Its single published commit
+postdates the 2026-09-09 plan. It contains Pallas/Mosaic fused decode implementations for a
+multi-host 32-device Kimi configuration and an eight-device Qwen configuration. The kernels use
+explicit HBM/VMEM staging, DMA semaphores, remote copies/collectives, state aliases and target
+layouts. CPU/interpreter tests do not establish TPU lowering, capacity, scheduling or performance,
+as its own README states.
+
+This source is evidence that the semantic ideas behind V3—stateful full-step composition, explicit
+staged movement, bounded scratch, continued reductions and fused collectives—are not inherently
+CUDA-only. It is also evidence against pretending CUDA execution vocabulary is portable: TPU
+TensorCore/mesh placement, VMEM and semaphore/remote-DMA contracts are not warps, CTA shared memory
+or a cooperative grid. The repository is two hand-specialized implementations, not a generic FX
+compiler or a drop-in MegaBake backend.
+
+The distinction is consistent with JAX's primary [TPU pipelining documentation](https://docs.jax.dev/en/latest/pallas/tpu/pipelining.html),
+which describes HBM/VMEM/SMEM and semaphore-tracked movement, and its
+[distributed Pallas documentation](https://docs.jax.dev/en/latest/pallas/tpu/distributed.html),
+which describes mesh placement and remote DMA. These moving APIs would need version pinning and
+device tests before a future adapter; they are architecture evidence, not a V3 dependency.
+
+The resulting design decision is to separate `LogicalExecutionPlan` from backend-qualified
+`TargetExecutionPlan` now, while implementing only CUDA. This is a narrower response than adding a
+universal Tile IR or TPU work to the milestone: it preserves exact actions, footprints and lifetime
+obligations above the adapter and keeps physical bodies, spaces, synchronization, topology,
+codegen and runtime below it. Portability remains unclaimed until a second adapter is implemented,
+verified and measured.
+
 ### vLLM's proposed semantic dialect
 
 The [referenced RFC](https://github.com/vllm-project/vllm/issues/32358) is useful for keeping
@@ -132,9 +164,11 @@ They are not vendored dependencies and are not part of the V3 file changes.
 | Reference | Inspected revision | Source entry |
 |---|---|---|
 | MegaBake | `3695f06de14322fd8ac3e111c693612d53b56319` | Current repository before V3 additions |
+| MegaBake V3 portability revision base | `e84001d56df1535d5cc9d033cda435bd04f74630` | V3 planning commit before this documentation edit |
 | Luminal | `d18376d184172616ab3980309f524299a02595ef` | [Pinned tree](https://github.com/luminal-ai/luminal/tree/d18376d184172616ab3980309f524299a02595ef) |
 | Mirage | `17e9e36de583fe26a55be3fa0a6030f5c56a34d8` | [Pinned tree](https://github.com/mirage-project/mirage/tree/17e9e36de583fe26a55be3fa0a6030f5c56a34d8) |
 | Hazy Megakernels | `7309cec801537b61fea3b50d7dfe454a6cde578e` | [Pinned tree](https://github.com/HazyResearch/Megakernels/tree/7309cec801537b61fea3b50d7dfe454a6cde578e) |
+| Inferact TPU megakernels | `aa0094ef9add6a1f21b1697fc7371ffccf68e8ea` | [Pinned tree](https://github.com/Inferact/tpu-megakernels/tree/aa0094ef9add6a1f21b1697fc7371ffccf68e8ea) |
 | PyTorch flow/IR | `v2.6.0` | [Inductor source](https://github.com/pytorch/pytorch/tree/v2.6.0/torch/_inductor) |
 | cuBLASDx pipeline/requirements | `0.7.1` docs | [Versioned requirements](https://docs.nvidia.com/cuda/cublasdx/0.7.1/requirements_func.html) |
 | MPK paper | `2512.22219v1` | [Versioned paper](https://arxiv.org/html/2512.22219v1) |
@@ -167,7 +201,7 @@ research references, not evidence that the historical toolkit supports every doc
 | D02 | Handoff in normalized FX before GraphLowering | Pinned source; later IR is not optimized ATen | A concrete later pass provides essential reusable value |
 | D03 | FatOps within FX with reference expansions | Semantic selection without another graph framework | FX cannot express a required transformation cleanly |
 | D04 | LayerSummary is analysis, not mandatory IR | Layer names alone add no executable semantics | Structured iteration/state transformation is needed |
-| D05 | TargetProfile separates legality from measured costs | APIs/manuals do not reveal achieved performance | A new backend needs a genuinely richer model |
+| D05 | Backend-qualified TargetProfile separates legality from measured costs | APIs/manuals do not reveal achieved performance | Two implemented backends require a richer shared property model |
 | D06 | Primary bounded pipelined regions; barrier entry is a control | User objective and concrete source mechanisms; old queue/static timing is not a pipeline ablation | Measurements select a coarse schedule for a particular cell |
 | D07 | Explicit tile stages, readiness and reduction footprints now | Consumers can start on partial tensor regions; movement can start on address readiness | Never remove without replacing the information |
 | D08 | Logical tiles independent of worker residency | Current source conflates them; shape evidence contradicts it | Fundamental invariant, not a tuning preference |
@@ -183,6 +217,9 @@ research references, not evidence that the historical toolkit supports every doc
 | D18 | Static staging slots and region-owned activation chunks initially | Bounded overlap without a general page allocator or multi-consumer ring | Storage pressure measurably warrants finer reclamation |
 | D19 | First block tests all three pipeline patterns, with controlled ablations | One-grid count does not establish non-launch benefits | Never label an untested mechanism a success |
 | D20 | Progress proof includes worker order, resources and cooperative support | Data-DAG acyclicity alone is insufficient | Fundamental legality requirement |
+| D21 | Split logical and target execution plans; keep search jointly target-aware | TPU source confirms common action/lifetime ideas but incompatible physical execution vocabulary | The split duplicates decisions without enforcing a boundary |
+| D22 | Define a narrow BackendAdapter now; implement only CUDA in V3 | Avoid CUDA leakage without expanding the first performance experiment | A second implemented backend needs a richer proven contract |
+| D23 | Portability is not a V3 success claim | Neutral schemas and mocks do not establish another compiler/runtime/device path | A second backend passes device correctness and measurement gates |
 
 ## 6. Alternatives deliberately deferred
 
@@ -190,7 +227,7 @@ research references, not evidence that the historical toolkit supports every doc
 |---|---|---|
 | Full Inductor loop-IR interception | Inherits lowering choices and loses easy high-level semantics | Reuse a specific proven pass through an adapter |
 | Standalone Layer IR | No required new transformation yet | Structured repeated/stateful regions |
-| General Tile IR / hardware DSL | Adds backend infrastructure before math viability is known | Multiple targets/languages needing common transformations |
+| General instruction-level Tile IR / hardware DSL | Logical/target plan split supplies the present seam without modeling either ISA | Two implemented backends expose shared instruction-level transformations that adapters cannot express cleanly |
 | Mandatory equality saturation | Larger optimizer than the first candidate set needs | Complex overlapping rewrite search |
 | MPK's full queue/runtime and general allocator | Bounded V3 stages/events already supply initial overlap | Measured dynamic imbalance or storage limits beyond static templates |
 | Mandatory hybrid planner and GraCE binding layer | Does not solve current strict body deficit | Product fallback with costly dynamic bindings |
@@ -224,11 +261,12 @@ The main idea is sound as a research direction: keep generic graph semantics, re
 computations, and compose high-quality device implementations with better coordination. The
 current evidence does not establish that a universal megakernel beats a strong compiled baseline.
 
-The recommended simplification is three representations and one compute-and-movement plan with
-bounded schedule templates. It is **not** removing the stage/readiness information needed for
-megakernel benefits. FatOps supply semantic choices; joint planning and stage-capable bodies turn
-those choices into useful fusion and overlap. Extra hierarchy, binary extraction and a large
-release framework do not substitute for either competitive math or effective execution.
+The recommended simplification is two semantic compiler representations followed by logical and
+target forms of one compute-and-movement plan with bounded schedule templates. It is **not**
+removing the stage/readiness information needed for megakernel benefits or inserting an unrelated
+graph IR. FatOps supply semantic choices; joint planning and stage-capable target bodies turn those
+choices into useful fusion and overlap. Extra hierarchy, binary extraction and a large release
+framework do not substitute for either competitive math or effective execution.
 
 ## 9. What this revision corrects
 
@@ -243,11 +281,18 @@ head-ready attention, streamed gated MLP and weight-lookahead designs with expli
 conditions. The performance model adds action-level calculations, optimized controls, interference
 and conditional size/rate scenarios. None is described as implemented or GPU-validated.
 
+The 2026-09-24 portability revision additionally separates logical obligations from physical
+target realization, generalizes the TargetProfile contract, and moves CUDA source/compiler/runtime
+ownership behind a named adapter. It deliberately leaves all device milestones and performance
+gates CUDA-only. The Inferact TPU source motivates the seam; it is not incorporated code or TPU
+support in MegaBake.
+
 The remaining uncertainty is profitability and implementation correctness, not whether these
 mechanisms have an architectural home. That is the strongest conclusion the present evidence
 supports without manufacturing performance results.
 
-Documentation checks for this revision covered all 11 V3 files: local link targets and V3 section
-anchors, pinned source paths against the three research checkouts, fenced-block balance, whitespace,
-and recomputation of the numerical examples/tables. These are documentation/analysis checks, not
-GPU tests, a rendered-diagram test or a formal proof of the proposed implementation.
+The original 2026-09-09 revision recorded checks over all 11 V3 files, the three original research
+checkouts and the numerical examples/tables. The 2026-09-24 backend-boundary revision rechecked its
+changed local links/anchors, fenced-block balance and whitespace, and pinned the separately cloned
+TPU repository revision. These are documentation/analysis checks, not GPU/TPU tests, a
+rendered-diagram test or a formal proof of the proposed implementation.

@@ -1,6 +1,6 @@
 # MegaBake V3: hardware facts without a hardware-discovery project
 
-Status: proposed, 2026-09-09. No device was queried or benchmarked for V3.
+Status: proposed, 2026-09-09; backend boundary revised 2026-09-24. No device was queried or benchmarked for V3.
 
 ## 1. Verdict on the DFS idea
 
@@ -9,16 +9,19 @@ Traversal requires an existing graph. CUDA exposes some properties, manuals desc
 features, and experiments reveal achieved costs. None exposes a universal complete hierarchy with
 all bandwidths and latencies attached.
 
-Use a compact `TargetProfile`. Represent only facts that change legality, tiling, residency,
-movement or a measured cost. A relational table plus a few scope/movement edges is sufficient.
+Use a compact backend-qualified `TargetProfile`. Represent only facts that change legality, tiling,
+placement/residency, movement, synchronization or a measured cost. The common schema does not
+assume an SM, warp, CTA or cooperative CUDA launch. A relational table plus a few scope/movement
+edges is sufficient. Each backend populates it through a versioned adapter. V3 implements only the
+CUDA adapter; the abstraction is an extension seam, not evidence of another working target.
 Do not build a general chip reverse-engineering framework before compiling a decoder step.
 
 ## 2. Three classes of facts
 
 | Class | Examples | Source | May prune legality? |
 |---|---|---|---|
-| Queried capability | Visible SM count, shared-memory limits, cooperative support, compute capability | CUDA runtime/driver | Yes, subject to API meaning |
-| Documented feature | Instruction family, synchronization scope, TMA/cluster restrictions | Versioned architecture/ISA documentation | Yes, with precise target gating |
+| Queried capability | Compute resources, local-memory limits, topology, supported invocation mechanisms | Backend runtime/compiler API | Yes, subject to API meaning |
+| Documented feature | Body/instruction family, synchronization scope, movement and collective restrictions | Versioned architecture/ISA/backend documentation | Yes, with precise target gating |
 | Calibrated cost | Shape latency, achieved bandwidth, barrier cost, composition penalty | Experiment with provenance | No: selects/ranks, not a correctness proof |
 
 Unknown costs remain `UNKNOWN`. A documented peak is not a measurement. A historical result from
@@ -29,18 +32,27 @@ carry their assumptions and may not be presented as predicted measured performan
 
 ```text
 TargetProfile {
-  identity: GPU name, compute capability, device/MIG identity when available,
-            visible SM count, driver, toolkit, compiler and library versions,
-  capabilities: threads/warps/blocks, register and shared-memory limits,
-                cooperative launch, supported MMA/TMA/cluster/TMEM mechanisms,
-  spaces: register, CTA_shared, global, optional_cluster_shared, optional_TMEM,
-  movements: supported copies/loads and their required scopes/protocols,
+  identity: backend, target kind/version, visible partition/topology,
+            runtime, compiler and body-provider versions,
+  execution_domains: participant/group/device/mesh domains and capacities,
+  capabilities: supported body, invocation, movement, synchronization and collective mechanisms,
+  spaces: stable IDs with reachability, capacity/alignment and access restrictions,
+  movements: supported source/destination edges, issuers and required scopes/protocols,
+  synchronization: supported scopes, participation, ordering, visibility and progress contracts,
+  topology: addressability, collective/remote links and backend-visible placement constraints,
   contention_domains: shared bandwidth/issue resources relevant to chosen actions,
-  stage_requirements: copy/MMA/store completion, proxy ordering, descriptor lifetime,
+  stage_requirements: operation completion, source retirement, destination visibility and descriptor lifetime,
   costs: [experiment_key, value, unit, conditions, uncertainty, provenance],
   source_versions, unknown_fields
 }
 ```
+
+Profiles use backend-owned stable identifiers such as `cuda:cta_shared`; the common planner treats
+them as opaque spaces with declared properties. It may compare reachability, capacity and movement
+edges, but must not branch on spelling such as `shared`, `VMEM` or a numeric architecture suffix.
+Logical target requirements request properties—local cooperative storage, an asynchronous copy
+with distinct completion/retirement, a collective group—not a CUDA primitive name. The adapter
+either binds those requirements to precise mechanisms or rejects the candidate.
 
 Global memory is an address space. HBM/DRAM and L2 are physical parts of the memory system. Registers
 are not a universally addressable cache tier. Texture/constant paths, shared/L1 partitioning and
@@ -51,7 +63,9 @@ participants, alignment, descriptor prerequisites, completion scope and source-r
 Bandwidth-sharing domains are a small cost-model annotation, not an automatically discovered
 microarchitecture. An async engine does not provide independent unlimited memory bandwidth.
 
-| Storage/resource | Ownership and relevant use | Important restriction |
+The first CUDA profile instantiates the common schema with these resources:
+
+| CUDA storage/resource | Ownership and relevant use | Important restriction |
 |---|---|---|
 | Registers | Thread/warp computation and accumulators | Allocation/liveness can limit residency; spills use local memory |
 | CTA shared memory | Cooperative tiles and async staging | Not accessible from arbitrary other CTAs |
@@ -64,7 +78,15 @@ Facts about tensor memory are not generalizable to every GPU marketed as Blackwe
 and target-specific support, as illustrated by the
 [tcgen05 programming documentation](https://docs.nvidia.com/cutlass/4.5.2/media/docs/pythonDSL/mma_docs/tcgen05_programming.html).
 
-## 4. Obtain only what the planner uses
+## 4. Backend discovery and CUDA realization
+
+The common discovery interface accepts an explicit backend/target selection, records absent facts
+as unknown and never changes the active device as a side effect. It is lazy so CPU-only planning
+does not load CUDA. Offline profiles use the same schema and provenance rules. Cache keys include
+the backend ID and exact target identity; similarly named resources from two backends are never
+assumed compatible.
+
+For the first CUDA implementation, obtain only what the planner uses.
 
 At session/device initialization, query documented properties and attributes, including visible
 SMs, compute capability, block/thread limits, shared-memory opt-in limits, register limits and
@@ -96,7 +118,7 @@ stages, next-task preloads, delayed output stores and metadata can require simul
 storage. Measure the complete role mixture; neither `max(isolated_smem)` nor a per-phase occupancy
 estimate is a sufficient composition model. See [storage and progress](MEGABAKE_V3_PIPELINING_AND_SCHEDULING.md).
 
-## 5. Architecture distinctions worth encoding
+## 5. CUDA architecture distinctions worth encoding
 
 | Target family | Facts that can change a candidate | V3 consequence |
 |---|---|---|
@@ -116,6 +138,15 @@ toolchain compatibility. Do not create an architecture suffix or assume every la
 supports every earlier architecture-specific instruction. Unsupported compilation is a clear
 candidate rejection, not a silently degraded unknown body.
 
+A future non-CUDA adapter must provide equivalent facts rather than emulate this table by analogy.
+At minimum it must identify its compute/group/mesh domains, locally and remotely reachable spaces,
+layout restrictions, async movement issuers and completion semantics, synchronization and collective
+participation scopes, invocation admission rules, compiler resource reports, and runtime ownership.
+For example, a TPU adapter would need to model HBM/VMEM/SMEM and semaphore-backed DMA/remote-copy
+contracts as their own mechanisms; it must not rename VMEM to CUDA shared memory or pretend a TPU
+mesh barrier is a cooperative-grid barrier. Such an adapter is deliberately outside the first
+implementation ledger.
+
 ## 6. H200 MIG: what the historical profile tells us
 
 The latest V2 report describes 60 visible SMs in `3g.71gb`; older tracked JSON describes 32 visible
@@ -134,6 +165,9 @@ restriction for the [persisting-L2 set-aside](https://docs.nvidia.com/cuda/cuda-
 Ordinary L2 caching still matters; disabling this set-aside does not mean every access goes to HBM.
 
 ## 7. The minimum useful calibration set
+
+The following set is for the first CUDA backend. Another backend keeps the provenance and
+whole-entry principles but substitutes its own invocation, synchronization and counter mechanisms.
 
 1. Exact hot linear shapes at matched dtype/layout, with both standalone and persistent-composed
    versions. Record the cache/weight working set.
@@ -161,7 +195,7 @@ step stays unresolved. V3 can specify a legal candidate without claiming it achi
 
 ## 8. Cache keys and offline use
 
-Correctness/legality keys include graph semantics, guards, dtype/layout, target feature set,
+Correctness/legality keys include graph semantics, guards, dtype/layout, backend and target feature set,
 numerical flags, selected body versions and toolchain ABI. Performance keys additionally include
 workload bucket, visible resource profile, relevant clock/power conditions and experiment settings,
 body mixture, layout, cohort assignment and pipeline depth. Changing those invalidates associated
@@ -170,7 +204,7 @@ Device identity is useful provenance; it need not force recompilation across dem
 devices. A new resource profile does require rechecking launch legality and invalidates old tuning
 assumptions where applicable.
 
-Without a GPU, emit a source/plan report with unresolved costs. If a suitable toolkit is present,
+Without a GPU, the CUDA adapter emits a source/plan report with unresolved costs. If a suitable toolkit is present,
 cross-compilation can test syntax and some resource constraints; it cannot establish runtime
 correctness, actual occupancy behavior or latency. V3 performs no such new GPU validation.
 

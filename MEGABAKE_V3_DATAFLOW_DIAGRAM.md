@@ -1,6 +1,7 @@
 # MegaBake V3: architecture and dataflow diagrams
 
-Status: pipeline-first proposal, 2026-09-09; not implemented. These diagrams summarize the contracts in
+Status: pipeline-first proposal, 2026-09-09; backend boundary revised 2026-09-24; not implemented.
+These diagrams summarize the contracts in
 [architecture](MEGABAKE_V3_ARCHITECTURE.md) and [IR](MEGABAKE_V3_IR_AND_REUSE_PLAN.md).
 
 ## 1. End-to-end compiler
@@ -9,16 +10,19 @@ Status: pipeline-first proposal, 2026-09-09; not implemented. These diagrams sum
 flowchart TD
     A[FX or ExportedProgram] --> B[Normalize and collect TensorFacts]
     B --> C[SemanticGraph: FatOps and reference regions]
-    C --> D[Joint body, fusion, tile, transport and schedule candidates]
-    T[TargetProfile: capabilities and measured costs] --> D
+    C --> D[Logical body, fusion, tile, transport and schedule candidates]
     C -. analysis .-> L[LayerSummary]
     L -. reuse templates and tuning .-> D
-    D --> E[ExecutionPlan: staged actions, readiness, reductions and storage]
-    E --> V[Verify semantics, lifetimes, participation and progress]
-    V --> F[Generate bounded pipelined entry and barrier control]
+    D --> E[LogicalExecutionPlan: actions, footprints, reductions and lifetime constraints]
+    E --> V[Verify semantic coverage and logical obligations]
+    T[Backend-qualified TargetProfile] --> Q[Backend body options, legality and cost]
+    V --> Q
+    Q --> P[TargetExecutionPlan: bodies, spaces, protocols, placement and invocation]
+    P --> W[Verify target participation, storage and progress]
+    W --> F[Backend codegen: CUDA first]
     F --> G[Compile and inspect actual resources]
     G --> H{Legal and correct?}
-    H -->|no| D
+    H -->|no: revise bounded candidate| D
     H -->|yes| I[Measure mechanisms and strongest equivalent baseline]
     I --> J[Select measured artifact or explicit fallback]
     I -. empirical costs .-> T
@@ -28,9 +32,11 @@ Candidate enumeration is bounded. Exhaustion returns an explanation or fallback;
 is not an instruction to search indefinitely. Without a GPU, compilation may be possible but the
 measurement edge remains unavailable and no winner is asserted.
 
-Three representations remain: normalized FX, SemanticGraph and ExecutionPlan. The staged action
-graph is inside ExecutionPlan; TargetProfile and LayerSummary stay side analyses. Body, tiling
-and schedule choices are coupled until selection, not finalized in separate irreversible passes.
+Normalized FX and SemanticGraph retain semantic meaning. The execution-plan boundary has a logical
+form and a backend-resolved target form; TargetProfile and LayerSummary stay side analyses. The
+adapter participates in bounded joint search, so the diagram does not imply that logical body,
+tiling and schedule choices are finalized without target feedback. Only an admitted target plan is
+invocable. CUDA is the only adapter implemented by this proposal.
 
 ## 2. Inductor reuse boundary
 
@@ -41,7 +47,7 @@ flowchart LR
     B -. separate baseline path .-> D[Inductor GraphLowering]
     D --> E[Loop and buffer IR]
     E --> F[Scheduler and backend codegen]
-    C --> G[MegaBake ExecutionPlan and codegen]
+    C --> G[MegaBake logical plan, target lowering and codegen]
 ```
 
 This is a proposed adapter boundary, not a claim that PyTorch exposes a public “all optimization
@@ -59,7 +65,7 @@ flowchart TD
     V --> B[Tensor-core device body]
     V --> C[Composite body]
     V --> D[External fallback kernel]
-    A --> P[Strict ExecutionPlan candidates]
+    A --> P[Backend-qualified target-plan candidates]
     B --> P
     C --> P
     D --> X[Separately reported fallback or graph baseline]
@@ -68,7 +74,7 @@ flowchart TD
 A semantic match never forces one algorithm. An external candidate does not enter an owned
 persistent grid merely because its operation matches the FatOp.
 
-## 4. Two schedules, one execution-plan contract
+## 4. Two CUDA schedules from one logical contract
 
 ```text
 Host: bind inputs and state -> launch one cooperative grid -> retain valid outputs
@@ -89,8 +95,9 @@ The sketch shows dependencies, not scaled durations or guaranteed overlap. Cohor
 mixed static worker programs are candidates; compare an optimized phase assignment too. A fixed
 graph can execute asynchronously without a universal ready-task queue.
 
-Logical tile count can greatly exceed worker count. Every worker reaches each retained grid join,
-including workers without arithmetic there. Actual compiled resources bound the cooperative grid;
+Logical tile count can greatly exceed worker count. In the CUDA target plan, every worker reaches
+each retained grid join, including workers without arithmetic there. Actual compiled resources
+bound the cooperative grid;
 workers are not pinned to physical SMs. All coexisting stages/accumulators count against the common
 entry envelope. See [runtime legality](MEGABAKE_V3_PIPELINING_AND_SCHEDULING.md#10-forward-progress-is-part-of-legality).
 
@@ -174,7 +181,8 @@ and workspace or another explicit ownership protocol.
 | Input | What it may decide | What it cannot establish |
 |---|---|---|
 | FX and reference execution | Semantics, shapes, effects | Best device algorithm |
-| CUDA queries and documentation | Feature/launch legality | Achieved bandwidth or speedup |
+| Backend profile and documentation | Target feature/invocation legality | Achieved bandwidth or speedup |
+| CUDA profile/query realization | SM/CTA/cooperative-grid legality for the first backend | Legality on another backend |
 | Exact-shape microbenchmarks | Candidate quality under recorded conditions | Whole-entry performance |
 | Joint stage/pair experiments | Lead time, contention and useful bounded overlap | All shapes or whole-model speedup |
 | Compiled resource report | Actual register, stack and shared-storage requirements | Correctness or a speed win |

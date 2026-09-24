@@ -1,11 +1,13 @@
 # MegaBake V3: reuse good math, not opaque launches
 
-Research date: 2026-09-09. This is a source-backed design assessment; no library adapter was
-implemented or benchmarked. See [research provenance](MEGABAKE_V3_RESEARCH_AND_DECISIONS.md).
+Research date: 2026-09-09; contract revised 2026-09-24. This is a source-backed assessment of the
+first CUDA body provider; no
+library adapter was implemented or benchmarked. Other backends need their own body-source audit.
+See [research provenance](MEGABAKE_V3_RESEARCH_AND_DECISIONS.md).
 
 ## 1. The decisive boundary
 
-The strict backend needs a computation that the threads of its existing grid can execute.
+The strict CUDA backend needs a computation that the threads of its existing grid can execute.
 A host-callable library API, a launchable kernel handle and a device-callable tile routine are
 three different interfaces.
 
@@ -216,35 +218,51 @@ specific implementation before copying an interface or quoting a performance res
 V3 borrows the useful separation, not a mandatory equality-saturation engine. A bounded candidate
 set is enough to test the current hypothesis. More general search needs an observed limitation.
 
-## 7. The MegaBake device-body contract
+## 7. Logical capability and target-body contracts
 
-The proposed adapter must declare:
+The common planner requests a `LogicalBodyCapability` containing semantic support, numerical
+policy, logical output/reduction footprints, legal stage boundaries, ownership constraints and the
+capability set (`ATOMIC_TILE`, `PRELOADABLE`, `STREAM_REDUCTION`, `EARLY_RELEASE`). It contains no
+thread count, CUDA storage class, instruction family or library descriptor. A backend body provider
+returns `TargetBodySpec` alternatives that realize that capability.
+
+Every target-body adapter must declare:
 
 ```text
 semantics and numerical policy
 supported target features and toolchain/library versions
 shape/layout/alignment/tail guards
 logical output tile and complete read/reduction footprint
-required block shape and participating thread/warp roles
+required target participation domain and roles
 capabilities: atomic tile, separate preload, reduction continuation, early release
-register-accumulator and shared-scratch lifetime requirements
+physical accumulator and local-scratch lifetime requirements
 host descriptors, addresses, workspace and setup lifetime
 stage preconditions; issued/completed async operations; source retirement points
 accumulator initialization/update/finalization and numerical-order contract
-output ownership, publication scope, resource release and collective participation
+output ownership, target publication scope, resource release and collective participation
 ```
 
-It must not secretly launch child grids, allocate unaccounted storage, assume `blockIdx` is its
-logical tile index, or leave **untracked** operations accessing scratch after a stage returns.
+For the CUDA provider, target participation resolves to block shape and thread/warp roles; local
+scratch resolves to registers/shared memory; publication and collectives resolve to supported CUDA
+scopes and primitives. The selected CUDA source libraries in §§2–6 are candidates for this provider,
+not dependencies of the common planner. A future backend supplies separate bodies and mechanisms
+against the same logical capabilities rather than wrapping CUDA bodies or translating their thread
+contract literally.
+
+No target body may secretly launch child work, allocate unaccounted storage, bind a target worker
+identifier directly to a logical tile, or leave **untracked** operations accessing scratch after a
+stage returns. In the CUDA provider this specifically forbids hidden child grids and assuming
+`blockIdx` is the logical tile index.
 For an atomic tile, its declared accesses are drained at return. A staged body transfers explicit
 operation/lifetime tokens to the enclosing generated program; those tokens cannot be discarded.
-It cannot
-require an incompatible number of threads just because the caller has extra idle warps; whether
-extra threads can be gated is part of the body's synchronization contract.
+It cannot require an incompatible participation shape merely because the enclosing target entry
+has additional idle participants. For CUDA, whether extra threads/warps can be gated is part of
+the body's synchronization contract.
 No body may introduce an unadvertised grid collective inside a cohort-specific path. Global
 joins belong to the verified plan and must be reached by every participating worker as required.
 
-Each candidate is tested under the complete entry's chosen block shape and resource envelope.
+Each candidate is tested under the complete target entry's chosen participation shape and resource
+envelope. For CUDA this includes the chosen block shape.
 The verifier may reject a legal standalone body because it is incompatible with other required
 regions. That is a legitimate strict-backend limitation, not permission to misreport a split graph.
 Registers held across a reduction continuation count against the entire generated entry. Giving

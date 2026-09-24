@@ -1,8 +1,9 @@
 # MegaBake V3: atomic implementation work orders
 
-Status: implementation plan only, 2026-09-09. None of the tasks below is implemented by this
-documentation change. The current repository base is `3695f06de14322fd8ac3e111c693612d53b56319`;
-recheck the working tree before starting. Proposed paths, interfaces, commands and artifacts are
+Status: implementation plan only, 2026-09-09; backend boundary revised 2026-09-24. None of the
+tasks below is implemented by this documentation change. The portability revision repository base
+is `e84001d56df1535d5cc9d033cda435bd04f74630`. Recheck the working tree before starting. Proposed
+paths, interfaces, commands and artifacts are
 explicit implementation targets, not claims that those files or tools already exist.
 
 This is the execution handbook for the complete pipeline-first V3 design. It replaces the earlier
@@ -24,20 +25,25 @@ evidence of device correctness.
 ### 1.1 Authority and non-negotiable scope
 
 - The [architecture](MEGABAKE_V3_ARCHITECTURE.md) owns the pipeline-first scope.
-- [IR contracts](MEGABAKE_V3_IR_AND_REUSE_PLAN.md) own semantic and ExecutionPlan meaning.
+- [IR contracts](MEGABAKE_V3_IR_AND_REUSE_PLAN.md) own semantic, LogicalExecutionPlan and
+  TargetExecutionPlan meaning.
 - [Pipeline contracts](MEGABAKE_V3_PIPELINING_AND_SCHEDULING.md) own stages, publication, storage and progress.
 - [Performance protocol](MEGABAKE_V3_PERFORMANCE_MODEL.md) owns timings, controls and claim rules.
 - This document owns task order, concrete module seams, fixtures, handoffs and acceptance tests.
 - If these disagree, identify the precise conflict and request a decision; do not silently
   change architecture while implementing a task.
 
-Keep three representations: normalized FX, SemanticGraph within FX, and ExecutionPlan. TargetProfile
-and LayerSummary remain analyses. Preserve the old backend as a control until an explicitly
-authorized migration. No general Tile IR, new graph framework, binary cuBLAS extraction, generic
-queue runtime, paged scratch allocator, quantization rescue or multi-GPU expansion is required here.
+Keep normalized FX and SemanticGraph within FX, then the two checked execution-plan forms:
+`LogicalExecutionPlan` and backend-qualified `TargetExecutionPlan`. TargetProfile and LayerSummary
+remain analyses. Common modules may define protocols and neutral records but must not import CUDA;
+the only implemented adapter, bodies, code generator and runtime in this ledger are CUDA. Preserve
+the old backend as a control until an explicitly authorized migration. No TPU code, general Tile IR,
+new graph framework, binary cuBLAS extraction, generic queue runtime, paged scratch allocator,
+quantization rescue or multi-GPU expansion is required here.
 
-The target remains generic FX input with an explicit supported subset, one owned compute grid for
-strict execution, batch-one cached decoding, and the model's declared FP16/BF16 policy. Initial
+The frontend target remains generic FX input with an explicit supported subset. The first CUDA
+target remains one owned compute grid for strict execution, batch-one cached decoding, and the
+model's declared FP16/BF16 policy. Initial
 model evidence must include a small model and a roughly 2B model at declared short/long contexts.
 Uncached sequence-one execution is a diagnostic, not a cached-decode result.
 
@@ -145,7 +151,9 @@ Proposed organization:
 
 ```text
 V3/
-  contracts.py, diagnostics.py, target.py, backend.py
+  contracts.py, diagnostics.py, api.py
+  backend/
+    base.py, target.py, artifacts.py
   frontend/
     capture.py, normalize.py, facts.py, effects.py, semantic.py
     match_linear.py, match_pointwise.py, match_norm.py
@@ -154,10 +162,12 @@ V3/
   plan/
     model.py, bodies.py, footprints.py, dependencies.py
     storage.py, verify.py, simulate.py, templates.py, costs.py, search.py
-  codegen/
-    source.py, compile.py, resources.py
+  backends/
+    cuda/
+      profile.py, bodies.py, lower.py
+      source.py, compile.py, resources.py, runtime.py
   runtime/
-    driver.py, session.py
+    session.py
 CUDA/
   abi.cuh, entry support headers, selected bodies/
 BENCH/
@@ -169,11 +179,28 @@ Do not create every empty module in the first task. Each owner creates only what
 Keep related small definitions together; splitting a module requires a concrete readability or
 ownership reason, not a one-class-per-file rule. CPU tests import only Python/reference layers.
 
+`backend/base.py` contains narrow protocols, not a registry that imports every backend:
+
+```text
+TargetAdapter:
+  profile(explicit_target) -> TargetProfile
+  body_options(logical_capability, profile) -> [TargetBodySpec]
+  lower(logical_plan, selected_options, profile) -> TargetExecutionPlan | Rejection
+  verify_target(target_plan) -> VerificationReport
+  emit/compile/load/invoke(...) -> backend-owned artifacts/results
+```
+
+The common planner may call these methods through dependency injection. It must not inspect
+`backend_id == "cuda"` to choose spaces, scopes or primitives. The CUDA adapter may use all CUDA
+facts required by this plan. No placeholder TPU package, mock TPU compiler or unused universal
+plugin manager is created; a future backend is added by implementing this protocol and registering
+it explicitly at the public integration boundary.
+
 Shared device-test helpers live in `tests/test_v3/support/body_harness.py` and
 `tests/test_v3/support/pipeline_harness.py` when their owning tasks need them. These helpers construct
 test inputs/plans and invoke the same production emitter/runtime; they must not become a second
 executor whose success substitutes for generated production code. Body “registration” edits mean
-the corresponding BodySpec/source association in the existing V3 registry seam, not an unrelated
+the corresponding TargetBodySpec/source association in the existing backend registry seam, not an unrelated
 global legacy dispatch change. Serialize shared registration edits through the interface owner.
 
 ### 2.3 Public boundary to implement, not today's API
@@ -181,18 +208,22 @@ global legacy dispatch change. Serialize shared registration edits through the i
 ```python
 normalize_fx(graph, example_args=None, *, input_spec, policy) -> NormalizedProgram
 recognize(program) -> SemanticGraph
-make_plans(semantic_graph, target, body_registry, options) -> CandidateSet
-verify_plan(plan, semantic_graph, target) -> VerificationReport
-emit_entry(verified_plan, body_registry) -> SourceArtifact
-compile_entry(source_artifact, toolchain) -> CompiledArtifact
-create_session(compiled_artifact, bindings, state, *, device, stream_policy) -> Session
+make_logical_plans(semantic_graph, requirements, options) -> LogicalCandidateSet
+select_and_lower(logical_candidates, adapter, profile, options) -> TargetCandidateSet
+verify_logical(plan, semantic_graph) -> VerificationReport
+verify_target(target_plan, adapter, profile) -> VerificationReport
+emit_entry(verified_target_plan, adapter) -> SourceArtifact
+compile_entry(source_artifact, adapter, toolchain) -> CompiledArtifact
+create_session(compiled_artifact, adapter, bindings, state, *, target, invocation_policy) -> Session
 session.run(*inputs) -> owned_output_tree
 session.run_into(output_tree, *inputs) -> explicit caller-owned output_tree
 ```
 
 These are shared contracts to implement incrementally. Use keyword-only contracts for choices
 that alter semantics. A candidate lacking costs may be examined/emitted offline but cannot be
-labelled a measured winner. Never make `normalize_fx` query a GPU.
+labelled a measured winner. Never make `normalize_fx` or logical planning query a device.
+`select_and_lower` is target-aware and may request alternative logical candidates; that feedback
+is explicit rather than a CUDA import in the common planner.
 
 ## 3. Shared interfaces that prevent agents from inventing incompatible pieces
 
@@ -222,11 +253,13 @@ Implement small dataclasses/enums first; no dependency on a new graph or schema 
 | NumericalPolicy | reference expansion identity, intermediate casts, accumulation/reassociation allowances, dtype/op-specific tolerances and exceptional-value policy |
 | NormalizedProgram | FX graph, input/output pytree and export signature, lifted bindings, constraints, effects, reference callable |
 | SemanticGraph | FX dialect nodes, executable reference regions, origin mapping, facts and composite alternatives |
-| BodySpec | semantic support predicate, version/features, thread roles, tile/footprint generator, scratch/accumulator requirements, capability set, source/descriptor dependencies |
-| ExecutionPlan | the schema in IR §7; unresolved choices prohibited in a finalized plan |
+| LogicalBodyCapability | semantic support predicate, numerical policy, logical tile/footprint generator, stage/ownership constraints and capability set; no target roles or source dependencies |
+| TargetBodySpec | backend/provider/version, guards, target roles, physical scratch/accumulator and stages, source/descriptor dependencies, realized logical capability |
+| LogicalExecutionPlan | the target-neutral schema in IR §7; exact logical work and conditions, with no physical placement or primitive names |
+| TargetExecutionPlan | logical-plan hash plus resolved backend bodies, spaces/layouts, events, placement, schedule and invocation; no unresolved physical choices |
 | CostRecord | key, value/unit or unknown, measured/estimated provenance, interval, working-set and contention conditions |
-| SourceArtifact | selected source/header hashes, entry name, typed argument schema, numerical flags, target requirements, plan hash |
-| CompiledArtifact | source/toolchain identity, binary location/hash, entry attributes, compiler logs, unresolved runtime checks |
+| SourceArtifact | backend ID, selected source/header hashes, entry name, typed argument schema, numerical flags, target requirements, logical and target plan hashes |
+| CompiledArtifact | backend/source/toolchain and target-plan identity, binary location/hash, entry attributes, compiler logs, unresolved runtime checks |
 | VerificationReport | independent coverage/storage/events/participation/progress/guards results with counterexample IDs |
 | TaskHandoff | task/dependency revisions, changed files, commands/results, evidence vector, remaining risks and next eligible tasks |
 
@@ -241,10 +274,11 @@ Use `reserve`, `preload`, `compute`, `reduce_begin`, `reduce_update`, `reduce_fi
 load-complete, accumulator-ready, destination-visible and source-retired meanings distinct.
 
 Atomic-tile bodies drain declared accesses before returning. Staged bodies may return outstanding
-operation tokens only with explicit ownership/lifetime transfer. A same-CTA barrier is not a
-substitute for an async completion, a cross-CTA publication, or a grid collective.
+operation tokens only with explicit ownership/lifetime transfer. A local-group barrier is not a
+substitute for async completion, cross-worker publication or an invocation-wide collective. In
+the CUDA target plan these distinctions become CTA barrier, inter-CTA publication and grid join.
 
-For the first inter-CTA event protocol: positive expected producer counts, same-grid zero
+For the first CUDA inter-CTA event protocol: positive expected producer counts, same-grid zero
 initialization plus a uniform grid barrier, exact unique producer contributions, device-scope
 acquire-release publication and acquire consumption, and no within-invocation event-counter reuse.
 Activation chunks have unique addresses inside a region. Small per-CTA staging rings use their
@@ -779,42 +813,49 @@ are not falsely independent parameter storage; unknown costs remain unknown; rep
 
 <a id="mb3-022"></a>
 
-### MB3-022 — Implement the ExecutionPlan data model and deterministic serialization
+### MB3-022 — Implement both execution-plan contracts and deterministic serialization
 
 **Depends:** MB3-004, MB3-006. **Lane/review:** CPU, R2.
 **Own:** `V3/plan/model.py`, `CPU/test_plan_model.py`.
 **Read:** IR §7; pipeline §2; shared interfaces §3.
 
-**Before → after:** V3 plans exist only in prose → one typed model stores candidate/final plans,
-actions, footprints, reductions, buffers, events, worker programs and unresolved decisions.
+**Before → after:** V3 plans exist only in prose → typed logical and target-plan records separate
+actions/footprints/reductions/lifetimes from physical bodies/spaces/events/worker programs.
 
-**Do:** implement the logical schema without a task interpreter or new graph library. Support
-small explicit domains first and compact repeated domains where needed. Separate immutable
-semantic IDs from physical worker assignments. A finalize operation rejects unresolved guards,
-body choices or required synchronization, but permits unknown performance costs marked as such.
+**Do:** implement both schemas in IR §7 without a task interpreter or new graph library. Support
+small explicit domains first and compact repeated domains where needed. The logical form rejects
+target roles, address-space IDs, primitives and launch fields. The target form references a stable
+logical-plan hash and rejects unresolved body, layout, placement, synchronization, invocation or
+guard choices, while permitting unknown performance and pre-compilation resource facts marked as
+such. Model `lowered`, `compiled` and `admitted` lifecycle states; only the latter is invocable.
+Keep immutable semantic IDs distinct from target worker assignments.
 
 **Validate/accept:** `CPU/test_plan_model.py`: round-trip equality, stable ordering/hash, invalid
-references and unknown schema rejection; changing worker count does not change logical work coverage.
-**Expected:** S: explicit plan meaning; C: one representation; P: no direct gain.
+references and unknown schema rejection; CUDA fields reject in a logical plan; a target plan with
+the wrong logical hash rejects; a lowered plan cannot claim admission; changing worker count does
+not change logical work coverage.
+**Expected:** S: explicit plan meaning; C: checked lowering boundary; P: no direct gain.
 
 <a id="mb3-023"></a>
 
-### MB3-023 — Implement device-body capability and support registration
+### MB3-023 — Implement logical capability and target-body registration
 
 **Depends:** MB3-010, MB3-022. **Lane/review:** CPU, R2.
-**Own:** `V3/plan/bodies.py`, `CPU/test_body_registry.py`.
+**Own:** `V3/plan/bodies.py`, `V3/backends/cuda/bodies.py`, `CPU/test_body_registry.py`.
 **Read:** kernel reuse §7; pipeline §2.
 
-**Before → after:** a callable body is assumed composable → support is a checked semantic,
-shape/layout, target, thread-role, descriptor and stage-capability contract.
+**Before → after:** a callable body is assumed composable → target-neutral capability requests are
+separate from checked backend body, shape/layout, participation, descriptor and stage contracts.
 
-**Do:** implement BodySpec/support results with precise rejection reasons. Distinguish ATOMIC_TILE,
-PRELOADABLE, STREAM_REDUCTION and optional EARLY_RELEASE. Register test bodies without claiming
-their CUDA implementation exists. Include required source/header versions, explicit role masks,
-scratch/alignment and accumulator lifetime. No external/child-grid body is admitted as strict.
+**Do:** implement `LogicalBodyCapability`, `TargetBodySpec` and support results with precise rejection
+reasons. Distinguish ATOMIC_TILE, PRELOADABLE, STREAM_REDUCTION and optional EARLY_RELEASE. Register
+neutral test capabilities and CUDA test specs without claiming device implementation exists. Only
+target specs include source/header versions, role masks, scratch/alignment and physical accumulator
+lifetime. No external/child-grid CUDA body is admitted as strict.
 
-**Validate/accept:** `CPU/test_body_registry.py`: missing stages, incompatible block participation,
-unsupported dtype/alignment and host-only operations reject; costs cannot override legality.
+**Validate/accept:** `CPU/test_body_registry.py`: a logical capability cannot contain thread roles;
+missing stages, incompatible CUDA block participation, unsupported dtype/alignment and host-only
+operations reject; costs cannot override legality; providers from different backends never mix.
 **Expected:** S: honest compatibility; C: visible missing interfaces; P: enables joint body selection.
 
 <a id="mb3-024"></a>
@@ -868,10 +909,11 @@ to kv1; missing V/current-slot publication fails; poison beyond valid length is 
 **Before → after:** a plan can look complete while dropping work → explicit checks prove each
 required semantic region/effect and each output/reduction contribution is represented.
 
-**Do:** validate body support, graph boundary mapping, unique writers or declared reducers, exact
+**Do:** validate logical capability support, graph boundary mapping, unique writers or declared reducers, exact
 K coverage and finalizer order. Reject duplicate state effects, missing live outputs, overlaps
 without a reduction protocol and finalization before the last required update. Numerical-policy
-compatibility is a required body guard, not just a runtime comparison.
+compatibility is a required logical capability guard; target-body compatibility is rechecked after
+lowering rather than assumed from this report.
 
 **Validate/accept:** `CPU/test_plan_coverage.py`: mutate valid plans to omit/duplicate a K chunk,
 drop a residual/state output or round a continuation early; each yields an identifying diagnostic.
@@ -892,7 +934,7 @@ producer contributions and typed prerequisites.
 required effects. Distinguish input-ready facts from produced events with positive expected counts.
 Deduplicate contribution IDs; aggregate events only for identical complete dependency sets.
 Address-ready weights can be independent of activation-ready tokens. No within-invocation reuse
-of inter-CTA event IDs in this first scheme.
+of cross-worker event IDs in this first logical scheme.
 
 **Validate/accept:** `CPU/test_event_dependencies.py`: multi-tile heads wait for all contributions;
 duplicate counting, zero-ready produced data and source-retired-as-data-ready are rejected.
@@ -900,19 +942,20 @@ duplicate counting, zero-ready produced data and source-retired-as-data-ready ar
 
 <a id="mb3-028"></a>
 
-### MB3-028 — Generate barrier-control worker programs
+### MB3-028 — Generate logical barrier-control schedules
 
 **Depends:** MB3-024, MB3-026. **Lane/review:** CPU, R2.
 **Own:** `V3/plan/templates.py`, `CPU/test_barrier_plan.py`.
 **Read:** architecture §6; dataflow §4.
 
-**Before → after:** the only executable control is the legacy task scheduler → V3 has a simple
-same-body cooperative phase plan for comparison and correctness debugging.
+**Before → after:** the only control is the legacy task scheduler → V3 has a simple logical
+same-body phase schedule for later backend lowering, comparison and correctness debugging.
 
-**Do:** assign logical tiles over an explicit worker count; use balanced strip mining or a declared
-costed static assignment. Every worker reaches the same ordered joins, even with no arithmetic.
-Keep body calls atomic here. Do not force a poor producer/consumer cohort split into this control
-to inflate later overlap gains.
+**Do:** assign logical tiles over an explicit count of abstract worker slots; use balanced strip
+mining or a declared costed static assignment. Express all-participant ordered joins as logical
+relations, without selecting cooperative grids, CTA barriers or another backend primitive. Every
+slot participates even with no arithmetic. Keep body calls atomic here. Do not force a poor
+producer/consumer cohort split into this control to inflate later overlap gains.
 
 **Validate/accept:** `CPU/test_barrier_plan.py`: zero-work workers, fewer/more tiles than workers,
 two dependent regions and complete output coverage; joins have uniform participation.
@@ -920,23 +963,26 @@ two dependent regions and complete output coverage; joins have uniform participa
 
 <a id="mb3-029"></a>
 
-### MB3-029 — Allocate buffers from partial-order access lifetimes
+### MB3-029 — Derive logical buffer conflicts from partial-order lifetimes
 
 **Depends:** MB3-022, MB3-026, MB3-028. **Lane/review:** CPU, R3.
 **Own:** `V3/plan/storage.py`, `CPU/test_storage_lifetimes.py`.
 **Read:** IR §8; pipeline §8; old sequential buffer_planner.py.
 
-**Before → after:** an estimated/topological interval can justify unsafe overlay → reuse requires
-a proven release-before-next-use order for all relevant accesses.
+**Before → after:** an estimated/topological interval can justify unsafe overlay → logical reuse
+eligibility requires a proven release-before-next-use order for all relevant accesses.
 
-**Do:** build lifetime/conflict records from actions, ownership and async source retirement.
-Treat incomparable lifetimes as overlapping. Allocate aligned fixed slots by deterministic first-fit
-over a conflict graph; do not add serializing edges silently just to fit memory. Separate global
-activation arena, per-CTA shared staging and accumulator storage. Preserve output/state lifetimes.
-For inter-CTA chunks, use unique region addresses and reuse only after the verified region join.
+**Do:** build lifetime/conflict and logical space/reachability requirement records from actions,
+ownership and async source retirement. Treat incomparable lifetimes as overlapping. Derive
+deterministic overlay classes over the conflict graph, but do not choose physical address spaces,
+sizes after target padding, or add serializing edges silently just to fit memory. Distinguish
+invocation-reachable activation storage, local-group staging and private accumulators as properties,
+not CUDA names. Preserve output/state lifetimes. Cross-worker chunks require unique region storage
+and reuse only after the verified region join. Physical allocation occurs during target lowering.
 
 **Validate/accept:** `CPU/test_storage_lifetimes.py`: simultaneous current/next tiles do not overlay;
-slow-store source stays live; two-reader buffers outlive both readers; address bounds/alignment hold.
+slow-store source stays live; two-reader buffers outlive both readers; logical extent/alignment and
+reachability requirements hold; no CUDA space identifier appears in serialized logical output.
 **Expected:** S: safe reuse; C: explicit memory budget; P: lowers footprint where ordering proves it, otherwise may grow safely.
 
 <a id="mb3-030"></a>
@@ -950,11 +996,12 @@ slow-store source stays live; two-reader buffers outlive both readers; address b
 **Before → after:** event IDs and scratch ranges are structurally present → the plan checks their
 initialization, publication, acquisition, retirement and reuse ordering.
 
-**Do:** require same-grid initialization before use, positive produced-event counts and exact
+**Do:** require same-invocation initialization plus an all-required-participant ordering point before
+use, positive produced-event counts and exact
 producer multiplicity. Check destination visibility precedes publish, acquire precedes consumer
-reads, and source retirement precedes slot overwrite. For a bounded per-CTA ring, verify each
-iteration's phase and release-before-reacquire; reject unknown unbounded cycles. Count bounds must
-fit the selected integer representation without wraparound.
+reads, and source retirement precedes slot overwrite. For a bounded local-group ring, verify each
+iteration's phase and release-before-reacquire; reject unknown unbounded cycles. Record count-width
+requirements without choosing a target atomic representation; target lowering verifies the binding.
 
 **Validate/accept:** `CPU/test_protocol_lifetimes.py`: early publication, lost acquire, stale phase,
 double reserve, counter overflow and overwrite-before-retirement all fail with action IDs.
@@ -971,11 +1018,12 @@ double reserve, counter overflow and overwrite-before-retirement all fail with a
 **Before → after:** an acyclic tensor graph is assumed safe → generated worker/resource waits
 must also satisfy a bounded progress argument and collective participation rules.
 
-**Do:** add worker instruction-order, producer readiness and explicit slot-credit/release edges
+**Do:** add abstract worker-slot order, producer readiness and explicit slot-credit/release edges
 to the wait-for/order model. Reject a cycle with a concrete cycle witness. For supported templates,
 prove blocked consumers leave prerequisites runnable and do not retain required producer slots.
-Reject body-internal hidden grid collectives. Record cooperative residency as a runtime proof
-obligation; a CPU profile stub cannot discharge it.
+Reject body-internal hidden collectives. Record required simultaneous participants and progress as
+target proof obligations without naming cooperative residency; a CPU logical proof cannot discharge
+the CUDA cooperative-residency obligation added by its target lowering.
 
 **Validate/accept:** `CPU/test_progress.py`: acyclic-data/cyclic-worker example, slot deadlock,
 idle-worker early return and nonuniform collective all reject; legal barrier/pipeline toy plans pass.
@@ -1146,21 +1194,25 @@ extra 2 us coordination, positive/negative tail examples, saturated shared-bandw
 
 ### MB3-040 — Select bounded joint body/fusion/layout/schedule candidates
 
-**Depends:** MB3-019, MB3-023, MB3-026, MB3-033, MB3-037, MB3-039.
+**Depends:** MB3-019, MB3-023, MB3-026, MB3-033, MB3-037, MB3-039, MB3-041.
 **Lane/review:** CPU, R2. **Own:** `V3/plan/search.py`, `CPU/test_joint_search.py`.
 **Read:** architecture §6; pipeline §3.
 
 **Before → after:** fastest isolated bodies or greedy covers freeze later choices → bounded
 whole-region candidates retain fusion/readiness alternatives through legality and cost evaluation.
 
-**Do:** enumerate compatible body/tile/transport/cover combinations, instantiate schedules,
-allocate/verify, and keep a configured small beam (initial default eight). Retain a legal control
+**Do:** enumerate compatible logical body/tile/transport/cover combinations, instantiate schedule
+constraints, and ask the selected adapter for body options, physical allocation, lowering and target
+verification. Keep a configured small beam (initial default eight). A target rejection may revise
+the logical candidate but cannot mutate it silently. Retain a legal control
 and mechanism-distinct exploratory candidates when costs are unknown. Log pruning reasons and
 budget exhaustion. Keep compile/measured feedback interfaces, but do not implement an autotuning
-service or infinite search. Final plans contain no unresolved execution choices.
+service or infinite search. Selected `TargetExecutionPlan`s contain no unresolved physical choices.
 
 **Validate/accept:** `CPU/test_joint_search.py`: a slower isolated body can win a cheaper region;
-an invalid fast candidate rejects; unknown costs retain alternatives; fixed inputs yield stable plans.
+an invalid fast candidate rejects; a mock adapter cannot inject CUDA fields into the logical plan;
+target rejection retains/revises alternatives explicitly; unknown costs retain alternatives;
+fixed inputs yield stable plans.
 **Expected:** S: only verified covers; C: bounded explainable search; P: enables end-to-end selection, not a guaranteed win.
 
 <a id="mb3-041"></a>
@@ -1168,19 +1220,23 @@ an invalid fast candidate rejects; unknown costs retain alternatives; fixed inpu
 ### MB3-041 — Define TargetProfile legality and offline feature records
 
 **Depends:** MB3-004, MB3-006. **Lane/review:** CPU, R2.
-**Own:** `V3/target.py`, `CPU/test_target_profile.py`.
+**Own:** `V3/backend/target.py`, `V3/backend/base.py`, `CPU/test_target_profile.py`.
 **Read:** hardware §§1–5,8; research source versions.
 
 **Before → after:** architecture names/numeric thresholds imply capabilities → a versioned profile
 separates explicit supported features, resource limits and unknown/calibrated costs.
 
-**Do:** define capability/space/movement records, target/toolchain identity and provenance. Start
-with only target entries relevant to the chosen first GPU or explicit offline examples. No
-SM>=90 suffix rule, automatic topology DFS, product-peak-as-measured-bandwidth or MIG set-aside
-assumption. Offline construction must not query CUDA and must label unknown properties.
+**Do:** define backend identity, execution-domain, capability, space, movement, synchronization,
+topology, target/toolchain and provenance records. The schema contains no CUDA enums and does not
+import a backend. Use opaque backend-qualified IDs plus declared properties. Start with offline
+examples needed by the first CUDA target. No SM>=90 suffix rule, automatic topology DFS,
+product-peak-as-measured-bandwidth or MIG set-aside assumption. Offline construction must not query
+CUDA and must label unknown properties.
 
-**Validate/accept:** `CPU/test_target_profile.py`: unsupported instruction/target pair rejects;
-different visible-resource profiles remain distinct; unknown costs never become legality facts.
+**Validate/accept:** `CPU/test_target_profile.py`: unsupported requirement/target pairs reject;
+different backend or visible-resource profiles remain distinct; same-spelled spaces from different
+backends do not compare equal; unknown costs never become legality facts; importing common profiles
+does not initialize CUDA.
 **Expected:** S: target safety; C: small fact table; P: no direct gain.
 
 <a id="mb3-042"></a>
@@ -1188,7 +1244,7 @@ different visible-resource profiles remain distinct; unknown costs never become 
 ### MB3-042 — Query the actual selected CUDA device and resource profile
 
 **Depends:** MB3-041. **Lane/review:** GPU, R2.
-**Own:** `V3/target.py`, `GTEST/test_target_query.py`, CPU mocked-query tests.
+**Own:** `V3/backends/cuda/profile.py`, `GTEST/test_target_query.py`, CPU mocked-query tests.
 **Read:** hardware §4 and the selected release's device-property APIs.
 
 **Before → after:** device 0/product-string assumptions drive launch choices → the requested device
@@ -1208,19 +1264,26 @@ to mark querying validated; a mocked H200 profile is not an observed device.
 ### MB3-043 — Emit selected atomic-body source and typed argument manifests
 
 **Depends:** MB3-022, MB3-023, MB3-026, MB3-028, MB3-041.
-**Lane/review:** CPU, R2. **Own:** `V3/codegen/source.py`, `CUDA/abi.cuh`, `CPU/test_source_emission.py`.
+**Lane/review:** CPU, R2. **Own:** `V3/backends/cuda/lower.py`, `V3/backends/cuda/source.py`,
+`CUDA/abi.cuh`, `CPU/test_source_emission.py`.
 **Read:** architecture §§6–7; kernel reuse §7.
 
 **Before → after:** all legacy task sources enter one translation unit → a V3 source artifact
 contains only selected reachable atomic bodies and an explicit entry argument schema.
 
-**Do:** emit the barrier-control plan and a minimal standalone-body diagnostic wrapper. Include
+**Do:** lower a verified logical barrier-control candidate through CUDA body, padded physical
+buffer allocation, address-space/layout, event and invocation choices into a CUDA
+`TargetExecutionPlan`, verify that target plan, then emit its schedule and a
+minimal standalone-body diagnostic wrapper. Include
 only declared header dependencies, preserve numerical flags, and derive logical coordinates from
 plan tile IDs rather than blockIdx. Keep generated joins uniform. Reject unverified semantic/body
-coverage. Full pipeline-stage emission is MB3-064, not hidden scope in this task.
+coverage. Emission accepts only the verified target form and rejects a logical or non-CUDA target
+plan at the API boundary. Full pipeline-stage
+emission is MB3-064, not hidden scope in this task.
 
-**Validate/accept:** `CPU/test_source_emission.py`: stable golden source/manifest; an unused heavy
-body is absent; missing body/argument binding rejects; tail predicates and required joins are present.
+**Validate/accept:** `CPU/test_source_emission.py`: stable target-plan/source/manifest goldens; an
+unused heavy body is absent; logical hash mismatch, missing body/argument binding and non-CUDA
+plans reject; tail predicates and required joins are present.
 Source-string tests establish emission only, not executable correctness.
 **Expected:** S: explicit bindings; C: inspectable selected code; P: aims to reduce universal-entry costs, unmeasured.
 
@@ -1229,11 +1292,12 @@ Source-string tests establish emission only, not executable correctness.
 ### MB3-044 — Add isolated CUDA builds with complete artifact/cache keys
 
 **Depends:** MB3-043. **Lane/review:** CPU+CT, R2.
-**Own:** `V3/codegen/compile.py`, `CPU/test_build_keys.py`, `CTEST/test_build_smoke.py`.
+**Own:** `V3/backends/cuda/compile.py`, `CPU/test_build_keys.py`, `CTEST/test_build_smoke.py`.
 **Read:** hardware §8; current cuda_compiler.py; kernel reuse §§3–4.
 
 **Before → after:** a broad cache key and ambient flags can reuse the wrong binary → source,
-target, ABI, compiler/header versions and numerical policy determine the artifact identity.
+backend, target, logical/target plan hashes, ABI, compiler/header versions and numerical policy
+determine the artifact identity.
 
 **Do:** generate an explicit command for one selected target; compile in a unique build directory,
 preserve stdout/stderr/command and hash the binary. Resolve optional headers only when selected.
@@ -1249,7 +1313,7 @@ stale cache entries with diagnostics. Do not modify the global environment or up
 ### MB3-045 — Collect compiler and function resource reports
 
 **Depends:** MB3-044. **Lane/review:** CPU+CT, R2.
-**Own:** `V3/codegen/resources.py`, `CPU/test_resource_reports.py`, `CTEST/test_resource_smoke.py`.
+**Own:** `V3/backends/cuda/resources.py`, `CPU/test_resource_reports.py`, `CTEST/test_resource_smoke.py`.
 **Read:** hardware §4; GPU audit §6.
 
 **Before → after:** isolated source estimates stand in for the composed entry → each artifact
@@ -1269,7 +1333,7 @@ and parse failures; `CTEST/test_resource_smoke.py` checks a real compiled test e
 ### MB3-046 — Implement a lazy, typed, per-context CUDA driver wrapper
 
 **Depends:** MB3-006, MB3-044. **Lane/review:** CPU+GPU, R3.
-**Own:** `V3/runtime/driver.py`, `CPU/test_driver_abi.py`, `GTEST/test_driver_smoke.py`.
+**Own:** `V3/backends/cuda/runtime.py`, `CPU/test_driver_abi.py`, `GTEST/test_driver_smoke.py`.
 **Read:** existing launcher.py; kernel reuse §§1,7; selected CUDA driver ABI documentation.
 
 **Before → after:** global module/function state and loosely typed calls → explicit artifact/device/
@@ -1289,7 +1353,7 @@ alive through use; expose unload only after safe completion. No import-time driv
 ### MB3-047 — Enforce actual-entry cooperative launch admission
 
 **Depends:** MB3-042, MB3-045, MB3-046. **Lane/review:** CPU+GPU, R3.
-**Own:** `V3/runtime/driver.py`, `CPU/test_launch_admission.py`, `GTEST/test_launch_admission.py`.
+**Own:** `V3/backends/cuda/runtime.py`, `CPU/test_launch_admission.py`, `GTEST/test_launch_admission.py`.
 **Read:** hardware §4; pipeline §10.
 
 **Before → after:** num_sms and fixed shared memory are assumed safe → function attributes and
@@ -1316,7 +1380,7 @@ cases and confirms unsafe requests are rejected **before** launch. Retain the ad
 **Before → after:** body quality is visible only through the entire old model → identical device
 body logic can be validated standalone and under a controlled persistent launch envelope.
 
-**Do:** accept an explicit BodySpec, exact shape/layout, input set and worker count. Generate both
+**Do:** accept an explicit CUDA TargetBodySpec, exact shape/layout, input set and worker count. Generate both
 wrappers from the same selected body; persistent wrapper strip-mines more logical tiles than
 workers and repeats legal body calls with scratch reuse. A temporary trivial test body validates
 the harness before optimized math exists. This is a diagnostic, not a generic compiler result.
@@ -1352,7 +1416,7 @@ MB3-080; being functional is not vendor parity.
 ### MB3-050 — Generate lean pointwise device expressions with explicit casts
 
 **Depends:** MB3-014, MB3-048. **Lane/review:** CT+GPU, R2.
-**Own:** `CUDA/bodies/pointwise.cuh`, pointwise support in `V3/codegen/source.py`,
+**Own:** `CUDA/bodies/pointwise.cuh`, pointwise support in `V3/backends/cuda/source.py`,
 `GTEST/test_pointwise_body.py`.
 **Read:** IR §4; kernel reuse §9.
 
@@ -1539,7 +1603,7 @@ success leaves GPU protocol validation pending; independent review is required.
 
 **Depends:** MB3-049, MB3-058. **Lane/review:** CT+GPU, R3.
 **Own:** `CUDA/bodies/linear_simt.cuh`, `GTEST/test_preloadable_linear.py`.
-**Read:** pipeline §§2,6; BodySpec contract.
+**Read:** pipeline §§2,6; TargetBodySpec contract.
 
 **Before → after:** linear is an indivisible tile call → its selected weight tile can be loaded
 into caller-owned staging and consumed later with a verified lifetime.
@@ -1642,23 +1706,26 @@ A simple value match once is insufficient; require R3 review of the actual instr
 
 ### MB3-064 — Lower bounded staged worker programs into one cooperative entry
 
-**Depends:** MB3-031, MB3-034, MB3-035, MB3-036, MB3-043, MB3-058, MB3-063.
+**Depends:** MB3-031, MB3-034, MB3-035, MB3-036, MB3-040, MB3-043, MB3-058, MB3-063.
 **Lane/review:** CPU+CT+GPU, R3.
-**Own:** `V3/codegen/source.py`, `CUDA/abi.cuh`, `CPU/test_staged_emission.py`,
+**Own:** `V3/backends/cuda/lower.py`, `V3/backends/cuda/source.py`, `CUDA/abi.cuh`, `CPU/test_staged_emission.py`,
 `GTEST/test_staged_entry.py`.
 **Read:** pipeline §§2–3,8–10; IR §7.
 
 **Before → after:** V3 can emit only atomic phase controls → one generated entry executes verified
 reserve/preload/compute/update/publish/release programs with bounded worker/cohort roles.
 
-**Do:** translate typed tokens to the corresponding body/runtime primitive, preserving argument
-types and accumulator scope. Emit common initialization and uniform joins; idle workers cannot
+**Do:** lower the verified staged logical candidate into a fully resolved CUDA target plan, then
+translate its typed tokens to the corresponding body/runtime primitive, preserving argument types
+and accumulator scope. Record every physical buffer/event/scope and cooperative invocation field.
+Emit common initialization and uniform joins; idle workers cannot
 return early. Preserve tracked outstanding operations across stage returns. Generate finite
 loops/template repeats, not a CPU per-tile dispatcher or arbitrary queue interpreter. Reject any
-unresolved action/capability/lifetime; never silently drop it.
+unresolved action/capability/lifetime or logical-to-target obligation; never silently drop it.
 
-**Validate/accept:** golden source checks plus `GTEST/test_staged_entry.py` with tiny synthetic
-producer/consumer bodies; multiple tiles/workers, complete event lifecycle and admission reports.
+**Validate/accept:** target-plan and source goldens plus `GTEST/test_staged_entry.py` with tiny
+synthetic producer/consumer bodies; exact logical-to-target coverage, multiple tiles/workers,
+complete event lifecycle and admission reports.
 **Expected:** S: executable verified plan; C: one bounded runtime; P: enables non-launch mechanisms, not yet model evidence.
 
 <a id="mb3-065"></a>
@@ -1821,7 +1888,7 @@ or ordered as documented; all required allocation/copy/update operations are cou
 ### MB3-072 — Add strict rejection and an explicit ordinary compiled fallback
 
 **Depends:** MB3-006, MB3-007, MB3-071.
-**Lane/review:** CPU+GPU, R2. **Own:** `V3/backend.py`, `CPU/test_fallback_policy.py`.
+**Lane/review:** CPU+GPU, R2. **Own:** `V3/runtime/session.py`, `CPU/test_fallback_policy.py`.
 **Read:** architecture §§3,9–10; performance §8.
 
 **Before → after:** an unsupported path may look like megakernel success → strict and ordinary
@@ -1869,7 +1936,7 @@ cache objects produce a bounded diagnostic. GPU FP16/BF16 agreement remains a se
 
 **Depends:** MB3-019, MB3-040, MB3-050, MB3-051, MB3-066, MB3-067, MB3-068, MB3-071.
 **Lane/review:** CPU+GPU, R3.
-**Own:** `V3/backend.py`, BLOCK_TINY/BLOCK_DEVICE fixtures, `GTEST/test_generated_block.py`.
+**Own:** `V3/api.py`, BLOCK_TINY/BLOCK_DEVICE fixtures, `GTEST/test_generated_block.py`.
 **Read:** architecture §11; dataflow §5; pipeline §11.
 
 **Before → after:** components/probes are manually connected → one ordinary FX block passes
@@ -1891,7 +1958,8 @@ identical structure, changed norm/mask not falsely matched, both schedule polici
 
 **Depends:** MB3-020, MB3-036, MB3-064, MB3-074.
 **Lane/review:** CPU+CT+GPU, R3.
-**Own:** repeated-region support in `V3/plan/templates.py` and `V3/codegen/source.py`, `CPU/test_repeated_plan.py`,
+**Own:** repeated-region support in `V3/plan/templates.py` and `V3/backends/cuda/source.py`,
+`CPU/test_repeated_plan.py`,
 `GTEST/test_repeated_layers.py`.
 **Read:** IR §6; pipeline §6; architecture §7.
 
@@ -1913,7 +1981,7 @@ correctness, boundary preload lifetime, source-size/resource report and no weigh
 
 **Depends:** MB3-021, MB3-040, MB3-052, MB3-069, MB3-072, MB3-073, MB3-075.
 **Lane/review:** CPU+GPU, R3.
-**Own:** `V3/backend.py`, narrow opt-in public API hook, `CPU/test_v3_api.py`,
+**Own:** `V3/api.py`, narrow opt-in public API hook, `CPU/test_v3_api.py`,
 `GTEST/test_generated_causal_lm.py`.
 **Read:** architecture §§1–3,9–11; IR §10.
 
@@ -2159,7 +2227,8 @@ graph cannot be reported as a strict full-step result. CPU mocks test the seam, 
 ### MB3-086 — Make selected-source compilation work from an installed package
 
 **Depends:** MB3-043, MB3-044, MB3-076. **Lane/review:** CPU+CT, R2.
-**Own:** `pyproject.toml`, package-resource resolution in `V3/codegen/source.py`, `CPU/test_package_resources.py`,
+**Own:** `pyproject.toml`, package-resource resolution in `V3/backends/cuda/source.py`,
+`CPU/test_package_resources.py`,
 `CTEST/test_installed_compile.py`.
 **Read:** pyproject.toml; V3 source/dependency manifests; kernel reuse §§3–5,7.
 
@@ -2213,10 +2282,12 @@ import the checkout. No implementation task is marked GPU-validated merely becau
 **Before → after:** many merged tasks suggest completion → a reader can reproduce the supported
 result, locate every unrun gate and distinguish implemented architecture from successful research.
 
-**Do:** verify task/source/plan/model/toolchain hashes, review records, license provenance and durable
-artifact locations. Compare implementation with the three-representation architecture and all three
-pipeline experiments. List unsupported semantics, fallbacks, lost candidates and optional unimplemented
-work. Update docs with measured facts only; retain historical assertions as historical. Recommend one
+**Do:** verify task/source/logical-plan/target-plan/model/toolchain hashes, review records, license
+provenance and durable artifact locations. Confirm common modules contain no CUDA mechanism choices,
+every emitted artifact traces to a verified backend-qualified plan, and the CUDA adapter satisfies
+all logical obligations. Compare implementation with all three pipeline experiments. List unsupported
+semantics, fallbacks, lost candidates and optional unimplemented work. Update docs with measured facts
+only; retain historical assertions as historical. Recommend one
 bounded next experiment from observed bottlenecks, or hand off the completed target if it is met.
 
 **Validate/accept:** a fresh reader can follow one real-model result back to source, correctness,
@@ -2598,7 +2669,7 @@ output = a / l                          # only under the defined nonempty policy
 Mask/scale precede the update as the reference requires. A tile with no valid values must not
 produce `exp(-inf - -inf)`. Empty/all-masked outputs follow the captured reference/policy, not an
 assumed universal behavior. Accumulator type, exponential approximation and final cast belong to
-NumericalPolicy and BodySpec and need actual device comparison.
+NumericalPolicy and TargetBodySpec and need actual device comparison.
 
 For MB3-089, partials use compatible `(m_j, l_j, a_j)` values. The combine rescales each valid
 partial to the global maximum before summing l/a. Simply adding independently normalized outputs
@@ -2781,8 +2852,8 @@ without declaring the overall performance target achieved.
 | Design authority | Concrete tasks and acceptance hooks |
 |---|---|
 | [README](MEGABAKE_V3_README.md) | 004 workload scope; 076 generic supported-FX route; 082 non-launch evidence; 084/088 honest outcome |
-| [Architecture](MEGABAKE_V3_ARCHITECTURE.md) | 007–012 three representations; 019/034–040 joint planning; 063–076 specialized execution/session; 084 first result |
-| [IR and reuse](MEGABAKE_V3_IR_AND_REUSE_PLAN.md) | 007–021 signatures/facts/FatOps/state/LayerSummary; 022–033 coverage, lifetimes and verification; 085 optional backend adapter |
+| [Architecture](MEGABAKE_V3_ARCHITECTURE.md) | 007–021 semantic contracts; 022/023/040–047 logical/target boundary and CUDA target plan; 019/034–040 joint planning; 063–076 specialized CUDA execution/session; 084 first result |
+| [IR and reuse](MEGABAKE_V3_IR_AND_REUSE_PLAN.md) | 007–021 signatures/facts/FatOps/state/LayerSummary; 022–033 logical coverage/lifetimes/verification; 040–047 target lowering and verification; 085 torch.compile integration adapter |
 | [Pipelining and scheduling](MEGABAKE_V3_PIPELINING_AND_SCHEDULING.md) | 027–037 readiness/ownership/tails; 058–068 stage contracts/protocol/generated pipelines; 069 resource composition; 081/082 costs and evidence |
 | [Dataflow diagrams](MEGABAKE_V3_DATAFLOW_DIAGRAM.md) | 007–012 frontend handoff; 040 selection; 043/064 code generation; 070–076 invocation; 078/082 causal trace |
 | [Hardware model](MEGABAKE_V3_HARDWARE_MODEL.md) | 038 cost provenance; 041/042 TargetProfile; 045/047 actual function resources/admission; 058 target-gated stages; 081 targeted calibration |

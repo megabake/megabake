@@ -1,10 +1,13 @@
 # MegaBake V3: research and design
 
-Research date: 2026-09-09. Repository inspected: `3695f06de14322fd8ac3e111c693612d53b56319`.
+Research date: 2026-09-09; backend boundary revised 2026-09-24. Original source audit base:
+`3695f06de14322fd8ac3e111c693612d53b56319`; portability revision base:
+`e84001d56df1535d5cc9d033cda435bd04f74630`.
 Status: pipeline-first revision, source-audited; no V3 implementation or new GPU measurements.
 
-The recommendation is to build a **generic FX compiler with a small semantic dialect and a
-specialized pipelined CUDA backend**. Keep the single-grid objective, but optimize tile-level
+The recommendation is to build a **target-extensible FX compiler with a small semantic dialect and
+a specialized pipelined CUDA first backend**. CUDA is the only implementation and performance
+target in V3. Keep the single-grid objective for that backend, but optimize tile-level
 compute and movement, not just launches. Competitive math, useful fusion, early consumer
 readiness and bounded cross-task weight staging are designed and selected together.
 
@@ -18,15 +21,18 @@ FX / ExportedProgram
   -> normalize, preserve semantics, collect tensor facts
   -> SemanticGraph: FatOps + ordinary ATen regions
        optional LayerSummary over the same graph
-  -> jointly choose body, fusion, consumer-aligned tiles, transport and schedule
-  -> ExecutionPlan: staged actions, reduction continuations, readiness and release
-  -> generate one specialized cooperative CUDA entry
+  -> LogicalExecutionPlan: tiles, footprints, staged actions and lifetime constraints
+  -> jointly choose target body, layout, physical transport and schedule through BackendAdapter
+  -> TargetExecutionPlan: resolved spaces, events, placement and invocation
+  -> CUDA adapter generates one specialized cooperative entry
   -> compile, check resources, validate, measure, select
 ```
 
-`TargetProfile` is a separate input to planning. It contains queried capabilities, documented
-features, and measurements with provenance. It is not another program IR. `LayerSummary` is also
-an analysis, until a real transformation needs structured layer/loop semantics.
+`TargetProfile` is a backend-qualified input to planning. It contains queried capabilities,
+documented features, and measurements with provenance. It is not another program IR. The logical
+plan contains no CUDA hierarchy, memory-space, primitive or launch names; the target plan is not
+launchable until one adapter resolves all of them. `LayerSummary` is also an analysis, until a real
+transformation needs structured layer/loop semantics.
 
 ## Read this first
 
@@ -55,7 +61,7 @@ Assign one task plus its prerequisite handoffs; GPU-unvalidated work is not a co
 The last four tasks are measurement-triggered alternatives, not mandatory expansion. The plan
 changes documentation only; it does not claim that these interfaces or tests already exist.
 
-## Five conclusions that matter
+## Six conclusions that matter
 
 1. The current code has concrete mapping and resource problems. More IR layers will not repair
    its serial per-output K reduction or its universal shared-memory reservation.
@@ -69,6 +75,10 @@ changes documentation only; it does not claim that these interfaces or tests alr
    not a peer semantic category to full attention.
 5. A private `CUfunction` does not provide an in-grid device body. cuBLASDx and adapted
    CUTLASS/CuTe code can provide such bodies, subject to their execution contracts.
+6. Extensibility is a checked boundary, not a second implementation. Common semantic, footprint,
+   lifetime and dependency contracts are target-neutral; CUDA owns its bodies, physical plan,
+   code generation and runtime. A future backend supplies those pieces and must earn its own
+   correctness/performance evidence.
 
 Evidence and primary references are attached to the detailed claims in the linked files.
 
@@ -96,8 +106,9 @@ The useful promise is more concrete: every proposed optimization has a named sou
 a cost to measure, and a rejection condition. The first performance milestone is a correct,
 generated cached-decode step that wins on both a small model and a roughly 2B model on one GPU.
 It also needs measured non-launch improvement over a matched phase control, with ablations
-distinguishing fusion, matrix-data lookahead and tile readiness. Portability and broader model
-coverage follow that result. There is no calibrated per-model-size forecast without a GPU.
+distinguishing fusion, matrix-data lookahead and tile readiness. The backend seam is defined now;
+implementing or claiming portability follows that result. There is no calibrated per-model-size
+forecast without a GPU.
 
 The initial objective retains the model's FP16 or BF16 policy. Quantization, continuous batching,
 multi-GPU execution, and recurrent hybrid models are separate extensions. They do not substitute

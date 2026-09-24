@@ -1,6 +1,7 @@
 # MegaBake V3: IR and reuse contracts
 
-Status: pipeline-first proposed design, 2026-09-09. The [architecture](MEGABAKE_V3_ARCHITECTURE.md) owns scope.
+Status: pipeline-first proposed design, 2026-09-09; backend boundary revised 2026-09-24. The
+[architecture](MEGABAKE_V3_ARCHITECTURE.md) owns scope.
 Examples below are schematic contracts, not implemented Python APIs.
 
 ## 1. When a representation earns its existence
@@ -14,11 +15,14 @@ a new graph container.
 |---|---|---|
 | Normalized FX | Tensor, shape, alias, numerical and effect facts | Safe simplification, guards, decomposition, reference execution |
 | SemanticGraph | Defined FatOps and their reference regions | Semantic matching, alternative composites, implementation selection |
-| ExecutionPlan | Body stages, tile ownership/footprints, reduction continuations, movement and readiness/release tokens | Joint fusion/tiling/scheduling, bounded overlap, safe storage reuse, CUDA generation |
+| LogicalExecutionPlan | Logical tiles/footprints, reduction continuations, movement intent and readiness/release conditions | Target-independent fusion/tiling alternatives, dependency verification and lifetime constraints |
+| TargetExecutionPlan | Selected target bodies/stages, physical layouts/spaces, worker placement, concrete events and invocation | Target-legal scheduling, bounded overlap, storage allocation, code generation and admission |
 
-`TensorFacts`, `LayerSummary`, and `TargetProfile` are side analyses. A memory allocation table is
-a field of the execution plan. Candidate and final plans have the same schema, with unresolved
-choices prohibited in a final plan. This avoids keeping multiple subtly inconsistent graphs alive.
+`TensorFacts`, `LayerSummary`, and `TargetProfile` are side analyses. Logical buffer requirements
+belong to the logical plan; physical allocation belongs to the target plan. Candidate and selected
+records may share implementation types, but a final target plan has no unresolved physical choices
+and always references the exact logical plan it lowers. This avoids keeping subtly inconsistent
+semantic graphs alive while still preventing CUDA fields from contaminating the portable contract.
 
 ## 2. The actual Inductor handoff
 
@@ -217,33 +221,79 @@ Do not add it merely to reproduce a configuration file's hierarchy.
 Code reuse is not automatic weight reuse: repeated layer shapes usually have different weights.
 A template loop may reduce instruction footprint without reducing the model's weight traffic.
 
-## 7. ExecutionPlan
+## 7. Logical and target execution plans
+
+The execution-plan boundary has two checked forms. `LogicalExecutionPlan` expresses what must
+happen and which partial orders are legal. `TargetExecutionPlan` records how one backend will make
+it happen. This split is deliberately below semantic recognition and above code generation.
+It is not a claim that a plan chosen without target feedback will perform well: joint search may
+enumerate or revise logical candidates after querying backend bodies, legality and costs.
+
+The logical form is serializable and contains no CUDA names:
 
 ```text
-ExecutionPlan {
+LogicalExecutionPlan {
   semantic_graph_hash, specialization_guards, numerical_policy,
-  target_requirements,
-  semantic_cover: [origin_regions, selected_body_or_composite],
-  bodies: [version, guards, thread_roles, stage_capabilities, resource_contract],
-  tiles: [body, logical_domain, output_region, read_and_reduction_footprints],
-  actions: [tile, kind, inputs, outputs, worker_or_cohort, required_tokens],
+  semantic_cover: [origin_regions, logical_body_capability_or_composite],
+  tiles: [logical_body, logical_domain, output_region, read_and_reduction_footprints],
+  actions: [tile, kind, inputs, outputs, placement_relation, required_conditions],
   reductions: [output_owner, accumulator, ordered_chunks, finalizer, cast_policy],
-  edges: [producer_action, consumer_action, exact_region, transport, layout],
-  events: [producers, expected_count, consumers, scope, initialization, generation],
-  buffers: [size, alignment, address_space, ownership, acquire_release_actions],
-  async_operations: [issuer, source, destination, completion, source_retirement],
-  schedule: [regions, worker_programs, cohort_sizes, lookahead, joins, progress_proof],
-  launch: [entry, block_shape, resident_worker_count, dynamic_smem],
-  invocation_bindings, output_and_state_contract,
+  edges: [producer_action, consumer_action, exact_region, transport_requirement, layout_constraints],
+  readiness: [producers, consumers, value_condition, initialization_requirement],
+  logical_buffers: [extent, alignment, ownership, lifetime_constraints, alias_constraints],
+  async_intents: [source, destination_role, completion_condition, source_retirement_condition],
+  schedule_constraints: [regions, partial_orders, allowed_cohorts, lookahead_bounds, required_joins],
+  invocation_bindings, output_and_state_contract, verification_report
+}
+```
+
+`placement_relation` can require same execution domain, distinct owners, co-resident participants
+or a collective group without naming a warp, CTA or TPU core. A transport requirement can request
+local forwarding, materialization, remote movement, a collective or recomputation with semantic
+constraints. It cannot select `CTA_shared`, `VMEM`, a CUDA atomic or a TPU semaphore.
+
+The target form resolves every mechanism required for compilation and invocation:
+
+```text
+TargetExecutionPlan {
+  logical_plan_hash, backend_id, target_profile_key,
+  selected_bodies: [provider, version, guards, target_roles, stage_and_resource_contract],
+  target_tiles: [logical_tile, body, physical_layout, target_coordinates],
+  actions: [logical_action, assigned_worker_or_cohort, concrete_stages, required_tokens],
+  edges: [logical_edge, selected_transport, source_space, destination_space, protocol],
+  events: [producers, expected_count, consumers, target_scope, primitive, initialization, generation],
+  buffers: [size, alignment, target_space, physical_layout, ownership, acquire_release_actions],
+  async_operations: [issuer, primitive, source, destination, completion, source_retirement],
+  schedule: [regions, worker_programs, target_cohorts, lookahead, joins, progress_proof],
+  invocation: [entry, topology, launch_or_dispatch_parameters, argument_abi],
   compiled_resources, verification_report, measurement_provenance
 }
 ```
 
-This is a logical schema, not a requirement for one object allocation per action or a general
-instruction interpreter. Repeated tiles/actions can be represented by affine domains and template
-loops; finalized descriptors may be compiled away. Candidates and selected plans use this schema.
+Target-plan lifecycle states are explicit: `lowered` has all physical choices needed to emit but
+may mark compiler-produced resource facts unknown; `compiled` attaches an immutable artifact and
+actual reports; `admitted` passes runtime legality for the visible target and may be invoked.
+Unknown compiler/runtime facts never become zeros or legal defaults. If actual resources invalidate
+the selected placement, create/reselect a new target plan referencing the same or a revised logical
+candidate; do not mutate the emitted plan's identity. Thus “no unresolved physical choices” does
+not pretend resource reports exist before compilation, and “target plan” alone does not mean safe
+to launch.
 
-An implementation's logical tiles describe work, not resident CTAs. Each output has one writer,
+These are schemas, not requirements for one object allocation per action or a general instruction
+interpreter. Repeated tiles/actions can be represented by affine domains and template loops;
+finalized descriptors may be compiled away. A CUDA target plan may resolve `topology` to a
+cooperative grid, `worker` to a CTA, spaces to registers/shared/global, and invocation parameters
+to block shape, resident worker count and dynamic shared memory. A future TPU target plan could
+instead resolve them to TensorCore/mesh placement, HBM/VMEM/SMEM, DMA semaphores, collectives and
+Pallas/Mosaic invocation metadata. Neither target vocabulary is legal in the logical schema.
+
+Lowering is accepted only if every logical tile, action, edge, readiness condition, buffer lifetime,
+state effect and numerical constraint has a target realization. Backend-introduced staging and
+joins may strengthen ordering but may not drop semantic work. When a target cannot realize a
+logical transport or progress requirement, it rejects that candidate; the common search may choose
+a different tile, transport or schedule. It must not silently reinterpret the plan.
+
+Logical tiles describe work, not CUDA CTAs or any other physical worker. Each output has one writer,
 unless an explicit reduction defines contributors and finalization. Body capabilities distinguish
 indivisible tiles, separately preloadable tiles and continued reductions. Actions have typed
 preconditions: an address-ready token cannot satisfy a data-ready dependency; scratch release
@@ -260,38 +310,49 @@ separately; do not mark a next operation entirely
 unready when only its activation is missing. A dynamic address dependent on an earlier value
 does retain that dependency. No speculation beyond guarded memory bounds is allowed.
 
-The primary lowering generates bounded pipelined worker/cohort programs. Barrier control is a
-second schedule policy for the same plan. A general scheduler IR, machine-instruction Tile IR or
-model-specific Layer IR is not necessary to express these decisions.
+The first CUDA lowering generates bounded pipelined CTA/cohort programs. Barrier control is a
+second CUDA schedule policy for the same logical plan. A general scheduler IR,
+machine-instruction Tile IR or model-specific Layer IR is not necessary to express these decisions.
 
-### Dependency scopes
+### Logical relations and target scopes
 
-| Scope | Example | Legal mechanism |
+The logical plan states relations; the target plan supplies mechanisms:
+
+| Logical relation | Meaning | CUDA realization in the first backend |
 |---|---|---|
-| Thread | Local expression | Program order |
-| Warp | Cooperative reduction | Required warp synchronization and participation contract |
-| CTA | Shared tile producer/consumer | Block barrier or documented async protocol |
-| Grid | Materialized phase boundary | Cooperative grid synchronization |
-| Cross-CTA tile | Published head/K chunk | Device-scope publication/acquire plus async completion and correct event lifecycle |
-| Resource token | Reusing staging or accumulator storage | All prior accesses retired, correct ownership and bounded credit protocol |
+| Same participant | Local expression/accumulator update | Thread or participating lane program order |
+| Same local group | Cooperative body or local forwarding | Required warp/CTA participation and block/async protocol |
+| All invocation workers | Materialized phase boundary | Uniform cooperative-grid synchronization |
+| Cross-worker region | Published head/K chunk | Device-scope publication/acquire plus async completion and event lifecycle |
+| Collective group | Reduction, exchange or group barrier | A CUDA collective/body protocol supported by the selected adapter |
+| Resource credit | Reusing staging or accumulator storage | All prior accesses retired, correct ownership and bounded credit protocol |
+
+Backends may expose different scopes and mechanisms, but they must prove that the selected scope
+covers every producer and consumer in the logical relation. A backend cannot weaken an all-worker
+join to a local barrier or treat local scratch as remotely reachable. Target-specific validation
+owns primitive ordering, participation, memory visibility and progress guarantees.
 
 Do not treat an atomic increment as a complete memory-ordering proof. The first pipeline requires
 initialized events, exact producer sets, no premature zero-ready state, scoped publication,
 safe reuse and a forward-progress argument. Its conservative initial protocol is defined in
-[publication](MEGABAKE_V3_PIPELINING_AND_SCHEDULING.md#9-cross-worker-publication-protocol).
+[publication](MEGABAKE_V3_PIPELINING_AND_SCHEDULING.md#9-cross-worker-publication-and-the-first-cuda-protocol).
 Worker order, resources and collective participation enter the proof, not just tensor-DAG edges.
 
 ## 8. Memory and state correctness
 
-Allocate from the selected schedule's partial order, not the original FX order or an estimated
-timeline. Incomparable uses may overlap. Async copies, continued accumulators and output retention
-extend lifetimes; distinguish source-access retirement from destination visibility. If two buffers
-alias, every access to the old value must retire before overwrite. Any body/tiling/pipeline change
-invalidates affected allocation, event and progress analyses and requires reverification.
+Derive logical lifetime conflicts from the selected schedule's partial order, not the original FX
+order or an estimated timeline. The target plan then assigns physical spaces, layouts and addresses
+that satisfy those conflicts and reachability requirements. Incomparable uses may overlap. Async
+copies, continued accumulators and output retention extend lifetimes; distinguish source-access
+retirement from destination visibility. If two buffers alias, every access to the old value must
+retire before overwrite. Any body/tiling/pipeline or target-lowering change invalidates affected
+allocation, event and progress analyses and requires reverification.
 
-Static per-CTA staging slots and distinct inter-CTA activation chunks within a region are enough
-initially. Reuse across a region join requires all readers/async work to finish. Inter-CTA ring
-reclamation with consumer acknowledgements is not silently assumed to exist.
+For the first CUDA target plan, static per-CTA staging slots and distinct inter-CTA activation
+chunks within a region are enough initially. Reuse across a region join requires all readers/async
+work to finish. Inter-CTA ring reclamation with consumer acknowledgements is not silently assumed
+to exist. The logical plan records local-group/cross-worker reachability and lifetime requirements,
+not these CUDA space names.
 
 State can be represented functionally:
 
@@ -311,14 +372,17 @@ buffer/`run_into` contract. Compare equivalent baselines.
 ## 9. Verification ladder
 
 1. **Reference equivalence:** run original, normalized and FatOp-expanded graphs on shared inputs.
-2. **Plan structure:** semantic/tile coverage, exact footprints, unique writers/reduction coverage,
-   typed tokens, effect order, bounds and guards.
-3. **Storage:** alias legality, partial-order lifetimes, async completion versus source retirement,
-   event initialization, accumulator lifetime and session ownership.
-4. **Participation:** every required barrier reached uniformly; every body receives its legal
-   threads, launch shape and scratch; cooperative residency checked on the compiled entry.
-5. **Progress/publication:** augmented worker/resource wait-for graph, correct atomics/scopes,
-   no stale generations, all producers runnable; tiny interleaving tests and device litmus tests.
+2. **Logical plan:** semantic/tile coverage, exact footprints, unique writers/reduction coverage,
+   typed conditions, effect order, lifetime/reachability constraints, bounds and guards.
+3. **Target coverage/storage:** every logical obligation has one realization; physical alias/space/
+   layout legality; async completion versus source retirement; event initialization; accumulator
+   lifetime and session ownership.
+4. **Participation:** every required target synchronization reached uniformly; every body receives
+   its legal participants, invocation shape and scratch. For CUDA, cooperative residency is checked
+   on the compiled entry.
+5. **Progress/publication:** augmented physical worker/resource wait-for graph, correct selected
+   primitives/scopes, no stale generations, all producers runnable; tiny interleaving tests and
+   target-device litmus tests.
 6. **Device differential tests:** values and state, including repeated calls and bucket boundaries.
 7. **End-to-end numerical tests:** agreed reference policy, adversarial ranges, long-context state
    and multi-step divergence. A large model-to-model max error alone proves little.
