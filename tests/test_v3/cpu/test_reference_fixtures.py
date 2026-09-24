@@ -7,6 +7,7 @@ import torch
 from megabake.v3.contracts import ExceptionalValuePolicy
 from tests.test_v3.fixtures import (
     GATE_TINY,
+    ATTENTION_TINY,
     LINEAR_TINY,
     NORM_VARIANTS,
     StateRegion,
@@ -59,3 +60,9 @@ def test_state_region_is_checked_separately_and_wrong_state_fails() -> None:
     report = compare_outputs(expected, actual, state_regions=(region,))
     assert not report.ok
     assert not report.state_regions_ok
+
+
+def test_attention_tiny_keeps_append_only_gqa_cache_semantics() -> None:
+    case = ATTENTION_TINY(seed=17, position=16)
+    assert case.expected["valid_length"] == 17
+    assert torch.equal(case.state_before["cache_k"][:, :, :16], case.state_after["cache_k"][:, :, :16])

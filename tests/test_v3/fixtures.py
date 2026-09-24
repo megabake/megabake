@@ -139,6 +139,47 @@ GATE_TINY = make_gate_tiny
 NORM_VARIANTS = make_norm_variants
 
 
+def make_attention_tiny(seed: int = DEFAULT_FIXTURE_SEED, *, position: int = 0) -> ReferenceCase:
+    """ATTENTION_TINY with GQA heads and an append-only capacity-17 KV cache."""
+
+    if position not in (0, 1, 15, 16):
+        raise ValueError("ATTENTION_TINY position must be one of 0, 1, 15, 16")
+    generator = _generator(seed)
+    q = torch.randn((1, 4, 1, 8), generator=generator)
+    k = torch.randn((1, 2, 1, 8), generator=generator)
+    v = torch.randn((1, 2, 1, 8), generator=generator)
+    cache_k = torch.full((1, 2, 17, 8), -17.0)
+    cache_v = torch.full((1, 2, 17, 8), -19.0)
+    next_k, next_v = cache_k.clone(), cache_v.clone()
+    next_k[:, :, position:position + 1] = k
+    next_v[:, :, position:position + 1] = v
+    valid = position + 1
+    output = F.scaled_dot_product_attention(q, next_k[:, :, :valid], next_v[:, :, :valid], enable_gqa=True)
+    return ReferenceCase(
+        name="ATTENTION_TINY", seed=seed,
+        inputs={"q": q, "k": k, "v": v, "cache_k": cache_k, "cache_v": cache_v, "position": position},
+        expected={"output": output, "cache_k": next_k, "cache_v": next_v, "valid_length": valid},
+        metadata={"B": 1, "Hq": 4, "Hkv": 2, "D": 8, "capacity": 17, "position": position},
+        state_before={"cache_k": cache_k, "cache_v": cache_v}, state_after={"cache_k": next_k, "cache_v": next_v},
+    )
+
+
+ATTENTION_TINY = make_attention_tiny
+
+
+def make_state_poison(seed: int = DEFAULT_FIXTURE_SEED, *, position: int = 0) -> ReferenceCase:
+    """A cache oracle whose untouched slots are deliberately distinguishable."""
+    case = make_attention_tiny(seed, position=position)
+    return ReferenceCase(
+        name="STATE_POISON", seed=case.seed, inputs=case.inputs, expected=case.expected,
+        metadata={**case.metadata, "poison_k": -17.0, "poison_v": -19.0},
+        state_before=case.state_before, state_after=case.state_after,
+    )
+
+
+STATE_POISON = make_state_poison
+
+
 @dataclass(frozen=True)
 class StateRegion:
     """A path and slice tuple used for independent state validation."""

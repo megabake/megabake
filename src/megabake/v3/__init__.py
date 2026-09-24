@@ -21,6 +21,7 @@ from .diagnostics import (
     EvidenceVector,
     TaskHandoff,
 )
+from .frontend import NormalizedProgram, SemanticGraph, collect_facts, normalize_fx, recognize
 
 __all__ = [
     "BenchmarkCell",
@@ -34,4 +35,9 @@ __all__ = [
     "DiagnosticRecord",
     "EvidenceVector",
     "TaskHandoff",
+    "NormalizedProgram",
+    "SemanticGraph",
+    "collect_facts",
+    "normalize_fx",
+    "recognize",
 ]
