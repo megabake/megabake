@@ -7,3 +7,6 @@ __pycache__/
 .pytest_cache/
 skills-lock.json
 benchmarks/baselines/
+
+# Local V3 task handoffs and benchmark evidence
+ART/

@@ -26,3 +26,8 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+markers = [
+    "v3_gpu: requires a selected CUDA device and defers device checks until test setup",
+    "v3_toolchain: requires the selected CUDA toolchain, normally nvcc",
+    "v3_slow: an intentionally slow V3 correctness or evidence test",
+]

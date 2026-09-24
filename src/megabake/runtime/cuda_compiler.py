@@ -47,8 +47,6 @@ def _resolve_cutlass_include() -> Path:
     )
 
 
-_CUTLASS_INCLUDE = _resolve_cutlass_include()
-
 
 def _compile_megakernel(force: bool = False, portable: bool = False) -> str:
     """Compile all CUDA sources into a cubin/fatbin.
@@ -108,6 +106,9 @@ def _compile_megakernel(force: bool = False, portable: bool = False) -> str:
 
     combined_src.write_text(combined)
 
+    # Resolve the optional headers only for an actual compile request.
+    cutlass_include = _resolve_cutlass_include()
+
     sm = get_sm_version()
 
     if portable:
@@ -122,7 +123,7 @@ def _compile_megakernel(force: bool = False, portable: bool = False) -> str:
             "-std=c++17",
             "--use_fast_math",
             "--expt-relaxed-constexpr",
-            f"-I{_CUTLASS_INCLUDE}",
+            f"-I{cutlass_include}",
             "-o", out_path,
             "-diag-suppress=177",
         ]
@@ -137,7 +138,7 @@ def _compile_megakernel(force: bool = False, portable: bool = False) -> str:
             "-std=c++17",
             "--use_fast_math",
             "--expt-relaxed-constexpr",
-            f"-I{_CUTLASS_INCLUDE}",
+            f"-I{cutlass_include}",
             "-o", out_path,
             "-diag-suppress=177",
         ]
