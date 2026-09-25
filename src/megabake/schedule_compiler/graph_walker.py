@@ -88,6 +88,55 @@ def _resolve_shape_op(target, view: StridedView, args) -> StridedView | None:
     return view
 
 
+def _can_elide_tensor_metadata_assert(node) -> bool:
+    aten_ops = getattr(torch.ops, "aten", None)
+    assert_op = getattr(
+        getattr(aten_ops, "_assert_tensor_metadata", None), "default", None
+    )
+    if node.target != assert_op or node.users or not node.args:
+        return False
+
+    tensor_node = node.args[0]
+    tensor_meta = getattr(tensor_node, "meta", {}).get("val")
+    if not isinstance(tensor_meta, torch.Tensor):
+        return False
+
+    for name, index in (
+        ("size", 1),
+        ("stride", 2),
+        ("dtype", 3),
+        ("device", None),
+        ("layout", None),
+    ):
+        expected = node.kwargs.get(name)
+        if expected is None and index is not None and len(node.args) > index:
+            expected = node.args[index]
+        if expected is None:
+            continue
+
+        if name == "size" or name == "stride":
+            actual = tensor_meta.shape if name == "size" else tensor_meta.stride()
+            if (not isinstance(expected, (tuple, list))
+                    or any(type(dim) is not int for dim in expected)
+                    or any(type(dim) is not int for dim in actual)
+                    or tuple(expected) != tuple(actual)):
+                return False
+        elif name == "device":
+            try:
+                expected_device = torch.device(expected)
+            except (TypeError, RuntimeError):
+                return False
+            actual_device = tensor_meta.device
+            if (expected_device.type != actual_device.type
+                    or (expected_device.index is not None
+                        and expected_device.index != actual_device.index)):
+                return False
+        elif getattr(tensor_meta, name) != expected:
+            return False
+
+    return True
+
+
 def _extract_dimensions(op_type: int, node, out_shape: list[int]) -> list[int]:
     dims = [0] * 8
     if op_type == OpType.MATMUL:
@@ -1087,6 +1136,8 @@ def compile_from_ep(
                         buffer_map[node.name] = new_view.buffer_id
 
             elif mapping is None:
+                if _can_elide_tensor_metadata_assert(node):
+                    continue
                 op_name = getattr(target, "__name__", str(target))
                 unsupported_ops.append(op_name)
                 out_meta = node.meta.get("val")
