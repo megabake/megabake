@@ -4,6 +4,8 @@
 
 # megabake
 
+**New here?** Read the [MegaBake launch post](blog/megabake-launch.md) for a quick introduction and an honest snapshot of the project's current state.
+
 MegaBake compiles a **supported** `torch.export` graph into a task schedule
 executed by one cooperative CUDA kernel. This reduces per-operator kernel
 launches; it does not eliminate launch, allocation, or host overhead.
@@ -199,4 +201,4 @@ eager PyTorch. Partial graph acceleration is not implemented.
 
 ## License
 
-BSD-3-Clause
+MIT License ([LICENSE-MIT](LICENSE-MIT)).
