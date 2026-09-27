@@ -1,17 +1,21 @@
 # MegaBake V3: audit of the GPU evidence
 
-Audit date: 2026-09-09. No GPU available; no benchmarks rerun. Repository inspected at
-`3695f06de14322fd8ac3e111c693612d53b56319`.
+Original evidence audit: 2026-09-09, repository base
+`3695f06de14322fd8ac3e111c693612d53b56319`. Architectural implications revised
+2026-09-27. The historical numbers below were not rerun and are not V3 measurements.
 
 ## 1. The conclusion supported today
 
-The current implementation has strong source-level evidence of poor skinny-linear mapping and a
-large whole-entry resource footprint. The latest V2 prose reports substantial losses against a
-low-overhead compiled baseline. Neither more IR layers nor the GraCE argument-patching mechanism
-addresses those problems directly.
+The inspected V2 implementation has strong source-level evidence of poor skinny-linear mapping
+and a large whole-entry resource footprint. The latest V2 prose reports substantial losses
+against a low-overhead compiled baseline. The V3 response is a different compiler center:
+indexed tensor semantics that can generate supported work without a new model-family FatOp,
+plus an exact-shape, target-specific portfolio of competitive device bodies. A scheduler or
+argument-patching mechanism does not repair a dominant 4–6x body deficit by itself.
 
-The immediate experiment is competitive embedded math plus a correctly measured, generated
-cached-decode step. Its eventual speedup is unknown.
+The immediate experiment is a matched vendor baseline, embedded SIMT/tensor-core tactics,
+their lean-entry composition and a correctly measured full cached-decode step. Its eventual
+speedup is unknown.
 
 ## 2. Separate the evidence generations
 
@@ -104,8 +108,8 @@ reduce-overhead experiment as a fully reproducible named benchmark path. Add tha
 implementation work rather than assuming the current harness reproduces all V2 tables.
 
 These issues qualify the evidence; they do not require throwing away the useful mapping/resource
-findings. The [performance protocol](MEGABAKE_V3_PERFORMANCE_MODEL.md#7-measurement-protocol) specifies
-the replacement measurement contract. No harness is modified in this documentation task.
+findings. The [performance protocol](MEGABAKE_V3_PERFORMANCE_MODEL.md#6-measurement-contract) specifies
+the replacement measurement contract. No harness is modified by this documentation rewrite.
 
 ## 6. Concrete implementation bottlenecks
 
@@ -157,9 +161,13 @@ Historical isolated measurements from [V2 §5](MEGABAKE_V2_GPU_REANALYSIS.md), p
 | 1,49152,576 | WMMA-based | 34.98 | 77.76 |
 | 1,4096,4096 | Tensor-core GEMM | 23.39 | 95.78 |
 
-The evidence supports testing both K-parallel GEMV and a tensor-core tactic at M=1. It does not
-support mandating four implementation libraries for every shape or claiming one family wins
-all skinny matrices. Tune logical tile count separately from resident worker count.
+The evidence supports testing both K-parallel GEMV and a tensor-core tactic at M=1. For
+`Y = X W^T`, the equivalent `Y^T = W X^T` can put N output channels on the wide tensor-core
+axis, with padding and split-K as separately costed choices. At N=576, 64-channel tiles expose
+only nine output tiles before split-K; at N=4096 they expose 64. This is one reason a body
+algorithm must be selected by exact shape and visible target resources. It does not support
+mandating four implementation libraries or claiming one tactic wins all skinny matrices.
+Logical tile count remains independent of resident worker count.
 
 ## 8. Smaller overheads are real but not the first explanation
 
@@ -170,40 +178,38 @@ work still count; removing them alone cannot explain a multi-millisecond body ga
 The reported scheduler comparison is 4.756 ms with queues versus 4.573 ms with a static loop:
 about 3.85% lower body latency in that experiment. This shows a control-overhead difference for
 those implementations; it does not measure head-ready attention, streamed gate/down reductions
-or matrix-data lookahead. It neither establishes that fine-grained scheduling is worth only 4%
-nor justifies excluding pipelines from the primary architecture. Scheduling simplification alone
-also does not close the approximately 2.72x end-to-end gap.
+or matrix-data lookahead. It does not bound the value of those optional mechanisms; each needs
+its own body-quality and complete-call comparison. Scheduling simplification alone also does
+not close the approximately 2.72x end-to-end gap.
 
 Large reported logits differences, including 0.195312 for MegaBake, remain unresolved correctness
 evidence. The fact that another compiled path differed more does not validate either policy.
 No speedup is accepted until the agreed numerical and state tests pass.
 
-## 9. What changes in V3
+## 9. Implications for the revised V3
 
-Keep the resource/mapping diagnosis. Strengthen the baseline and evidence contracts. Remove
-unconditional claims that semantic parameter bytes divided by product bandwidth are a latency
-floor; physical traffic depends on accessed tensors and cache conditions. Do not infer exact CPU
-overhead by subtraction or exact attainable fusion savings from profiler sums.
+Keep the source-level mapping/resource diagnosis and strengthen baseline, numerical and state
+evidence. Semantic parameter bytes divided by a product-sheet bandwidth are not an unconditional
+latency floor; accessed tensors and cache conditions matter. Profiler kernel-duration sums do not
+isolate exact host overhead or an automatically recoverable fusion budget.
 
-The useful next result is not another architecture document with a promised multiplier. It is a
-reproducible table containing correctness, complete latency, actual compiled resources and stateful
-workload definitions for one generated design. See [implementation experiments](MEGABAKE_V3_IMPLEMENTATION.md).
-
-### Revised implications for the pipeline-first architecture
-
-| Historical evidence | What V3 changes | What still requires measurement |
+| Historical evidence | Revised compiler decision | Still unmeasured |
 |---|---|---|
-| Serial per-output K work and few useful lanes | Shape-specific K-parallel/tensor-core bodies; logical tiling independent of workers | Quality after consumer-aligned tiling and embedding |
-| Universal large shared allocation and register footprint | Selected bodies plus proven overlapping lifetimes, actual-entry resource gate | Whether lookahead/continuations fit without losing more residency than they save |
-| Queue/static comparison without mechanism isolation | Keep barrier control; generate staged/ready-tile schedules too | Non-launch gains under matched optimized assignments |
-| Uncached sequence-one wrapper | Real stateful decode with head/cache readiness | Attention overlap and long-context costs |
-| Incomplete real-model raw artifacts | Matched external baseline and owned-body/fusion/pipeline ablations | Reproducible whole-model win and uncertainty |
+| Serial per-output K work and few valid lanes | Generate K-parallel SIMT and output-channel-major tensor-core tactics from indexed contraction semantics | Exact-shape vendor-relative quality across SMs and within a mixed entry |
+| Universal large shared reservation and register footprint | Compile each selected body mixture and admit its actual resource envelope | Whether a lighter tactic beats a faster isolated body after composition |
+| Queue/static comparison without mechanism isolation | Keep static/barrier controls and cost optional ready-tile, streamed or prefetch variants | Net non-launch gain and its body-quality tradeoff |
+| Uncached sequence-one wrapper | Capture one actual stateful cached FX step with effects and valid-length guards | Attention, cache and long-context behavior |
+| Missing latest raw real-model artifacts | Predeclare a complete-step scorecard and retain raw samples/resources | Reproducible strict win or loss against strongest equivalent `torch.compile` |
 
-The mapping defect is still an immediate priority, but treating scheduling as a small final polish
-was too strong an inference. The revised [architecture](MEGABAKE_V3_ARCHITECTURE.md) jointly selects
-bodies, tiles, movement and schedule. Good microkernel results do not excuse missing pipelines;
-pipeline diagrams do not excuse weak math. Neither component's success alone establishes the goal.
+The new [architecture](MEGABAKE_V3_ARCHITECTURE.md) removes FatOps as a strict-coverage gate,
+puts algorithm/body quality before a large scheduling project, and selects body, tile, ownership
+and schedule jointly. A generic generated contraction may compile an unfamiliar model yet still
+lose to the vendor body. An optional pipeline may help only after its own loss of body efficiency,
+extra scratch and synchronization are charged. The [implementation order](MEGABAKE_V3_IMPLEMENTATION.md)
+tests these risks early.
 
-No historical number above has been reinterpreted as a measured V3 benefit. In particular, the
-new model-size/efficiency scenarios in the performance document are calculations, not an extension
-of the H200/MIG benchmark record.
+For an implementation handoff, [V3R-002H](MEGABAKE_V3_IMPLEMENTATION.md) replaces the uncached real-model wrapper as the workload proof; V3R-003/004 establish the matched baseline and hot shapes; V3R-005–009 measure whether an embedded body can meet that budget. Later scheduling cards cannot reinterpret this V2 evidence as a V3 speedup.
+
+No historical number above is a measured V3 benefit. In particular, the older 4.85 ms versus
+1.78 ms result is an uncached V2 comparison on a specific MIG partition, not the cached-step
+target or a prediction for another SM generation.
