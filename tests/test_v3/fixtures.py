@@ -180,6 +180,31 @@ def make_state_poison(seed: int = DEFAULT_FIXTURE_SEED, *, position: int = 0) ->
 STATE_POISON = make_state_poison
 
 
+def make_tiny_stateful_graph() -> torch.fx.GraphModule:
+    """A complete one-token FX step with one lifted weight and one KV append."""
+
+    class TinyStep(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.arange(12, dtype=torch.float32).reshape(4, 3) / 12)
+
+    root = TinyStep()
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    cache = graph.placeholder("cache")
+    position = graph.placeholder("position")
+    weight = graph.get_attr("weight")
+    logits = graph.call_function(torch.ops.aten.mm.default, (x, weight))
+    update = graph.call_function(torch.ops.aten.view.default, (x, [1, 1, 1, 4]))
+    new_cache = graph.call_function(torch.ops.aten.index_copy.default, (cache, 2, position, update))
+    new_length = graph.call_function(torch.ops.aten.add.Scalar, (position, 1))
+    graph.output({"logits": logits, "cache": new_cache, "valid_length": new_length})
+    graph_module = torch.fx.GraphModule(root, graph)
+    graph_module.graph.lint()
+    graph_module.recompile()
+    return graph_module
+
+
 @dataclass(frozen=True)
 class StateRegion:
     """A path and slice tuple used for independent state validation."""

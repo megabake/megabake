@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
+
 import pytest
 
 from megabake.v3.contracts import (
@@ -9,6 +12,8 @@ from megabake.v3.contracts import (
     ContractError,
     ExceptionalValuePolicy,
     NumericalPolicy,
+    StepABI,
+    StepManifest,
     ToleranceSpec,
     WorkloadSpec,
 )
@@ -93,3 +98,78 @@ def test_invalid_workload_contracts_are_rejected(overrides: dict[str, object]) -
 def test_missing_numerical_policy_fields_are_rejected() -> None:
     with pytest.raises(TypeError):
         NumericalPolicy(reference_expansion="missing-fields")  # type: ignore[call-arg]
+
+
+def _tiny_manifest() -> StepManifest:
+    path = Path(__file__).resolve().parents[3] / "benchmarks/v3/manifests/tiny_cached_step.json"
+    return StepManifest.from_json(path.read_text())
+
+
+def test_step_manifest_round_trip_and_complete_cache_abi_hash() -> None:
+    manifest = _tiny_manifest()
+    restored = StepManifest.from_json(manifest.to_json())
+    assert restored.to_dict() == manifest.to_dict()
+    assert restored.contract_hash == manifest.contract_hash
+    assert set(manifest.not_measured_cells) == {"tiny-advance-L0", "tiny-advance-L1"}
+    assert manifest.step_abi.state_mode == "advancing"
+    assert manifest.step_abi.cache_update_mode == "functional_append"
+
+    state_data = manifest.step_abi.to_dict()
+    changed_layout_name = "b,capacity,h,d"
+    state_data["old_state_inputs"][0]["layout"] = changed_layout_name
+    workload_data = manifest.workload.to_dict()
+    workload_data["cache_layout"] = changed_layout_name
+    changed_layout = replace(
+        manifest,
+        workload=WorkloadSpec.from_dict(workload_data),
+        step_abi=StepABI.from_dict(state_data),
+    )
+    assert changed_layout.contract_hash != manifest.contract_hash
+
+    policy_data = manifest.numerical_policy.to_dict()
+    policy_data["intermediate_casts"] = ["x->float16"]
+    changed_policy = NumericalPolicy.from_dict(policy_data)
+    abi_data = manifest.step_abi.to_dict()
+    abi_data["guard_set"]["numerical_policy_hash"] = changed_policy.contract_hash
+    changed_numeric_contract = replace(
+        manifest,
+        numerical_policy=changed_policy,
+        step_abi=StepABI.from_dict(abi_data),
+    )
+    assert changed_numeric_contract.contract_hash != manifest.contract_hash
+
+    replay_data = manifest.step_abi.to_dict()
+    replay_data["state_mode"] = "fixed_replay"
+    replay_data["invocation_preparation"]["fixed_state_reset"] = {
+        "policy": "restore_initial_cache",
+        "frequency": "per_invocation",
+    }
+    replay = replace(manifest, step_abi=StepABI.from_dict(replay_data))
+    assert replay.contract_hash != manifest.contract_hash
+
+
+@pytest.mark.parametrize("field,value", [("old_state_inputs", []), ("new_state_outputs", [])])
+def test_cached_step_manifest_rejects_missing_state_edges(field: str, value: object) -> None:
+    manifest = _tiny_manifest()
+    payload = manifest.step_abi.to_dict()
+    payload[field] = value
+    with pytest.raises(ValueError, match="state"):
+        StepABI.from_dict(payload)
+
+
+def test_cached_step_manifest_rejects_uncached_calls_and_pointer_hashes() -> None:
+    manifest = _tiny_manifest()
+    payload = manifest.to_dict()
+    payload["workload"]["timed_unit"] = "forward"
+    with pytest.raises(ValueError, match="cached_step"):
+        StepManifest.from_dict(payload)
+
+    payload = manifest.to_dict()
+    payload["fixed_inputs"]["cache_pointer"] = 123456
+    with pytest.raises(ValueError, match="pointer"):
+        StepManifest.from_dict(payload)
+
+    abi = manifest.step_abi.to_dict()
+    abi["cache_update_mode"] = "disabled"
+    with pytest.raises(ValueError, match="functional_append"):
+        StepABI.from_dict(abi)

@@ -22,5 +22,7 @@ def test_graphmodule_capture_rejects_unknown_python_callback_before_export():
     result = fx_graph.call_function(callback, (x,))
     fx_graph.output(result)
     custom = torch.fx.GraphModule({}, fx_graph)
-    with __import__("pytest").raises(UnsupportedGraphError):
+    with __import__("pytest").raises(UnsupportedGraphError, match="callback") as exc:
         capture_graph_module(custom, (torch.ones(2),), input_spec={})
+    stable_target = f"{callback.__module__}.{callback.__qualname__}"
+    assert str(exc.value) == f"unsupported custom effect/control-flow node callback: {stable_target}"

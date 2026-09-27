@@ -9,6 +9,8 @@ from .contracts import (
     BenchmarkCell,
     ExceptionalValuePolicy,
     NumericalPolicy,
+    StepABI,
+    StepManifest,
     ToleranceSpec,
     WorkloadSpec,
 )
@@ -27,6 +29,8 @@ __all__ = [
     "BenchmarkCell",
     "ExceptionalValuePolicy",
     "NumericalPolicy",
+    "StepABI",
+    "StepManifest",
     "ToleranceSpec",
     "WorkloadSpec",
     "BenchmarkEvidence",

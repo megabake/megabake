@@ -104,6 +104,48 @@ def _mapping_proxy(value: Mapping[str, Any], field_name: str) -> Mapping[str, An
     return MappingProxyType({key: result[key] for key in sorted(result)})
 
 
+def _contains_pointer_key(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            name = str(key).lower().replace("_", "")
+            if "pointer" in name or name.endswith("ptr") or name in {"dataptr", "address", "deviceaddress"}:
+                return True
+            if _contains_pointer_key(item):
+                return True
+    elif isinstance(value, (tuple, list)):
+        return any(_contains_pointer_key(item) for item in value)
+    return False
+
+
+def _freeze_json(value: Any, field_name: str) -> Any:
+    """Validate JSON data and freeze nested mappings/sequences for contracts."""
+    canonical_json(value)
+    if _contains_pointer_key(value):
+        raise ContractError(f"{field_name} cannot contain raw tensor pointers or addresses")
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_json(item, field_name) for key, item in value.items()})
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_json(item, field_name) for item in value)
+    return value
+
+
+def _record_tuple(value: Any, field_name: str) -> tuple[Mapping[str, Any], ...]:
+    if not isinstance(value, (tuple, list)):
+        raise ContractError(f"{field_name} must be a sequence of JSON objects")
+    records = tuple(_freeze_json(item, field_name) for item in value)
+    if any(not isinstance(item, Mapping) for item in records):
+        raise ContractError(f"{field_name} must contain only JSON objects")
+    return records
+
+
+def _path(value: Any, field_name: str) -> tuple[str | int, ...]:
+    if not isinstance(value, (tuple, list)) or any(
+        not isinstance(item, (str, int)) or isinstance(item, bool) for item in value
+    ):
+        raise ContractError(f"{field_name} must be a sequence of string/integer path components")
+    return tuple(value)
+
+
 class InputOrigin(str, Enum):
     CPU = "cpu"
     GPU = "gpu"
@@ -515,6 +557,329 @@ class NumericalPolicy:
         return _contract_hash(self.to_dict())
 
 
+@dataclass(frozen=True)
+class StepABI:
+    """Versioned caller/state/output ABI for one complete cached decode step."""
+
+    ordered_user_inputs: tuple[Mapping[str, Any], ...]
+    lifted_bindings: Mapping[str, Mapping[str, Any]]
+    old_state_inputs: tuple[Mapping[str, Any], ...]
+    state_effects: tuple[Mapping[str, Any], ...]
+    new_state_outputs: tuple[Mapping[str, Any], ...]
+    user_output_tree: Mapping[str, Any]
+    position_and_valid_length: Mapping[str, Any]
+    batch_rule: str
+    invocation_preparation: Mapping[str, Any]
+    guard_set: Mapping[str, Any]
+    state_mode: str
+    cache_update_mode: str
+    schema_version: int = CONTRACT_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        input_records = _record_tuple(self.ordered_user_inputs, "ordered_user_inputs")
+        state_records = _record_tuple(self.old_state_inputs, "old_state_inputs")
+        effect_records = _record_tuple(self.state_effects, "state_effects")
+        output_records = _record_tuple(self.new_state_outputs, "new_state_outputs")
+        if not input_records:
+            raise ContractError("StepABI requires ordered user inputs")
+        input_ids = []
+        for item in input_records:
+            input_ids.append(_nonempty(item.get("placeholder"), "input placeholder"))
+            _path(item.get("path"), "input path")
+        if len(set(input_ids)) != len(input_ids):
+            raise ContractError("StepABI user input placeholders must be unique")
+        object.__setattr__(self, "ordered_user_inputs", input_records)
+        state_mode = _nonempty(self.state_mode, "state_mode")
+        if state_mode not in {"advancing", "fixed_replay"}:
+            raise ContractError("state_mode must be 'advancing' or 'fixed_replay'")
+        object.__setattr__(self, "state_mode", state_mode)
+        if self.cache_update_mode != "functional_append":
+            raise ContractError("StepABI/v1 requires functional_append cache updates")
+
+        bindings = _freeze_json(self.lifted_bindings, "lifted_bindings")
+        if not isinstance(bindings, Mapping):
+            raise ContractError("lifted_bindings must be a mapping")
+        for placeholder, binding in bindings.items():
+            _nonempty(placeholder, "lifted binding placeholder")
+            if not isinstance(binding, Mapping):
+                raise ContractError(f"lifted_bindings[{placeholder!r}] must be an object")
+            _nonempty(binding.get("identity"), f"lifted_bindings[{placeholder!r}].identity")
+            if binding.get("role") not in {"weight", "parameter", "buffer", "constant"}:
+                raise ContractError(f"lifted_bindings[{placeholder!r}].role is invalid")
+            _nonempty(binding.get("lifetime"), f"lifted_bindings[{placeholder!r}].lifetime")
+        object.__setattr__(self, "lifted_bindings", bindings)
+
+        if not state_records:
+            raise ContractError("cached-step ABI requires old state inputs")
+        state_ids: set[str] = set()
+        for item in state_records:
+            placeholder = _nonempty(item.get("placeholder"), "state placeholder")
+            if placeholder not in input_ids:
+                raise ContractError(f"state placeholder {placeholder!r} is not an ordered user input")
+            state_id = _nonempty(item.get("state_id"), "state_id")
+            if state_id in state_ids:
+                raise ContractError(f"duplicate old state identity {state_id!r}")
+            state_ids.add(state_id)
+            _path(item.get("path"), "state input path")
+            _nonempty(item.get("layout"), "state layout")
+            _nonempty(item.get("alias_set"), "state alias_set")
+            capacity = item.get("capacity")
+            if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity <= 0:
+                raise ContractError("state capacity must be a positive integer")
+        object.__setattr__(self, "old_state_inputs", state_records)
+
+        if not effect_records:
+            raise ContractError("cached-step ABI requires explicit state effects")
+        effect_ids: set[str] = set()
+        orders: set[int] = set()
+        for item in effect_records:
+            effect_id = _nonempty(item.get("effect_id"), "effect_id")
+            if effect_id in effect_ids:
+                raise ContractError(f"duplicate state effect {effect_id!r}")
+            effect_ids.add(effect_id)
+            if item.get("state_id") not in state_ids:
+                raise ContractError(f"state effect {effect_id!r} refers to unknown state")
+            order = item.get("order")
+            if not isinstance(order, int) or isinstance(order, bool) or order < 0 or order in orders:
+                raise ContractError("state effect order must be a unique non-negative integer")
+            orders.add(order)
+            for field_name in ("reads", "writes"):
+                if not isinstance(item.get(field_name), (tuple, list, Mapping)) or not item[field_name]:
+                    raise ContractError(f"state effect {effect_id!r} needs explicit {field_name} regions")
+        object.__setattr__(self, "state_effects", effect_records)
+
+        if not output_records:
+            raise ContractError("cached-step ABI requires new state outputs")
+        output_state_ids: set[str] = set()
+        for item in output_records:
+            state_id = _nonempty(item.get("state_id"), "new state output state_id")
+            if state_id not in state_ids:
+                raise ContractError(f"new state output refers to unknown state {state_id!r}")
+            output_state_ids.add(state_id)
+            _path(item.get("path"), "new state output path")
+            if not item.get("source_id") and not item.get("alias_of"):
+                raise ContractError("new state output requires source_id or alias_of")
+        if output_state_ids != state_ids:
+            raise ContractError("every old state input must have a declared new state output")
+        object.__setattr__(self, "new_state_outputs", output_records)
+
+        output_tree = _freeze_json(self.user_output_tree, "user_output_tree")
+        if not isinstance(output_tree, Mapping) or "structure" not in output_tree:
+            raise ContractError("user_output_tree requires a structure")
+        leaves = output_tree.get("leaves")
+        if not isinstance(leaves, (tuple, list)) or not leaves:
+            raise ContractError("user_output_tree requires typed leaves")
+        output_paths: set[tuple[str | int, ...]] = set()
+        for leaf in leaves:
+            if not isinstance(leaf, Mapping):
+                raise ContractError("user_output_tree leaves must be objects")
+            path = _path(leaf.get("path"), "output leaf path")
+            if path in output_paths:
+                raise ContractError(f"duplicate output leaf path {path!r}")
+            output_paths.add(path)
+            if leaf.get("ownership") not in {item.value for item in OutputOwnership}:
+                raise ContractError(f"output ownership at {path!r} is invalid")
+            _nonempty(leaf.get("lifetime"), f"output lifetime at {path!r}")
+        if any(_path(item["path"], "new state output path") not in output_paths for item in output_records):
+            raise ContractError("new state outputs must be leaves of user_output_tree")
+        object.__setattr__(self, "user_output_tree", output_tree)
+
+        position = _freeze_json(self.position_and_valid_length, "position_and_valid_length")
+        if not isinstance(position, Mapping):
+            raise ContractError("position_and_valid_length must be an object")
+        for name in ("position_source", "old_valid_length_source", "attend_range"):
+            _nonempty(position.get(name), f"position_and_valid_length.{name}")
+        if position.get("append_position_expression") != "L":
+            raise ContractError("cached-step append position must be the old valid length L")
+        if position.get("new_valid_length_expression") != "L+1":
+            raise ContractError("cached-step new valid length must be L+1")
+        object.__setattr__(self, "position_and_valid_length", position)
+
+        batch_rule = _nonempty(self.batch_rule, "batch_rule")
+        if batch_rule != "uniform_valid_length":
+            raise ContractError("the first cached-step ABI requires uniform_valid_length")
+        object.__setattr__(self, "batch_rule", batch_rule)
+
+        preparation = _freeze_json(self.invocation_preparation, "invocation_preparation")
+        if not isinstance(preparation, Mapping):
+            raise ContractError("invocation_preparation must be an object")
+        _nonempty(preparation.get("setup_amortization"), "setup_amortization")
+        actions = preparation.get("actions")
+        if not isinstance(actions, (tuple, list)) or any(not isinstance(action, Mapping) for action in actions):
+            raise ContractError("invocation_preparation.actions must be a sequence of objects")
+        if state_mode == "fixed_replay" and not preparation.get("fixed_state_reset"):
+            raise ContractError("fixed_replay requires an explicit fixed_state_reset policy")
+        object.__setattr__(self, "invocation_preparation", preparation)
+
+        guards = _freeze_json(self.guard_set, "guard_set")
+        if not isinstance(guards, Mapping):
+            raise ContractError("guard_set must be an object")
+        required_guards = {"shapes", "strides", "dtypes", "capacity", "features", "numerical_policy_hash"}
+        if not required_guards.issubset(guards):
+            raise ContractError(f"guard_set is missing {sorted(required_guards.difference(guards))}")
+        for key in required_guards:
+            if guards[key] in (None, "", (), [], {}):
+                raise ContractError(f"guard_set.{key} cannot be empty")
+        object.__setattr__(self, "guard_set", guards)
+
+        if self.schema_version != CONTRACT_SCHEMA_VERSION:
+            raise ContractError(f"unsupported StepABI schema_version={self.schema_version}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _json_value({
+            "schema_version": self.schema_version,
+            "ordered_user_inputs": self.ordered_user_inputs,
+            "lifted_bindings": self.lifted_bindings,
+            "old_state_inputs": self.old_state_inputs,
+            "state_effects": self.state_effects,
+            "new_state_outputs": self.new_state_outputs,
+            "user_output_tree": self.user_output_tree,
+            "position_and_valid_length": self.position_and_valid_length,
+            "batch_rule": self.batch_rule,
+            "invocation_preparation": self.invocation_preparation,
+            "guard_set": self.guard_set,
+            "state_mode": self.state_mode,
+            "cache_update_mode": self.cache_update_mode,
+        })
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "StepABI":
+        _check_schema(value, cls.__name__)
+        fields_to_load = (
+            "ordered_user_inputs", "lifted_bindings", "old_state_inputs", "state_effects",
+            "new_state_outputs", "user_output_tree", "position_and_valid_length", "batch_rule",
+            "invocation_preparation", "guard_set", "state_mode", "cache_update_mode",
+        )
+        return cls(**{key: value[key] for key in fields_to_load}, schema_version=value["schema_version"])
+
+    def canonical_json(self) -> str:
+        return canonical_json(self.to_dict())
+
+    @property
+    def contract_hash(self) -> str:
+        return _contract_hash(self.to_dict())
+
+
+@dataclass(frozen=True)
+class StepManifest:
+    """Reproducible, hashed workload + numerical + state ABI manifest."""
+
+    workload: WorkloadSpec
+    numerical_policy: NumericalPolicy
+    step_abi: StepABI
+    checkpoint_revision: str
+    graph_hash: str
+    versions: Mapping[str, str]
+    fixed_inputs: Mapping[str, Any]
+    cell_status: Mapping[str, str]
+    schema_version: int = CONTRACT_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.workload, WorkloadSpec):
+            object.__setattr__(self, "workload", WorkloadSpec.from_dict(self.workload))
+        if not isinstance(self.numerical_policy, NumericalPolicy):
+            object.__setattr__(self, "numerical_policy", NumericalPolicy.from_dict(self.numerical_policy))
+        if not isinstance(self.step_abi, StepABI):
+            object.__setattr__(self, "step_abi", StepABI.from_dict(self.step_abi))
+        if self.workload.timed_unit != TimedUnit.CACHED_STEP.value:
+            raise ContractError("a StepManifest must use timed_unit=cached_step")
+        if not self.workload.benchmark_cells:
+            raise ContractError("a StepManifest must declare at least one benchmark cell")
+        for state in self.step_abi.old_state_inputs:
+            if state["capacity"] != self.workload.capacity:
+                raise ContractError("WorkloadSpec and StepABI cache capacities differ")
+            if state["layout"] != self.workload.cache_layout:
+                raise ContractError("WorkloadSpec and StepABI cache layouts differ")
+        object.__setattr__(self, "checkpoint_revision", _nonempty(self.checkpoint_revision, "checkpoint_revision"))
+        graph_hash = _nonempty(self.graph_hash, "graph_hash")
+        if len(graph_hash) != 64 or any(char not in "0123456789abcdef" for char in graph_hash.lower()):
+            raise ContractError("graph_hash must be a 64-character SHA-256 hex digest")
+        object.__setattr__(self, "graph_hash", graph_hash.lower())
+
+        versions = _freeze_json(self.versions, "versions")
+        if not isinstance(versions, Mapping):
+            raise ContractError("versions must be a mapping")
+        required_versions = {"python", "pytorch", "cuda_runtime", "cuda_toolkit", "transformers"}
+        if not required_versions.issubset(versions):
+            raise ContractError(f"versions is missing {sorted(required_versions.difference(versions))}")
+        for name in required_versions:
+            _nonempty(versions[name], f"versions.{name}")
+        object.__setattr__(self, "versions", versions)
+
+        fixed_inputs = _freeze_json(self.fixed_inputs, "fixed_inputs")
+        if not isinstance(fixed_inputs, Mapping) or not fixed_inputs:
+            raise ContractError("fixed_inputs must describe seeded input/state values")
+        object.__setattr__(self, "fixed_inputs", fixed_inputs)
+        if self.step_abi.guard_set["numerical_policy_hash"] != self.numerical_policy.contract_hash:
+            raise ContractError("StepABI numerical guard does not match NumericalPolicy")
+
+        statuses = _freeze_json(self.cell_status, "cell_status")
+        if not isinstance(statuses, Mapping):
+            raise ContractError("cell_status must be a mapping")
+        declared = {cell.cell_id for cell in self.workload.benchmark_cells}
+        if set(statuses) != declared:
+            raise ContractError("cell_status must report every declared benchmark cell exactly once")
+        allowed_statuses = {"not_measured", "measured", "unsupported", "unavailable", "incorrect", "strict_win", "strict_loss", "inconclusive"}
+        if any(value not in allowed_statuses for value in statuses.values()):
+            raise ContractError("cell_status contains an unknown result status")
+        object.__setattr__(self, "cell_status", statuses)
+        if self.schema_version != CONTRACT_SCHEMA_VERSION:
+            raise ContractError(f"unsupported StepManifest schema_version={self.schema_version}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "workload": self.workload.to_dict(),
+            "numerical_policy": self.numerical_policy.to_dict(),
+            "step_abi": self.step_abi.to_dict(),
+            "checkpoint_revision": self.checkpoint_revision,
+            "graph_hash": self.graph_hash,
+            "versions": _json_value(self.versions),
+            "fixed_inputs": _json_value(self.fixed_inputs),
+            "cell_status": _json_value(self.cell_status),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "StepManifest":
+        _check_schema(value, cls.__name__)
+        return cls(
+            workload=WorkloadSpec.from_dict(value["workload"]),
+            numerical_policy=NumericalPolicy.from_dict(value["numerical_policy"]),
+            step_abi=StepABI.from_dict(value["step_abi"]),
+            checkpoint_revision=value["checkpoint_revision"],
+            graph_hash=value["graph_hash"],
+            versions=value["versions"],
+            fixed_inputs=value["fixed_inputs"],
+            cell_status=value["cell_status"],
+            schema_version=value["schema_version"],
+        )
+
+    def to_json(self, *, indent: int | None = 2) -> str:
+        value = self.to_dict()
+        if indent is None:
+            return canonical_json(value)
+        return json.dumps(value, sort_keys=True, indent=indent, ensure_ascii=True, allow_nan=False) + "\n"
+
+    @classmethod
+    def from_json(cls, payload: str) -> "StepManifest":
+        try:
+            value = json.loads(payload)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ContractError(f"invalid step manifest JSON: {exc}") from exc
+        try:
+            return cls.from_dict(value)
+        except (KeyError, TypeError, ContractError) as exc:
+            raise ContractError(f"invalid step manifest: {exc}") from exc
+
+    @property
+    def contract_hash(self) -> str:
+        return _contract_hash(self.to_dict())
+
+    @property
+    def not_measured_cells(self) -> tuple[str, ...]:
+        return tuple(cell_id for cell_id, status in self.cell_status.items() if status == "not_measured")
+
+
 def _check_schema(value: Mapping[str, Any], record_name: str) -> None:
     if not isinstance(value, Mapping):
         raise ContractError(f"{record_name} requires a JSON object")
@@ -534,6 +899,8 @@ __all__ = [
     "InputOrigin",
     "NumericalPolicy",
     "OutputOwnership",
+    "StepABI",
+    "StepManifest",
     "TimedUnit",
     "ToleranceSpec",
     "WorkloadSpec",

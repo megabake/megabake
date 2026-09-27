@@ -7,6 +7,7 @@ from .capture import (
     UnsupportedGraphError,
     capture_exported_program,
     capture_graph_module,
+    graph_hash,
 )
 from .normalize import normalize_fx
 from .facts import FactTable, TensorFacts, collect_facts
@@ -15,6 +16,6 @@ from .semantic import SemanticGraph, SemanticRegistry, recognize
 __all__ = [
     "BindingError", "FactTable", "FrontendError", "NormalizedProgram",
     "SemanticGraph", "SemanticRegistry", "TensorFacts", "UnsupportedGraphError",
-    "capture_exported_program", "capture_graph_module", "collect_facts", "normalize_fx",
+    "capture_exported_program", "capture_graph_module", "collect_facts", "graph_hash", "normalize_fx",
     "recognize",
 ]
