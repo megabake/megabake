@@ -21,6 +21,7 @@ A provider is reusable across model families because it is keyed by computation 
 | Captured private `CUfunction` | No device-callable interface follows from the handle | Diagnostic tactic identity, not code reuse |
 | CUDA Graph or device graph launch | Constituent kernels remain separate grids | Vendor-preserving product/control path |
 | CUDA dynamic parallelism | Launches child grids | Does not satisfy the strict one-grid contract |
+| Inductor-generated Triton/CUDA kernel or autotune choice | Not as emitted; it is a launchable kernel candidate | Baseline/`ExternalPlan` and source of algorithm, layout and tile hypotheses |
 | cuBLASDx block GEMM | Potentially, after caller supplies movement/tiling | Candidate tactic |
 | cuBLASDx pipelined GEMM | Potentially, with host descriptor/entry adaptation | Candidate global-load-to-epilogue tactic |
 | CUTLASS/CuTe C++ components | Yes after adapting participation, pipeline and pointer binding | Controllable tensor-core body source |
@@ -28,6 +29,8 @@ A provider is reusable across model families because it is keyed by computation 
 | Generated SIMT indexed body | Yes | Coverage and sometimes fastest low-batch tactic |
 
 A private library kernel's function/argument information does not reveal stable source or a callable device routine. Binary rewriting would need to reestablish indexing, barriers, async protocols and register allocation; it is a separate research project. GraCE's [vendor graph-node path](https://www.usenix.org/system/files/osdi26-ghosh.pdf) can improve dynamic graph binding while retaining a separate vendor launch. It cannot solve strict body composition.
+
+Inductor should be an **active body teacher** for the exact hot shapes: retain which ATen, Triton or CUDA template won its legal autotune and, where inspectable, its tile/layout/padding and epilogue choices, generated source and register/shared usage. Record unknown details for opaque vendor kernels. Measure standalone and complete-step contributions. Seed the V3 tactic search from those choices, then measure the adapted tactic standalone, in a lean owner entry and in the complete mixed entry. The adaptation must expose arbitrary logical tile coordinates, compatible CTA roles, scratch/descriptor lifetime and output publication. Replaying an Inductor launch or treating its autotune cache timing as an in-grid cost does not establish that adaptation. [PyTorch `torch.compile` options](https://docs.pytorch.org/docs/stable/generated/torch.compile), [Inductor 2.6 loop/codegen path](https://github.com/pytorch/pytorch/blob/v2.6.0/torch/_inductor/compile_fx.py)
 
 ## 3. Body tactic contract
 

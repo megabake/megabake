@@ -73,6 +73,7 @@ The [cuBLASDx pipelined API](https://docs.nvidia.com/cuda/cublasdx/using_pipelin
 | D21 | Split tiny FX capture from real HF full-step capture | Generic semantics can progress while model export issues are diagnosed; a tiny fixture cannot be mistaken for benchmark coverage | A single verified capture path makes this split unnecessary |
 | D22 | Keep current cuBLASDx in an isolated versioned provider lane | Checked-in CUDA12/CUTLASS3.8 pins do not establish its CUDA13/CUTLASS4.4.1 requirements | Main environment is deliberately migrated and remeasured |
 | D23 | Predeclare all primary `must_win` workload cells and fresh validation trials | “Consistently beats” otherwise becomes movable after seeing favorable shapes | A different explicit claim/metric is chosen before tuning |
+| D24 | Reuse PyTorch export/decompositions and selected Inductor analysis through a pinned adapter; use Inductor autotune/codegen as a body teacher | Duplicating proven graph normalization and ignoring the strongest compiler's exact-shape choices wastes work; its launched kernels and late IR do not by themselves satisfy V3's effect or device-callable body ABI | A versioned pure-loop bridge fails the origin/effect/guard audit or a better stable reusable interface appears |
 
 ## 4. Deliberately deferred alternatives
 
