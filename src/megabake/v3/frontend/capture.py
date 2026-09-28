@@ -62,6 +62,7 @@ class NormalizedProgram:
     policy: Any = None
     normalization_path: str = "capture"
     state_bindings: Mapping[str, str] = field(default_factory=dict)
+    step_abi: StepABI | None = None
     source_graph_module: Any | None = None
     source_exported_program: Any | None = None
     # Current FX node name -> stable origin IDs; lineage retains deleted origins.
@@ -476,6 +477,7 @@ def capture_exported_program(
         source_kind="exported_program",
         policy=policy,
         state_bindings=normalized_states,
+        step_abi=step_abi,
         source_exported_program=exported_program,
     )
     program = seed_origins(program, exported_program.graph_module)
@@ -590,6 +592,7 @@ def capture_graph_module(
             source_kind="graph_module",
             policy=policy,
             state_bindings=normalized_states,
+            step_abi=step_abi,
         )
         program = seed_origins(program, graph_module)
         if step_abi is not None:
@@ -598,6 +601,7 @@ def capture_graph_module(
                 raise UnsupportedGraphError(
                     f"direct GraphModule ABI differs from StepABI: expected {expected!r}, got {placeholders!r}"
                 )
+            _validate_step_abi_capture(program, step_abi, output)
         return program
     # Export performs functionalization/metadata capture; it does not inspect a device.
     try:
@@ -627,4 +631,5 @@ def capture_graph_module(
         if not isinstance(step_abi, StepABI):
             raise TypeError("step_abi must be a StepABI")
         _validate_step_abi_capture(program, step_abi, captured_output)
+        program.step_abi = step_abi
     return program

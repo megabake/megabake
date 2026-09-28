@@ -17,6 +17,8 @@ _CUDA_TYPES = {
     "bfloat16": "__nv_bfloat16",
     "float32": "float",
     "bool": "bool",
+    "int32": "int32_t",
+    "int64": "int64_t",
 }
 _MATH_MAPS = {
     "add", "sub", "mul", "div", "neg", "exp", "rsqrt", "sqrt", "square",
@@ -523,6 +525,88 @@ def _emit_contraction(operation: IndexedOp, values: Mapping[str, IndexedValue],
     return CudaBody(source, entry, input_types, output_type, _numel(output_shape), "contraction", node_id)
 
 
+def _emit_index_select(operation: IndexedOp, values: Mapping[str, IndexedValue],
+                       output: IndexedValue, output_shape: tuple[int, ...], node_id: str) -> CudaBody:
+    if len(operation.inputs) != 2 or len(operation.input_index_maps) != 2:
+        raise CudaBodyError(node_id, "index_select requires one tensor and one index vector")
+    source, indices = (values[value_id] for value_id in operation.inputs)
+    source_shape, index_shape = _static_shape(source, node_id), _static_shape(indices, node_id)
+    source_type, index_type, output_type = _dtype(source, node_id), _dtype(indices, node_id), _dtype(output, node_id)
+    args = operation.attributes.get("arguments", ())
+    dim = args[1] if len(args) > 1 else 0
+    dim = dim + len(source_shape) if isinstance(dim, int) and dim < 0 else dim
+    bounds = operation.attributes.get("index_bounds")
+    if (not isinstance(dim, int) or not 0 <= dim < len(source_shape) or len(index_shape) != 1 or
+            index_shape != (output_shape[dim],) or
+            output_shape != source_shape[:dim] + index_shape + source_shape[dim + 1:] or
+            index_type not in {"int32_t", "int64_t"} or not isinstance(bounds, Mapping) or
+            bounds.get("upper_exclusive") != source_shape[dim]):
+        raise CudaBodyError(node_id, "index_select lacks an exact output map or bounded index guard")
+    prefix = _name(operation)
+    entry = f"{prefix}_tile"
+    lines = _coordinates(output_shape)
+    lines.append(f"const int64_t selected = static_cast<int64_t>(in1[idx[{dim}]*{indices.strides[0]}]);")
+    lines.append(f"if (selected < 0 || selected >= {source_shape[dim]}) return;")
+    offset = " + ".join(
+        f"({f'selected' if axis == dim else f'idx[{axis}]'})*{stride}"
+        for axis, stride in enumerate(source.strides)
+    ) or "0"
+    lines.append(f"const float value = {prefix}_load(in0, {offset});")
+    lines.append(f"out[{_output_offset(output, output_shape, node_id)}] = {prefix}_store(value, ({output_type}*)0);")
+    source_code = _helpers(prefix) + _body_loop(
+        entry, _pointer_arguments((source_type, index_type), output_type), _numel(output_shape), lines
+    )
+    return CudaBody(source_code, entry, (source_type, index_type), output_type,
+                    _numel(output_shape), "gather", node_id, dict(bounds))
+
+
+def _emit_index_copy(operation: IndexedOp, values: Mapping[str, IndexedValue],
+                     output: IndexedValue, output_shape: tuple[int, ...], node_id: str) -> CudaBody:
+    if len(operation.inputs) != 3 or len(operation.input_index_maps) != 3:
+        raise CudaBodyError(node_id, "index_copy requires old state, one index, and an update")
+    old, indices, update = (values[value_id] for value_id in operation.inputs)
+    old_shape, index_shape, update_shape = (
+        _static_shape(value, node_id) for value in (old, indices, update)
+    )
+    old_type, index_type, update_type, output_type = (
+        _dtype(value, node_id) for value in (old, indices, update, output)
+    )
+    args = operation.attributes.get("arguments", ())
+    dim = args[1] if len(args) > 1 else 0
+    dim = dim + len(old_shape) if isinstance(dim, int) and dim < 0 else dim
+    bounds = operation.attributes.get("index_bounds")
+    transition = operation.attributes.get("state_transition")
+    if (not isinstance(dim, int) or not 0 <= dim < len(old_shape) or output_shape != old_shape or
+            index_shape != (1,) or update_shape != old_shape[:dim] + (1,) + old_shape[dim + 1:] or
+            old_type != output_type or update_type != output_type or index_type not in {"int32_t", "int64_t"} or
+            not isinstance(bounds, Mapping) or bounds.get("upper_exclusive") != old_shape[dim] or
+            not isinstance(transition, Mapping) or transition.get("alias_rule") != "functional_new_value"):
+        raise CudaBodyError(node_id, "index_copy lacks an exact functional append and bounds contract")
+    prefix = _name(operation)
+    entry = f"{prefix}_tile"
+    lines = _coordinates(output_shape)
+    lines.append(f"const int64_t selected = static_cast<int64_t>(in1[0]);")
+    lines.append(f"if (selected < 0 || selected >= {old_shape[dim]}) return;")
+    lines.append(f"int64_t source_offset = 0;")
+    lines.append(f"if (idx[{dim}] == selected) {{")
+    for axis, stride in enumerate(update.strides):
+        coordinate = "0" if axis == dim else f"idx[{axis}]"
+        lines.append(f"  source_offset += {coordinate} * {stride};")
+    lines.append(f"  const float value = {prefix}_load(in2, source_offset);")
+    lines.append(f"  out[{_output_offset(output, output_shape, node_id)}] = {prefix}_store(value, ({output_type}*)0);")
+    lines.append("} else {")
+    old_offset = " + ".join(f"idx[{axis}]*{stride}" for axis, stride in enumerate(old.strides)) or "0"
+    lines.append(f"  const float value = {prefix}_load(in0, {old_offset});")
+    lines.append(f"  out[{_output_offset(output, output_shape, node_id)}] = {prefix}_store(value, ({output_type}*)0);")
+    lines.append("}")
+    source_code = _helpers(prefix) + _body_loop(
+        entry, _pointer_arguments((old_type, index_type, update_type), output_type),
+        _numel(output_shape), lines,
+    )
+    return CudaBody(source_code, entry, (old_type, index_type, update_type), output_type,
+                    _numel(output_shape), "state_write", node_id, dict(bounds))
+
+
 def emit_cuda_body(program: Any, operation: IndexedOp | str) -> CudaBody:
     """Emit one conservative in-grid body or exact view address map.
 
@@ -551,6 +635,10 @@ def emit_cuda_body(program: Any, operation: IndexedOp | str) -> CudaBody:
         return _emit_reduce(operation, values, output, output_shape, node_id)
     if operation.kind == "Contraction":
         return _emit_contraction(operation, values, output, output_shape, node_id)
+    if operation.kind == "Gather" and _operator(operation) == "index_select":
+        return _emit_index_select(operation, values, output, output_shape, node_id)
+    if operation.kind == "Scatter/StateWrite" and _operator(operation) == "index_copy":
+        return _emit_index_copy(operation, values, output, output_shape, node_id)
     raise CudaBodyError(node_id, f"indexed operation kind {operation.kind!r} has no generic CUDA body")
 
 

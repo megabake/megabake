@@ -3,7 +3,13 @@ import pytest
 
 from tests.test_v3.body_codegen import compile_library, index_module, run_indexed_gpu, source_bundle
 from tests.test_v3.cpu.test_generic_bodies import AddMM, Gate, MMKn, NormCastOrder, SliceReshapeExpand
-from tests.test_v3.fixtures import GATE_TINY, LINEAR_TINY, NORM_VARIANTS
+from tests.test_v3.fixtures import (
+    GATE_TINY,
+    LINEAR_TINY,
+    NORM_VARIANTS,
+    STATE_POISON,
+    capture_cache_append_program,
+)
 
 
 @pytest.mark.v3_gpu
@@ -36,6 +42,31 @@ def test_v3r014_generated_addmm_and_transposed_mm_match_linear_tiny(v3_device, v
     torch.testing.assert_close(addmm_result, torch.addmm(bias, x, weight_nk.t(), beta=-0.25, alpha=1.75),
                                rtol=2e-4, atol=2e-4)
     torch.testing.assert_close(mm_result, x @ weight_kn, rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.v3_gpu
+def test_v3r015_functional_kv_append_and_read_match_poisoned_cache_positions(v3_device, v3_toolchain, tmp_path):
+    case = STATE_POISON(position=0)
+    cache = case.state_before["cache_k"].to(v3_device)
+    index = torch.tensor([0], device=v3_device, dtype=torch.int64)
+    update = case.inputs["k"].to(v3_device)
+    program, _ = capture_cache_append_program(cache, index, update)
+    from megabake.v3.frontend.semantic import index_program
+    indexed = index_program(program)
+    assert indexed.strict_supported
+    source, bodies = source_bundle(indexed)
+    library, _ = compile_library(v3_toolchain, source, tmp_path / "v3_cache_append")
+
+    for position in (0, 1, 15, 16):
+        case = STATE_POISON(position=position)
+        old = case.state_before["cache_k"].to(v3_device)
+        token = case.inputs["k"].to(v3_device)
+        index = torch.tensor([position], device=v3_device, dtype=torch.int64)
+        actual = run_indexed_gpu(indexed, program, (old, index, token), library, bodies)
+        torch.testing.assert_close(actual["cache"].cpu(), case.expected["cache_k"], rtol=0, atol=0)
+        torch.testing.assert_close(actual["current"].cpu(), token.cpu(), rtol=0, atol=0)
+        assert torch.equal(actual["cache"][:, :, :position].cpu(), old[:, :, :position].cpu())
+        assert torch.equal(actual["cache"][:, :, position + 1:].cpu(), old[:, :, position + 1:].cpu())
 
 
 @pytest.mark.v3_gpu

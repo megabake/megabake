@@ -1,11 +1,20 @@
 import json
+from dataclasses import replace
 
 import pytest
 import torch
 
 from megabake.v3.frontend.normalize import normalize_fx
 from megabake.v3.frontend.semantic import index_program
-from tests.test_v3.fixtures import LINEAR_TINY
+from megabake.v3.frontend.capture import capture_graph_module
+from megabake.v3.semantics.verify import verify_indexed_program
+from tests.test_v3.fixtures import (
+    ATTENTION_TINY,
+    LINEAR_TINY,
+    STATE_POISON,
+    cache_append_step_abi,
+    make_cache_append_graph,
+)
 
 
 class _MapReduceView(torch.nn.Module):
@@ -94,6 +103,90 @@ def test_indexed_functional_state_write_owns_effect_and_preserves_old_state():
     actual = indexed.evaluate({"cache": old.clone(), "index": index_value, "update": update_value})
     assert torch.equal(actual["next_cache"][:, :, 2], update_value[:, :, 0])
     assert torch.equal(old, torch.full_like(old, -9.0))
+
+
+def _cache_append_program(*, with_abi=True):
+    old = torch.full((1, 2, 17, 8), -17.0)
+    index = torch.tensor([0], dtype=torch.int64)
+    update = torch.ones((1, 2, 1, 8))
+    abi = cache_append_step_abi() if with_abi else None
+    program = capture_graph_module(
+        make_cache_append_graph(), (old, index, update),
+        input_spec={"structure": "(cache,index,update)"},
+        output_spec=abi.user_output_tree["structure"] if abi else {"cache": "tensor", "current": "tensor"},
+        state_bindings={"cache": "kv"}, step_abi=abi,
+    )
+    return program, index_program(program), old, update
+
+
+def test_indexed_functional_kv_append_is_typed_bounded_and_published_before_gather():
+    program, indexed, old, _ = _cache_append_program()
+    assert indexed.strict_supported
+    assert len(indexed.state_transitions) == 1
+    transition = indexed.state_transitions[0]
+    assert transition.to_dict() == {
+        "effect_id": "append-kv", "state_id": "kv",
+        "old_value": next(value.value_id for value in indexed.values if value.fx_node == "cache"),
+        "new_value": next(value.value_id for value in indexed.values if value.fx_node == "index_copy"),
+        "index_value": next(value.value_id for value in indexed.values if value.fx_node == "index"),
+        "valid_length_before": next(value.value_id for value in indexed.values if value.fx_node == "index"),
+        "valid_length_after": "L+1", "capacity": 17, "axis": 2, "order": 0,
+        "write_footprint": {"axis": 2, "range": "[L,L+1)", "other_axes": "full"},
+        "alias_rule": "functional_new_value",
+    }
+    read = next(operation for operation in indexed.operations if operation.kind == "Gather")
+    dependency = next(edge for edge in read.effect_edges if edge.kind == "state_read_after_publish")
+    assert dependency.depends_on == (transition.effect_id,)
+    assert dependency.reads == (transition.new_value,)
+    transition.validate_index(16)
+    with pytest.raises(ValueError, match="outside"):
+        transition.validate_index(17)
+    with pytest.raises(ValueError, match="outside"):
+        transition.validate_index(-1)
+
+    for position in (0, 1, 15, 16):
+        case = STATE_POISON(position=position)
+        cache = case.state_before["cache_k"].clone()
+        update = case.inputs["k"]
+        index = torch.tensor([position], dtype=torch.int64)
+        actual = indexed.evaluate({"cache": cache, "index": index, "update": update})
+        torch.testing.assert_close(actual["cache"], case.expected["cache_k"], rtol=0, atol=0)
+        torch.testing.assert_close(actual["current"], update, rtol=0, atol=0)
+        torch.testing.assert_close(cache, case.state_before["cache_k"], rtol=0, atol=0)
+        assert torch.equal(actual["cache"][:, :, :position], cache[:, :, :position])
+        assert torch.equal(actual["cache"][:, :, position + 1:], cache[:, :, position + 1:])
+
+    first_index = torch.tensor([0], dtype=torch.int64)
+    first = indexed.evaluate({"cache": old, "index": first_index, "update": torch.ones_like(old[:, :, :1])})
+    second_index = torch.tensor([1], dtype=torch.int64)
+    second = indexed.evaluate({"cache": first["cache"], "index": second_index,
+                               "update": torch.full_like(old[:, :, :1], 2.0)})
+    assert torch.equal(second["cache"][:, :, 0], first["cache"][:, :, 0])
+    assert torch.equal(second["cache"][:, :, 1], torch.full_like(second["cache"][:, :, 1], 2.0))
+    assert torch.equal(old, torch.full_like(old, -17.0))
+
+    without_read_edge = tuple(
+        replace(operation, effect_edges=tuple(edge for edge in operation.effect_edges
+                                               if edge.kind != "state_read_after_publish"))
+        if operation is read else operation
+        for operation in indexed.operations
+    )
+    _, verification = verify_indexed_program(
+        program, without_read_edge, program.value_ids, indexed.outputs, indexed.state_transitions
+    )
+    assert any("missing its writer publication dependency" in item.message for item in verification)
+
+
+def test_indexed_state_write_rejects_unknown_bounds_and_duplicate_effect_owner():
+    program, indexed, _, _ = _cache_append_program(with_abi=False)
+    assert not indexed.strict_supported
+    assert any(item.code == "missing_facts" and "bounds" in item.message for item in indexed.diagnostics)
+
+    program, indexed, _, _ = _cache_append_program()
+    program.effects = program.effects + (program.effects[0],)
+    duplicated = index_program(program)
+    assert not duplicated.strict_supported
+    assert any("duplicated" in item.message for item in duplicated.diagnostics)
 
 
 def test_indexed_unknown_live_operator_is_a_precise_non_strict_diagnostic():

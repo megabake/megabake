@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 from ..diagnostics import DiagnosticCode, DiagnosticRecord, DiagnosticSeverity
 from ..frontend.capture import NormalizedProgram, _ORIGIN_META
-from .indexed import IndexedOp, OutputLeaf
+from .indexed import IndexedOp, OutputLeaf, StateTransition
 
 
 def _live_nodes(graph_module: Any, effects: set[str]) -> set[Any]:
@@ -25,7 +25,8 @@ def _live_nodes(graph_module: Any, effects: set[str]) -> set[Any]:
 
 def verify_indexed_program(program: NormalizedProgram, operations: tuple[IndexedOp, ...],
                            node_to_value: Mapping[str, str],
-                           outputs: tuple[OutputLeaf, ...] = ()) -> tuple[
+                           outputs: tuple[OutputLeaf, ...] = (),
+                           state_transitions: tuple[StateTransition, ...] = ()) -> tuple[
                                tuple[Mapping[str, Any], ...], tuple[DiagnosticRecord, ...]
                            ]:
     diagnostics: list[DiagnosticRecord] = []
@@ -109,13 +110,66 @@ def verify_indexed_program(program: NormalizedProgram, operations: tuple[Indexed
         if not effect.required:
             continue
         effect_origins = set(program.origin_map.get(effect.node_id, ()))
-        covered = any(effect.origin_id in effect_origins for operation in operations for effect in operation.effect_edges)
-        if not covered:
+        owners = [(operation, edge) for operation in operations for edge in operation.effect_edges
+                  if edge.origin_id in effect_origins and edge.kind == effect.kind and edge.target == effect.target]
+        if not owners:
             diagnostics.append(DiagnosticRecord(
                 DiagnosticCode.UNSUPPORTED_SEMANTICS,
                 f"required {effect.kind} effect at {effect.node_id} has no indexed owner",
                 DiagnosticSeverity.ERROR, node_id=effect.node_id,
             ))
+        elif len(owners) != 1:
+            diagnostics.append(DiagnosticRecord(
+                DiagnosticCode.UNSUPPORTED_SEMANTICS,
+                f"required {effect.kind} effect at {effect.node_id} has duplicated indexed ownership",
+                DiagnosticSeverity.ERROR, node_id=effect.node_id,
+                details={"owner_count": len(owners)},
+            ))
+
+    transitions_by_effect: dict[str, StateTransition] = {}
+    for transition in state_transitions:
+        if transition.effect_id in transitions_by_effect:
+            diagnostics.append(DiagnosticRecord(
+                DiagnosticCode.UNSUPPORTED_SEMANTICS,
+                f"state effect {transition.effect_id} has duplicate transitions",
+                DiagnosticSeverity.ERROR, node_id=transition.new_value,
+            ))
+        transitions_by_effect[transition.effect_id] = transition
+        writers = [operation for operation in operations
+                   if any(edge.effect_id == transition.effect_id and edge.writes == (transition.new_value,)
+                          for edge in operation.effect_edges)]
+        if len(writers) != 1 or transition.alias_rule != "functional_new_value":
+            diagnostics.append(DiagnosticRecord(
+                DiagnosticCode.UNSUPPORTED_SEMANTICS,
+                f"state transition {transition.effect_id} has no unique functional writer",
+                DiagnosticSeverity.ERROR, node_id=transition.new_value,
+                details={"writer_count": len(writers), "alias_rule": transition.alias_rule},
+            ))
+    for operation in operations:
+        for edge in operation.effect_edges:
+            if edge.kind != "state_read_after_publish":
+                continue
+            for dependency in edge.depends_on:
+                transition = transitions_by_effect.get(dependency)
+                if transition is None or edge.reads != (transition.new_value,):
+                    diagnostics.append(DiagnosticRecord(
+                        DiagnosticCode.UNSUPPORTED_SEMANTICS,
+                        f"state read at {operation.local_reference.node_name} is not ordered after its writer publication",
+                        DiagnosticSeverity.ERROR, node_id=operation.local_reference.node_name,
+                        details={"dependency": dependency, "negative_case": "read before publish"},
+                    ))
+
+    for operation in operations:
+        for transition in state_transitions:
+            if transition.new_value in operation.inputs and not any(
+                    edge.kind == "state_read_after_publish" and transition.effect_id in edge.depends_on
+                    for edge in operation.effect_edges):
+                diagnostics.append(DiagnosticRecord(
+                    DiagnosticCode.UNSUPPORTED_SEMANTICS,
+                    f"state read at {operation.local_reference.node_name} is missing its writer publication dependency",
+                    DiagnosticSeverity.ERROR, node_id=operation.local_reference.node_name,
+                    details={"dependency": transition.effect_id, "negative_case": "read before publish"},
+                ))
 
     output_keys = set(program.output_origins)
     seen_output_origins = set()

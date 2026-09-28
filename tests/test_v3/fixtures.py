@@ -205,6 +205,85 @@ def make_tiny_stateful_graph() -> torch.fx.GraphModule:
     return graph_module
 
 
+def make_cache_append_graph() -> torch.fx.GraphModule:
+    graph = torch.fx.Graph()
+    cache = graph.placeholder("cache")
+    index = graph.placeholder("index")
+    update = graph.placeholder("update")
+    new_cache = graph.call_function(torch.ops.aten.index_copy.default, (cache, 2, index, update))
+    current = graph.call_function(torch.ops.aten.index_select.default, (new_cache, 2, index))
+    graph.output({"cache": new_cache, "current": current})
+    module = torch.fx.GraphModule({}, graph)
+    module.graph.lint()
+    module.recompile()
+    return module
+
+
+def cache_append_step_abi(*, capacity: int = 17, batch: int = 1,
+                          heads: int = 2, head_dim: int = 8):
+    from megabake.v3.contracts import StepABI
+
+    cache_shape = (batch, heads, capacity, head_dim)
+    update_shape = (batch, heads, 1, head_dim)
+    return StepABI.from_dict({
+        "schema_version": 1,
+        "ordered_user_inputs": [
+            {"placeholder": "cache", "path": [0]},
+            {"placeholder": "index", "path": [1]},
+            {"placeholder": "update", "path": [2]},
+        ],
+        "lifted_bindings": {},
+        "old_state_inputs": [{
+            "placeholder": "cache", "state_id": "kv", "path": ["cache"],
+            "layout": "b,h,capacity,d", "alias_set": "state:kv", "capacity": capacity,
+        }],
+        "state_effects": [{
+            "effect_id": "append-kv", "state_id": "kv", "order": 0,
+            "reads": [{"state_id": "kv", "range": "[0,L)"}],
+            "writes": [{"state_id": "kv", "range": "[L,L+1)"}],
+        }],
+        "new_state_outputs": [{"state_id": "kv", "path": ["cache"], "source_id": "index_copy"}],
+        "user_output_tree": {
+            "structure": {"cache": "tensor", "current": "tensor"},
+            "leaves": [
+                {"path": ["cache"], "ownership": "owned", "lifetime": "returned_to_caller"},
+                {"path": ["current"], "ownership": "owned", "lifetime": "returned_to_caller"},
+            ],
+        },
+        "position_and_valid_length": {
+            "position_source": "index", "old_valid_length_source": "index",
+            "append_position_expression": "L", "new_valid_length_expression": "L+1",
+            "attend_range": "[0,L+1) after append",
+        },
+        "batch_rule": "uniform_valid_length",
+        "invocation_preparation": {"setup_amortization": "none", "actions": []},
+        "guard_set": {
+            "shapes": {"cache": list(cache_shape), "index": [1], "update": list(update_shape)},
+            "strides": {
+                "cache": [heads * capacity * head_dim, capacity * head_dim, head_dim, 1],
+                "index": [1], "update": [heads * head_dim, head_dim, head_dim, 1],
+            },
+            "dtypes": {"cache": "float32", "index": "int64", "update": "float32"},
+            "capacity": {"cache": capacity}, "features": ["aten.index_copy", "aten.index_select"],
+            "numerical_policy_hash": "cache-append-fixture-v1",
+        },
+        "state_mode": "advancing", "cache_update_mode": "functional_append",
+    })
+
+
+def capture_cache_append_program(cache: torch.Tensor, index: torch.Tensor, update: torch.Tensor):
+    from megabake.v3.frontend.capture import capture_graph_module
+
+    abi = cache_append_step_abi(capacity=cache.shape[2], batch=cache.shape[0],
+                                heads=cache.shape[1], head_dim=cache.shape[3])
+    program = capture_graph_module(
+        make_cache_append_graph(), (cache, index, update),
+        input_spec={"structure": "(cache,index,update)"},
+        output_spec=abi.user_output_tree["structure"], state_bindings={"cache": "kv"}, step_abi=abi,
+    )
+    return program, abi
+
+
 @dataclass(frozen=True)
 class StateRegion:
     """A path and slice tuple used for independent state validation."""

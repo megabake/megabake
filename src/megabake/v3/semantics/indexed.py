@@ -50,10 +50,49 @@ class EffectEdge:
     kind: str
     target: str | None
     required: bool
+    effect_id: str | None = None
+    reads: tuple[str, ...] = ()
+    writes: tuple[str, ...] = ()
+    depends_on: tuple[str, ...] = ()
+    alias_rule: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {"origin_id": self.origin_id, "kind": self.kind,
-                "target": self.target, "required": self.required}
+                "target": self.target, "required": self.required,
+                "effect_id": self.effect_id, "reads": list(self.reads),
+                "writes": list(self.writes), "depends_on": list(self.depends_on),
+                "alias_rule": self.alias_rule}
+
+
+@dataclass(frozen=True)
+class StateTransition:
+    """Functional, bounded append from one fixed-capacity state value to another."""
+
+    effect_id: str
+    state_id: str
+    old_value: str
+    new_value: str
+    index_value: str
+    valid_length_before: str
+    valid_length_after: str
+    capacity: int
+    axis: int
+    order: int
+    write_footprint: Mapping[str, Any]
+    alias_rule: str = "functional_new_value"
+
+    def validate_index(self, index: int) -> None:
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < self.capacity:
+            raise ValueError(f"append index {index!r} is outside [0, {self.capacity})")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"effect_id": self.effect_id, "state_id": self.state_id,
+                "old_value": self.old_value, "new_value": self.new_value,
+                "index_value": self.index_value,
+                "valid_length_before": self.valid_length_before,
+                "valid_length_after": self.valid_length_after,
+                "capacity": self.capacity, "axis": self.axis, "order": self.order,
+                "write_footprint": dict(self.write_footprint), "alias_rule": self.alias_rule}
 
 
 @dataclass(frozen=True)
@@ -142,6 +181,7 @@ class IndexedTensorProgram:
     outputs: tuple[OutputLeaf, ...]
     coverage: tuple[Mapping[str, Any], ...]
     diagnostics: tuple[DiagnosticRecord, ...]
+    state_transitions: tuple[StateTransition, ...] = ()
 
     @property
     def strict_supported(self) -> bool:
@@ -173,6 +213,7 @@ class IndexedTensorProgram:
                 "values": [value.to_dict() for value in self.values],
                 "operations": [operation.to_dict() for operation in self.operations],
                 "outputs": [output.to_dict() for output in self.outputs],
+                "state_transitions": [item.to_dict() for item in self.state_transitions],
                 "coverage": [dict(item) for item in self.coverage],
                 "diagnostics": [item.to_dict() for item in self.diagnostics]}
 
@@ -428,33 +469,35 @@ def _input_maps(node: Any, operator: str, kind: str, inputs: tuple[str, ...],
             maps.append(InputIndexMap(inputs[0], tuple(f"i{i}" for i in range(len(shape))), "view"))
         return tuple(maps)
     if kind == "Gather" and inputs:
-        if operator == "index_select" and len(inputs) > 1:
+        if operator == "index_select" and len(inputs) == 2:
             shape = input_shapes[0]
             dim = node.args[1] if len(node.args) > 1 else 0
-            dim = dim + len(shape) if dim < 0 else dim
-            base_map = [f"i{i}" for i in range(len(shape))]
-            index_map = [f"i{dim}"]
-            if 0 <= dim < len(base_map):
-                base_map[dim] = "index[i" + str(dim) + "]"
-            maps.append(InputIndexMap(inputs[0], tuple(base_map), "indirect"))
-            maps.append(InputIndexMap(inputs[1], tuple(index_map), "index"))
-        else:
-            maps.append(InputIndexMap(inputs[0], ("input[index_map]",), "indirect"))
-            for value in inputs[1:]:
-                maps.append(InputIndexMap(value, ("index_map",), "index"))
+            dim = dim + len(shape) if isinstance(dim, int) and dim < 0 else dim
+            if not isinstance(dim, int) or not 0 <= dim < len(shape) or len(input_shapes[1]) != 1:
+                return (InputIndexMap(inputs[0], ("UNKNOWN",), "indirect_select"),
+                        InputIndexMap(inputs[1], ("UNKNOWN",), "index"))
+            source_map = [f"i{i}" for i in range(len(shape))]
+            source_map[dim] = f"index[i{dim}]"
+            return (InputIndexMap(inputs[0], tuple(source_map), "indirect_select"),
+                    InputIndexMap(inputs[1], (f"i{dim}",), "index"))
+        maps.append(InputIndexMap(inputs[0], ("input[index_map]",), "indirect"))
+        for value in inputs[1:]:
+            maps.append(InputIndexMap(value, ("index_map",), "index"))
         return tuple(maps)
     if kind == "Scatter/StateWrite" and inputs:
-        maps.append(InputIndexMap(inputs[0], tuple(f"i{i}" for i in range(len(input_shapes[0]))), "read_modify_write"))
+        shape = input_shapes[0]
+        maps.append(InputIndexMap(inputs[0], tuple(f"i{i}" for i in range(len(shape))), "read_modify_write"))
         if operator == "index_copy" and len(inputs) == 3:
-            shape = input_shapes[0]
             dim = node.args[1] if len(node.args) > 1 else 0
-            dim = dim + len(shape) if dim < 0 else dim
-            index_map = [f"i{i}" for i in range(len(shape))]
+            dim = dim + len(shape) if isinstance(dim, int) and dim < 0 else dim
             source_shape = input_shapes[2]
+            if not isinstance(dim, int) or not 0 <= dim < len(shape) or len(source_shape) != len(shape):
+                return (InputIndexMap(inputs[0], ("UNKNOWN",), "read_modify_write"),
+                        InputIndexMap(inputs[1], ("UNKNOWN",), "index"),
+                        InputIndexMap(inputs[2], ("UNKNOWN",), "write"))
             source_map = [f"i{i}" for i in range(len(source_shape))]
-            if 0 <= dim < len(shape):
-                index_map = [f"i{dim}"]
-            maps.append(InputIndexMap(inputs[1], tuple(index_map), "index"))
+            source_map[dim] = "0"
+            maps.append(InputIndexMap(inputs[1], ("0",), "index"))
             maps.append(InputIndexMap(inputs[2], tuple(source_map), "write"))
         else:
             for value in inputs[1:]:
@@ -480,6 +523,147 @@ def _reduction_domain(node: Any, operator: str, kind: str,
     return tuple(axes)
 
 
+def _cache_axis(layout: str, rank: int) -> int | None:
+    axes = tuple(part.strip() for part in layout.split(","))
+    if len(axes) != rank or "capacity" not in axes:
+        return None
+    return axes.index("capacity")
+
+
+def _cache_transition(program: NormalizedProgram, node: Any, facts: FactTable,
+                      inputs: tuple[str, ...], output_id: str) -> tuple[StateTransition | None, DiagnosticRecord | None]:
+    effects = tuple(effect for effect in program.effects if effect.node_id == node.name and effect.required)
+    if not effects:
+        return None, None
+    if len(effects) != 1:
+        return None, DiagnosticRecord(
+            DiagnosticCode.UNSUPPORTED_SEMANTICS,
+            f"state write {node.name} has duplicated effect ownership",
+            DiagnosticSeverity.ERROR, node_id=node.name,
+            details={"effect_count": len(effects)},
+        )
+    effect = effects[0]
+    abi = program.step_abi
+    if abi is None:
+        return None, DiagnosticRecord(
+            DiagnosticCode.MISSING_FACTS,
+            f"state write {node.name} has no StepABI bounds and alias contract",
+            DiagnosticSeverity.ERROR, node_id=node.name,
+            details={"negative_case": "dynamic index has no proved bounds"},
+        )
+    if effect.kind != "functional_state_update" or not effect.target:
+        return None, DiagnosticRecord(
+            DiagnosticCode.UNSUPPORTED_SEMANTICS,
+            f"state write {node.name} is not a functional update",
+            DiagnosticSeverity.ERROR, node_id=node.name,
+            details={"effect_kind": effect.kind},
+        )
+    if len(inputs) != 3 or len(node.args) < 4:
+        return None, DiagnosticRecord(
+            DiagnosticCode.UNSUPPORTED_SEMANTICS,
+            f"state write {node.name} is not a four-argument index_copy",
+            DiagnosticSeverity.ERROR, node_id=node.name,
+        )
+
+    state_specs = [item for item in abi.old_state_inputs if item["state_id"] == effect.target]
+    state_effects = [item for item in abi.state_effects if item["state_id"] == effect.target]
+    output_specs = [item for item in abi.new_state_outputs if item["state_id"] == effect.target]
+    if len(state_specs) != 1 or len(state_effects) != 1 or len(output_specs) != 1:
+        return None, DiagnosticRecord(
+            DiagnosticCode.UNSUPPORTED_SEMANTICS,
+            f"state write {node.name} does not have one matching old/effect/new ABI edge",
+            DiagnosticSeverity.ERROR, node_id=node.name,
+            details={"old_states": len(state_specs), "state_effects": len(state_effects),
+                     "new_outputs": len(output_specs)},
+        )
+
+    state_spec, effect_spec, output_spec = state_specs[0], state_effects[0], output_specs[0]
+    old_node, index_node = node.args[0], node.args[2]
+    old_fact, index_fact = facts.for_node(old_node), facts.for_node(index_node)
+    update_fact, output_fact = facts.facts.get(inputs[2]), facts.facts.get(output_id)
+    if getattr(old_node, "name", None) != state_spec["placeholder"]:
+        return None, DiagnosticRecord(
+            DiagnosticCode.UNSUPPORTED_SEMANTICS,
+            f"state write {node.name} does not consume its declared old state",
+            DiagnosticSeverity.ERROR, node_id=node.name,
+        )
+    if output_spec.get("source_id") not in {node.name, output_id}:
+        return None, DiagnosticRecord(
+            DiagnosticCode.UNSUPPORTED_SEMANTICS,
+            f"state write {node.name} differs from the StepABI new-state source",
+            DiagnosticSeverity.ERROR, node_id=node.name,
+            details={"declared_source": output_spec.get("source_id")},
+        )
+    if old_fact is None or index_fact is None or update_fact is None or output_fact is None:
+        return None, DiagnosticRecord(
+            DiagnosticCode.MISSING_FACTS,
+            f"state write {node.name} lacks exact state/index/update facts",
+            DiagnosticSeverity.ERROR, node_id=node.name,
+        )
+    dim = node.args[1]
+    dim = dim + len(old_fact.shape) if isinstance(dim, int) and dim < 0 else dim
+    axis = _cache_axis(state_spec["layout"], len(old_fact.shape))
+    capacity = state_spec["capacity"]
+    position = abi.position_and_valid_length
+    write_ranges = {item.get("range") for item in effect_spec.get("writes", ()) if isinstance(item, Mapping)}
+    if (not isinstance(dim, int) or dim != axis or axis is None or
+            old_fact.shape != output_fact.shape or old_fact.shape[axis] != capacity or
+            output_fact.alias_kind != "fresh" or
+            len(index_fact.shape) != 1 or index_fact.shape != (1,) or
+            index_fact.dtype not in {"int32", "int64"} or
+            update_fact.shape != old_fact.shape[:axis] + (1,) + old_fact.shape[axis + 1:] or
+            getattr(index_node, "name", None) != position.get("position_source") or
+            position.get("old_valid_length_source") != position.get("position_source") or
+            position.get("append_position_expression") != "L" or
+            position.get("new_valid_length_expression") != "L+1" or
+            "[L,L+1)" not in write_ranges):
+        return None, DiagnosticRecord(
+            DiagnosticCode.MISSING_FACTS,
+            f"state write {node.name} is outside the proved fixed-capacity append contract",
+            DiagnosticSeverity.ERROR, node_id=node.name,
+            details={"capacity": capacity, "axis": dim,
+                     "negative_case": "index, alias, footprint, or valid-length guard mismatch"},
+        )
+    guard_capacity = abi.guard_set.get("capacity", {})
+    if isinstance(guard_capacity, Mapping) and state_spec["placeholder"] in guard_capacity:
+        if guard_capacity[state_spec["placeholder"]] != capacity:
+            return None, DiagnosticRecord(
+                DiagnosticCode.MISSING_FACTS,
+                f"state write {node.name} disagrees with the StepABI capacity guard",
+                DiagnosticSeverity.ERROR, node_id=node.name,
+            )
+    effect_id = str(effect_spec["effect_id"])
+    index_id = facts.node_to_value.get(index_node.name, inputs[1])
+    return StateTransition(
+        effect_id=effect_id, state_id=effect.target,
+        old_value=inputs[0], new_value=output_id, index_value=index_id,
+        valid_length_before=index_id, valid_length_after="L+1",
+        capacity=capacity, axis=axis, order=effect_spec["order"],
+        write_footprint={"axis": axis, "range": "[L,L+1)", "other_axes": "full"},
+    ), None
+
+
+def _bounded_state_index(program: NormalizedProgram, index_node: Any, state_id: str,
+                         source_shape: tuple[Any, ...], axis: int,
+                         index_fact: TensorFacts | None) -> Mapping[str, Any] | None:
+    abi = program.step_abi
+    if abi is None or index_fact is None or index_fact.shape != (1,) or index_fact.dtype not in {"int32", "int64"}:
+        return None
+    state_specs = [item for item in abi.old_state_inputs if item["state_id"] == state_id]
+    if len(state_specs) != 1:
+        return None
+    state = state_specs[0]
+    expected_axis = _cache_axis(state["layout"], len(source_shape))
+    position = abi.position_and_valid_length
+    if (getattr(index_node, "name", None) != position.get("position_source") or
+            position.get("old_valid_length_source") != position.get("position_source") or
+            position.get("append_position_expression") != "L" or
+            expected_axis != axis or source_shape[axis] != state["capacity"]):
+        return None
+    return {"value_id": index_fact.value_id, "lower": 0,
+            "upper_exclusive": state["capacity"], "guard": "StepABI/v1:L<capacity"}
+
+
 def _output_leaves(value: Any, path: tuple[Any, ...] = ()) -> list[tuple[tuple[Any, ...], Any]]:
     if hasattr(value, "op") and hasattr(value, "name"):
         return [(path, value)]
@@ -497,6 +681,8 @@ def lower_indexed_program(program: NormalizedProgram, *, facts: FactTable | None
     node_to_value = dict(facts.node_to_value)
     values = []
     operations = []
+    state_transitions: list[StateTransition] = []
+    transitions_by_output: dict[str, StateTransition] = {}
     diagnostics: list[DiagnosticRecord] = []
     module_lookup = getattr(program.graph_module, "get_submodule", lambda _name: None)
     for node in graph_nodes:
@@ -558,6 +744,29 @@ def lower_indexed_program(program: NormalizedProgram, *, facts: FactTable | None
         domain = _ranked_axes(output_shape)
         reductions = _reduction_domain(node, operator, kind, input_nodes, facts)
         maps = _input_maps(node, operator, kind, inputs, node_to_value, facts, input_nodes, output_shape)
+        transition = None
+        index_bounds = None
+        transition_diagnostic = None
+        if kind == "Scatter/StateWrite" and operator == "index_copy":
+            transition, transition_diagnostic = _cache_transition(program, node, facts, inputs, value_id)
+            if transition is not None:
+                index_bounds = {"value_id": transition.index_value, "lower": 0,
+                                "upper_exclusive": transition.capacity, "guard": "StepABI/v1:L<capacity"}
+        elif kind == "Gather" and operator == "index_select" and input_nodes:
+            source_transition = transitions_by_output.get(inputs[0])
+            source_state = program.state_bindings.get(input_nodes[0].name)
+            if source_transition is not None:
+                source_state = source_transition.state_id
+            source_fact = facts.for_node(input_nodes[0])
+            dim = node.args[1] if len(node.args) > 1 else 0
+            dim = dim + len(source_fact.shape) if source_fact and isinstance(dim, int) and dim < 0 else dim
+            if source_fact is not None and isinstance(dim, int) and 0 <= dim < len(source_fact.shape):
+                index_bounds = _bounded_state_index(
+                    program, input_nodes[1], source_state or "", source_fact.shape, dim,
+                    facts.for_node(input_nodes[1]),
+                )
+        if transition_diagnostic is not None:
+            diagnostics.append(transition_diagnostic)
         if any("UNKNOWN" in item.expressions for item in maps) and kind != "Unsupported":
             diagnostics.append(DiagnosticRecord(
                 DiagnosticCode.MISSING_FACTS, f"indexed operation {node.name} has an unproved index map",
@@ -566,7 +775,7 @@ def lower_indexed_program(program: NormalizedProgram, *, facts: FactTable | None
             ))
         if kind in {"Gather", "Scatter/StateWrite"} and operator in {
             "index_select", "gather", "take", "index_copy", "index_put", "slice_scatter", "scatter"
-        }:
+        } and index_bounds is None:
             diagnostics.append(DiagnosticRecord(
                 DiagnosticCode.MISSING_FACTS,
                 f"indexed operation {node.name} has dynamic indices without a proved bounds guard",
@@ -580,13 +789,32 @@ def lower_indexed_program(program: NormalizedProgram, *, facts: FactTable | None
         )
         source_origins = set(origins)
         effect_edges = tuple(
-            EffectEdge(origin_id, effect.kind, effect.target, effect.required)
+            EffectEdge(
+                origin_id, effect.kind, effect.target, effect.required,
+                effect_id=transition.effect_id if transition and effect.target == transition.state_id else None,
+                reads=(transition.old_value,) if transition and effect.target == transition.state_id else (),
+                writes=(transition.new_value,) if transition and effect.target == transition.state_id else (),
+                alias_rule=transition.alias_rule if transition and effect.target == transition.state_id else None,
+            )
             for effect in program.effects
             for origin_id in program.origin_map.get(effect.node_id, ())
             if effect.node_id == node.name or origin_id in source_origins
         )
+        read_transitions = tuple(transitions_by_output[value] for value in inputs if value in transitions_by_output)
+        if read_transitions and origins:
+            effect_edges += tuple(
+                EffectEdge(origins[0], "state_read_after_publish", item.state_id, True,
+                           effect_id=f"read:{node.name}:{item.effect_id}",
+                           reads=(item.new_value,), depends_on=(item.effect_id,),
+                           alias_rule="acquire_published_value")
+                for item in read_transitions
+            )
         attrs = {"arguments": refs.to_dict()["args"], "keywords": refs.to_dict()["kwargs"],
                  "operator_name": operator}
+        if index_bounds is not None:
+            attrs["index_bounds"] = dict(index_bounds)
+        if transition is not None:
+            attrs["state_transition"] = transition.to_dict()
         if kind == "Guard":
             attrs["guard_kind"] = "tensor_metadata"
         if kind == "Reduce" and input_nodes:
@@ -625,6 +853,9 @@ def lower_indexed_program(program: NormalizedProgram, *, facts: FactTable | None
             dtype_expr, attrs, aliases, effect_edges, origins, refs,
         )
         operations.append(operation)
+        if transition is not None:
+            state_transitions.append(transition)
+            transitions_by_output[transition.new_value] = transition
 
     outputs: list[OutputLeaf] = []
     output_node = next((node for node in reversed(graph_nodes) if node.op == "output"), None)
@@ -638,11 +869,13 @@ def lower_indexed_program(program: NormalizedProgram, *, facts: FactTable | None
             else:
                 outputs.append(OutputLeaf(path, None, output_id, value))
     from .verify import verify_indexed_program
-    coverage, coverage_diagnostics = verify_indexed_program(program, tuple(operations), node_to_value, tuple(outputs))
+    coverage, coverage_diagnostics = verify_indexed_program(
+        program, tuple(operations), node_to_value, tuple(outputs), tuple(state_transitions)
+    )
     diagnostics.extend(coverage_diagnostics)
     return IndexedTensorProgram(program, tuple(values), tuple(operations), tuple(outputs),
-                                tuple(coverage), tuple(diagnostics))
+                                tuple(coverage), tuple(diagnostics), tuple(state_transitions))
 
 
 __all__ = ["AliasEdge", "EffectEdge", "IndexedOp", "IndexedTensorProgram", "IndexedValue",
-           "InputIndexMap", "IterationAxis", "OutputLeaf", "lower_indexed_program"]
+           "InputIndexMap", "IterationAxis", "OutputLeaf", "StateTransition", "lower_indexed_program"]
