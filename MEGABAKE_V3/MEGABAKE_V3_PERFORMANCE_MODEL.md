@@ -85,6 +85,8 @@ Use three views:
 - CPU enqueue/framework duration without confusing submission with completion.
 - Synchronized user-visible call or controlled repeated-run wall time with explicit synchronization.
 
+Timing field units are part of the artifact contract: names ending in `_us` contain microseconds and names ending in `_ms` contain milliseconds, including every raw sample. Convert `perf_counter()` seconds by `1e6` for microseconds and `1e3` for milliseconds; do not infer units from magnitude or prose.
+
 Run traces, counters and instrumentation separately from final unprofiled timing. Warm compilation, capture and lazy allocation. Alternate or randomize paths in trial blocks to reduce order/clock bias. Retain raw samples, dispersion and a speedup confidence interval; reserve fresh validation trials after tuning. Define a practical margin before final runs, for example at least 5% lower median with a confidence interval above 1, while reporting smaller/inconclusive observations honestly. Do not claim p99 stability from a small correlated sample.
 
 ## 7. Artifact and result reporting

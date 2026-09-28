@@ -68,6 +68,7 @@ CPU lane: no CUDA device query, header lookup, model download or GPU claim durin
 - A strict artifact performs all required device compute in one owned CUDA grid. Host cuBLAS/cuBLASLt, child grids and a captured sequence of kernels belong to an `ExternalPlan`/baseline. Count copies, memset, descriptor updates, binding and return work in the chosen complete-call view.
 - The actual **composed** entry determines block shape, registers, shared/local storage, code footprint, occupancy and cooperative grid size. No estimate from a standalone body admits a different binary.
 - Unknown cost is `UNKNOWN`, never zero. An unavailable GPU/toolchain is `unvalidated`, not a fabricated measurement. Every final predeclared workload cell remains in the scorecard, including losses and unsupported cases.
+- Benchmark artifact field suffixes are binding: `_us` values and raw samples are microseconds; `_ms` values are milliseconds. Convert `perf_counter()` seconds by `1e6` or `1e3`, respectively.
 
 ## 2. What the current repository gives us
 

@@ -1,7 +1,9 @@
 #include "body_harness.h"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 #include <algorithm>
 #include <cstdint>
 
@@ -9,6 +11,9 @@ namespace {
 
 constexpr int kSerial = 0;
 constexpr int kSimt = 1;
+constexpr int kTensorCore = 2;
+constexpr int kFloat16 = 0;
+constexpr int kBfloat16 = 1;
 constexpr int kGridRejected = -1001;
 constexpr int kMaxWarps = 32;
 
@@ -184,6 +189,123 @@ __global__ void simt_owner(Mb3Contraction p) {
     simt_output<VectorWidth>(p, output_index, lane);
 }
 
+__device__ __forceinline__ float as_float(__half value) {
+  return __half2float(value);
+}
+
+__device__ __forceinline__ float as_float(__nv_bfloat16 value) {
+  return __bfloat162float(value);
+}
+
+template <class T>
+__device__ __forceinline__ T from_float(float value);
+
+template <>
+__device__ __forceinline__ __half from_float<__half>(float value) {
+  return __float2half_rn(value);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float value) {
+  return __float2bfloat16_rn(value);
+}
+
+template <int Warps, int Depth, class T>
+__global__ void output_major_mma(Mb3Contraction p) {
+  constexpr int kTile = 16;
+  constexpr int kTileElements = kTile * kTile;
+  constexpr int kWeightElementsPerStage = Warps * kTileElements;
+  __shared__ __align__(32) T weight_tile[Depth * kWeightElementsPerStage];
+  __shared__ __align__(32) T activation_tile[Depth * kTileElements];
+  __shared__ __align__(32) float result_tile[Warps * kTileElements];
+
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int64_t output_tiles = (p.n + kTile - 1) / kTile;
+  const int64_t worker_groups = (output_tiles + Warps - 1) / Warps;
+  const auto *x = static_cast<const T *>(p.x);
+  const auto *weight = static_cast<const T *>(p.weight);
+  const auto *bias = static_cast<const T *>(p.bias);
+  auto *output = static_cast<T *>(p.output);
+
+  // Y^T = W X^T. The batch axis is padded to one WMMA tile; stores retain
+  // only live [M,N] values. Every warp owns one output-channel tile.
+  for (int64_t group = blockIdx.x; group < worker_groups;
+       group += gridDim.x) {
+    const int64_t output_tile = group * Warps + warp;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kTile, kTile, kTile,
+                           float> accumulator;
+    nvcuda::wmma::fill_fragment(accumulator, 0.0f);
+
+    for (int64_t k_base = 0; k_base < p.k; k_base += Depth * kTile) {
+      for (int index = threadIdx.x;
+           index < Depth * kWeightElementsPerStage;
+           index += blockDim.x) {
+        const int stage = index / kWeightElementsPerStage;
+        const int stage_index = index % kWeightElementsPerStage;
+        const int tile_warp = stage_index / kTileElements;
+        const int within_tile = stage_index % kTileElements;
+        const int row = within_tile / kTile;
+        const int k = within_tile % kTile;
+        const int64_t channel = (group * Warps + tile_warp) * kTile + row;
+        const int64_t reduction = k_base + stage * kTile + k;
+        weight_tile[index] = channel < p.n && reduction < p.k
+            ? weight[channel * p.weight_n_stride + reduction * p.weight_k_stride]
+            : from_float<T>(0.0f);
+      }
+
+      // Stage several K tiles before the MMA phase to amortize CTA barriers.
+      if (warp == 0 && lane < kTile) {
+        for (int stage = 0; stage < Depth; ++stage) {
+          const int64_t reduction = k_base + stage * kTile + lane;
+          for (int batch = 0; batch < kTile; ++batch) {
+            const bool active = batch < p.m && reduction < p.k;
+            activation_tile[stage * kTileElements + batch * kTile + lane] =
+                active ? x[batch * p.x_m_stride + reduction * p.x_k_stride]
+                       : from_float<T>(0.0f);
+          }
+        }
+      }
+      __syncthreads();
+
+#pragma unroll
+      for (int stage = 0; stage < Depth; ++stage) {
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kTile, kTile, kTile,
+                               T, nvcuda::wmma::row_major> a;
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kTile, kTile, kTile,
+                               T, nvcuda::wmma::col_major> b;
+        nvcuda::wmma::load_matrix_sync(
+            a, weight_tile + stage * kWeightElementsPerStage +
+                   warp * kTileElements,
+            kTile);
+        nvcuda::wmma::load_matrix_sync(
+            b, activation_tile + stage * kTileElements, kTile);
+        nvcuda::wmma::mma_sync(accumulator, a, b, accumulator);
+      }
+      __syncthreads();
+    }
+
+    nvcuda::wmma::store_matrix_sync(
+        result_tile + warp * kTileElements, accumulator, kTile,
+        nvcuda::wmma::mem_row_major);
+    __syncwarp();
+    for (int index = lane; index < kTileElements; index += 32) {
+      const int channel_offset = index / kTile;
+      const int batch = index % kTile;
+      const int64_t channel = output_tile * kTile + channel_offset;
+      if (channel < p.n && batch < p.m) {
+        const int64_t output_index = static_cast<int64_t>(batch) * p.n + channel;
+        const float old_value = bias && p.beta != 0.0f
+            ? as_float(bias[output_index])
+            : 0.0f;
+        output[output_index] = from_float<T>(
+            p.alpha * result_tile[warp * kTileElements + index] +
+            p.beta * old_value);
+      }
+    }
+  }
+}
+
 template <class Kernel>
 int profile(Kernel kernel, int threads, Mb3Resources *result) {
   cudaDeviceProp prop{};
@@ -255,9 +377,60 @@ int profile_standalone(int strategy, Mb3Resources *resources) {
   return profile(simt_standalone<Warps, VectorWidth>, Warps * 32, resources);
 }
 
-int dispatch_profile(int strategy, int warps, int vector_width,
+template <int Warps, int Depth, class T>
+int launch_mma(const Mb3Contraction &p, int grid, cudaStream_t stream) {
+  const int64_t output_tiles = (p.n + 15) / 16;
+  const int64_t groups = (output_tiles + Warps - 1) / Warps;
+  if (grid == -1) {
+    grid = static_cast<int>(groups);
+    if (grid <= 0) return kGridRejected;
+    output_major_mma<Warps, Depth, T><<<grid, Warps * 32, 0, stream>>>(p);
+    return cudaGetLastError();
+  }
+  if (grid <= 0 || grid > groups) return kGridRejected;
+  void *args[] = {const_cast<Mb3Contraction *>(&p)};
+  return cudaLaunchCooperativeKernel(
+      reinterpret_cast<void *>(output_major_mma<Warps, Depth, T>), dim3(grid),
+      dim3(Warps * 32), args, 0, stream);
+}
+
+template <int Warps, int Depth>
+int profile_mma(int dtype, Mb3Resources *resources) {
+  if (dtype == kFloat16)
+    return profile(output_major_mma<Warps, Depth, __half>, Warps * 32, resources);
+  if (dtype == kBfloat16)
+    return profile(output_major_mma<Warps, Depth, __nv_bfloat16>, Warps * 32, resources);
+  return kGridRejected;
+}
+
+template <int Warps, int Depth>
+int profile_mma_standalone(int dtype, Mb3Resources *resources) {
+  return profile_mma<Warps, Depth>(dtype, resources);
+}
+
+int dispatch_profile(int strategy, int warps, int vector_width, int mainloop_depth,
+                     int dtype,
                      Mb3Resources *resources) {
-  if (!resources || (strategy != kSerial && strategy != kSimt)) return kGridRejected;
+  if (!resources) return kGridRejected;
+#define MB3_PROFILE_MMA(W, D) \
+  if (warps == W && mainloop_depth == D) \
+    return profile_mma<W, D>(dtype, resources)
+  if (strategy == kTensorCore && vector_width == 1) {
+    MB3_PROFILE_MMA(1, 1);
+    MB3_PROFILE_MMA(1, 2);
+    MB3_PROFILE_MMA(1, 4);
+    MB3_PROFILE_MMA(2, 1);
+    MB3_PROFILE_MMA(2, 2);
+    MB3_PROFILE_MMA(2, 4);
+    MB3_PROFILE_MMA(4, 1);
+    MB3_PROFILE_MMA(4, 2);
+    MB3_PROFILE_MMA(4, 4);
+    return kGridRejected;
+  }
+#undef MB3_PROFILE_MMA
+  if ((strategy != kSerial && strategy != kSimt) || dtype != kFloat16 ||
+      mainloop_depth != 1)
+    return kGridRejected;
   if (strategy == kSerial) return profile_simt<4, 1>(strategy, resources);
 #define MB3_PROFILE(W, V) \
   if (warps == W && vector_width == V) \
@@ -273,8 +446,28 @@ int dispatch_profile(int strategy, int warps, int vector_width,
 }
 
 int dispatch_standalone_profile(int strategy, int warps, int vector_width,
+                                int mainloop_depth, int dtype,
                                 Mb3Resources *resources) {
-  if (!resources || (strategy != kSerial && strategy != kSimt)) return kGridRejected;
+  if (!resources) return kGridRejected;
+#define MB3_PROFILE_STANDALONE_MMA(W, D) \
+  if (warps == W && mainloop_depth == D) \
+    return profile_mma_standalone<W, D>(dtype, resources)
+  if (strategy == kTensorCore && vector_width == 1) {
+    MB3_PROFILE_STANDALONE_MMA(1, 1);
+    MB3_PROFILE_STANDALONE_MMA(1, 2);
+    MB3_PROFILE_STANDALONE_MMA(1, 4);
+    MB3_PROFILE_STANDALONE_MMA(2, 1);
+    MB3_PROFILE_STANDALONE_MMA(2, 2);
+    MB3_PROFILE_STANDALONE_MMA(2, 4);
+    MB3_PROFILE_STANDALONE_MMA(4, 1);
+    MB3_PROFILE_STANDALONE_MMA(4, 2);
+    MB3_PROFILE_STANDALONE_MMA(4, 4);
+    return kGridRejected;
+  }
+#undef MB3_PROFILE_STANDALONE_MMA
+  if ((strategy != kSerial && strategy != kSimt) || dtype != kFloat16 ||
+      mainloop_depth != 1)
+    return kGridRejected;
   if (strategy == kSerial) return profile_standalone<4, 1>(strategy, resources);
 #define MB3_PROFILE(W, V) \
   if (warps == W && vector_width == V) \
@@ -290,10 +483,54 @@ int dispatch_standalone_profile(int strategy, int warps, int vector_width,
 }
 
 int dispatch_launch(const Mb3Contraction &p, int strategy, int warps,
-                    int vector_width, int grid, cudaStream_t stream) {
+                    int vector_width, int mainloop_depth, int grid,
+                    cudaStream_t stream) {
   if (p.m <= 0 || p.n <= 0 || p.k <= 0 || !p.x || !p.weight || !p.output ||
-      (p.beta != 0.0f && !p.bias) || (strategy != kSerial && strategy != kSimt))
+      (p.beta != 0.0f && !p.bias) ||
+      (p.input_dtype != kFloat16 && p.input_dtype != kBfloat16) ||
+      (strategy != kSerial && strategy != kSimt && strategy != kTensorCore))
     return kGridRejected;
+  if (strategy == kTensorCore) {
+    if (p.m > 16 || vector_width != 1) return kGridRejected;
+    if (warps == 1 && mainloop_depth == 1)
+      return p.input_dtype == kFloat16
+          ? launch_mma<1, 1, __half>(p, grid, stream)
+          : launch_mma<1, 1, __nv_bfloat16>(p, grid, stream);
+    if (warps == 1 && mainloop_depth == 2)
+      return p.input_dtype == kFloat16
+          ? launch_mma<1, 2, __half>(p, grid, stream)
+          : launch_mma<1, 2, __nv_bfloat16>(p, grid, stream);
+    if (warps == 1 && mainloop_depth == 4)
+      return p.input_dtype == kFloat16
+          ? launch_mma<1, 4, __half>(p, grid, stream)
+          : launch_mma<1, 4, __nv_bfloat16>(p, grid, stream);
+    if (warps == 2 && mainloop_depth == 1)
+      return p.input_dtype == kFloat16
+          ? launch_mma<2, 1, __half>(p, grid, stream)
+          : launch_mma<2, 1, __nv_bfloat16>(p, grid, stream);
+    if (warps == 2 && mainloop_depth == 2)
+      return p.input_dtype == kFloat16
+          ? launch_mma<2, 2, __half>(p, grid, stream)
+          : launch_mma<2, 2, __nv_bfloat16>(p, grid, stream);
+    if (warps == 2 && mainloop_depth == 4)
+      return p.input_dtype == kFloat16
+          ? launch_mma<2, 4, __half>(p, grid, stream)
+          : launch_mma<2, 4, __nv_bfloat16>(p, grid, stream);
+    if (warps == 4 && mainloop_depth == 1)
+      return p.input_dtype == kFloat16
+          ? launch_mma<4, 1, __half>(p, grid, stream)
+          : launch_mma<4, 1, __nv_bfloat16>(p, grid, stream);
+    if (warps == 4 && mainloop_depth == 2)
+      return p.input_dtype == kFloat16
+          ? launch_mma<4, 2, __half>(p, grid, stream)
+          : launch_mma<4, 2, __nv_bfloat16>(p, grid, stream);
+    if (warps == 4 && mainloop_depth == 4)
+      return p.input_dtype == kFloat16
+          ? launch_mma<4, 4, __half>(p, grid, stream)
+          : launch_mma<4, 4, __nv_bfloat16>(p, grid, stream);
+    return kGridRejected;
+  }
+  if (p.input_dtype != kFloat16 || mainloop_depth != 1) return kGridRejected;
   if (strategy == kSerial) return launch_simt<4, 1>(p, strategy, grid, stream);
 #define MB3_LAUNCH(W, V) \
   if (warps == W && vector_width == V) \
@@ -311,22 +548,29 @@ int dispatch_launch(const Mb3Contraction &p, int strategy, int warps,
 }  // namespace
 
 extern "C" int mb3_owner_profile(int strategy, int warps_per_cta,
-                                  int vector_width, Mb3Resources *resources) {
-  return dispatch_profile(strategy, warps_per_cta, vector_width, resources);
+                                  int vector_width, int mainloop_depth,
+                                  int input_dtype,
+                                  Mb3Resources *resources) {
+  return dispatch_profile(strategy, warps_per_cta, vector_width, mainloop_depth,
+                          input_dtype, resources);
 }
 
 extern "C" int mb3_standalone_profile(int strategy, int warps_per_cta,
-                                       int vector_width,
+                                       int vector_width, int mainloop_depth,
+                                       int input_dtype,
                                        Mb3Resources *resources) {
   return dispatch_standalone_profile(strategy, warps_per_cta, vector_width,
-                                     resources);
+                                     mainloop_depth, input_dtype, resources);
 }
 
 extern "C" int mb3_validate_owner_grid(int strategy, int warps_per_cta,
-                                       int vector_width, int grid_ctas) {
+                                       int vector_width, int mainloop_depth,
+                                       int input_dtype,
+                                       int grid_ctas) {
   if (grid_ctas <= 0) return kGridRejected;
   Mb3Resources resources{};
-  const int e = dispatch_profile(strategy, warps_per_cta, vector_width, &resources);
+  const int e = dispatch_profile(strategy, warps_per_cta, vector_width,
+                                 mainloop_depth, input_dtype, &resources);
   if (e) return e;
   if (!resources.cooperative_launch || !resources.active_ctas_per_sm ||
       grid_ctas > resources.resident_ctas)
@@ -335,22 +579,36 @@ extern "C" int mb3_validate_owner_grid(int strategy, int warps_per_cta,
 }
 
 extern "C" int mb3_launch(const Mb3Contraction *problem, int strategy,
-                           int warps_per_cta, int vector_width, int grid_ctas,
+                           int warps_per_cta, int vector_width,
+                           int mainloop_depth, int grid_ctas,
                            uintptr_t stream) {
   if (!problem) return kGridRejected;
   const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
   if (grid_ctas == -1)
     return dispatch_launch(*problem, strategy, warps_per_cta, vector_width,
-                           -1, cuda_stream);
+                           mainloop_depth, -1, cuda_stream);
   const int e = mb3_validate_owner_grid(strategy, warps_per_cta, vector_width,
+                                        mainloop_depth, problem->input_dtype,
                                         grid_ctas);
   if (e) return e;
   return dispatch_launch(*problem, strategy, warps_per_cta, vector_width,
-                         grid_ctas, cuda_stream);
+                         mainloop_depth, grid_ctas, cuda_stream);
+}
+
+extern "C" int mb3_launch_admitted(
+    const Mb3Contraction *problem, int strategy, int warps_per_cta,
+    int vector_width, int mainloop_depth, int grid_ctas, uintptr_t stream) {
+  if (!problem || grid_ctas <= 0) return kGridRejected;
+  const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+  // The caller has already admitted this exact target/entry/grid. Avoid
+  // repeating cudaFuncGetAttributes and occupancy queries in timed invocations.
+  return dispatch_launch(*problem, strategy, warps_per_cta, vector_width,
+                         mainloop_depth, grid_ctas, cuda_stream);
 }
 
 extern "C" int mb3_capture(const Mb3Contraction *problem, int strategy,
-                            int warps_per_cta, int vector_width, int grid_ctas,
+                            int warps_per_cta, int vector_width,
+                            int mainloop_depth, int grid_ctas,
                             int launches, uintptr_t stream, void **graph_exec) {
   if (!problem || !graph_exec || launches <= 0) return kGridRejected;
   const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
@@ -358,7 +616,7 @@ extern "C" int mb3_capture(const Mb3Contraction *problem, int strategy,
   if (e != cudaSuccess) return e;
   for (int i = 0; i < launches; ++i) {
     const int launch_error = mb3_launch(problem, strategy, warps_per_cta,
-                                         vector_width, grid_ctas,
+                                         vector_width, mainloop_depth, grid_ctas,
                                          reinterpret_cast<uintptr_t>(cuda_stream));
     if (launch_error) {
       cudaGraph_t discarded{};

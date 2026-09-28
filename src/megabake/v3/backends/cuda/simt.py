@@ -51,10 +51,11 @@ class ContractionShape:
             raise ValueError("contraction dimensions and call_count must be positive")
         if min(self.x_m_stride, self.x_k_stride, self.w_n_stride, self.w_k_stride) <= 0:
             raise ValueError("contraction strides must be positive")
-        if (self.input_dtype, self.output_dtype, self.accumulation_dtype) != (
-            "float16", "float16", "float32"
+        if (self.input_dtype, self.output_dtype, self.accumulation_dtype) not in (
+            ("float16", "float16", "float32"),
+            ("bfloat16", "bfloat16", "float32"),
         ):
-            raise ValueError("the V3R-006 probe supports fp16 inputs/output with fp32 accumulation")
+            raise ValueError("the CUDA contraction probes require fp16/bf16 with fp32 accumulation")
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,8 @@ class SimtSchedule:
 def enumerate_simt_schedules(shape: ContractionShape) -> tuple[SimtSchedule, ...]:
     """Return a small, legal K-parallel menu; no Cartesian search explosion."""
     shape.validate()
+    if shape.input_dtype != "float16":
+        raise ValueError("the V3R-006 SIMT body is fp16-only")
     widths = (1, 4) if shape.x_k_stride == shape.w_k_stride == 1 else (1,)
     return tuple(
         SimtSchedule(warps, width)
