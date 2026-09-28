@@ -62,9 +62,27 @@ class NormalizedProgram:
     policy: Any = None
     normalization_path: str = "capture"
     state_bindings: Mapping[str, str] = field(default_factory=dict)
+    source_graph_module: Any | None = None
+    source_exported_program: Any | None = None
+    # Current FX node name -> stable origin IDs; lineage retains deleted origins.
+    origin_map: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    origin_lineage: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    origin_history: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    output_origins: Mapping[str, str] = field(default_factory=dict)
 
-    def with_graph(self, graph_module: Any, *, effects: tuple[EffectFact, ...] | None = None) -> "NormalizedProgram":
-        return replace(self, graph_module=graph_module, effects=self.effects if effects is None else effects)
+    def with_graph(self, graph_module: Any, *, effects: tuple[EffectFact, ...] | None = None,
+                   origin_map: Mapping[str, tuple[str, ...]] | None = None,
+                   origin_lineage: Mapping[str, tuple[str, ...]] | None = None,
+                   origin_history: Mapping[str, tuple[str, ...]] | None = None,
+                   value_ids: Mapping[str, str] | None = None) -> "NormalizedProgram":
+        return replace(
+            self, graph_module=graph_module,
+            effects=self.effects if effects is None else effects,
+            origin_map=self.origin_map if origin_map is None else origin_map,
+            origin_lineage=self.origin_lineage if origin_lineage is None else origin_lineage,
+            origin_history=self.origin_history if origin_history is None else origin_history,
+            value_ids=_value_ids(graph_module) if value_ids is None else value_ids,
+        )
 
     def binding_for(self, placeholder: str) -> Any:
         try:
@@ -79,6 +97,66 @@ class NormalizedProgram:
 
 def _value_ids(graph_module: Any) -> dict[str, str]:
     return {node.name: f"v{index}" for index, node in enumerate(graph_module.graph.nodes)}
+
+
+_ORIGIN_META = "megabake_v3_origin_ids"
+
+
+def _stable_target(target: Any) -> str:
+    schema = getattr(target, "_schema", None)
+    if schema is not None:
+        return f"{schema.name}.{schema.overload_name or 'default'}"
+    return ".".join(filter(None, (
+        getattr(target, "__module__", None),
+        getattr(target, "__qualname__", getattr(target, "__name__", None)),
+    ))) or type(target).__name__
+
+
+def _output_leaves(value: Any, path: tuple[Any, ...] = ()) -> list[tuple[tuple[Any, ...], Any]]:
+    if hasattr(value, "op") and hasattr(value, "name"):
+        return [(path, value)]
+    if isinstance(value, Mapping):
+        return [leaf for key, item in value.items() for leaf in _output_leaves(item, path + (str(key),))]
+    if isinstance(value, (tuple, list)):
+        return [leaf for index, item in enumerate(value) for leaf in _output_leaves(item, path + (index,))]
+    return [(path, value)]
+
+
+def seed_origins(program: NormalizedProgram, source_graph_module: Any | None = None) -> NormalizedProgram:
+    """Attach stable capture IDs before any rewrite and retain output paths."""
+    graph_module = program.graph_module
+    source = source_graph_module or graph_module
+    source_nodes = list(source.graph.nodes)
+    payload = [
+        [node.op, _stable_target(node.target), _fx_value(node.args), _fx_value(node.kwargs)]
+        for node in source_nodes
+    ]
+    capture_id = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+    source_ids = {node.name: f"fx:{capture_id}:{index}" for index, node in enumerate(source_nodes)}
+    normalized_nodes = list(graph_module.graph.nodes)
+    # Capture adapters are allowed to copy the graph, but not to reorder its ABI.
+    if len(source_nodes) != len(normalized_nodes):
+        raise UnsupportedGraphError("capture changed FX node count before normalization provenance was assigned")
+    origin_map: dict[str, tuple[str, ...]] = {}
+    for source_node, node in zip(source_nodes, normalized_nodes):
+        origin_id = source_ids[source_node.name]
+        node.meta[_ORIGIN_META] = (origin_id,)
+        source_node.meta[_ORIGIN_META] = (origin_id,)
+        origin_map[node.name] = (origin_id,)
+    output_node = next((node for node in reversed(source_nodes) if node.op == "output"), None)
+    output_origins = {}
+    if output_node is not None and output_node.args:
+        for path, _ in _output_leaves(output_node.args[0]):
+            path_key = json.dumps(path, separators=(",", ":"), default=str)
+            output_origins[path_key] = f"fx:{capture_id}:output:{path_key}"
+    return replace(
+        program,
+        source_graph_module=source,
+        origin_map=origin_map,
+        origin_lineage={origin_id: () for origin_id in source_ids.values()},
+        origin_history={origin_id: (name,) for name, origin_id in source_ids.items()},
+        output_origins=output_origins,
+    )
 
 
 def _fx_value(value: Any) -> Any:
@@ -332,6 +410,41 @@ def _binding_data(exported_program: Any) -> tuple[dict[str, LiftedBinding], dict
     return bindings, values, tuple(effects)
 
 
+def _module_bindings(graph_module: Any) -> tuple[dict[str, LiftedBinding], dict[str, Any]]:
+    parameters = dict(graph_module.named_parameters(remove_duplicate=False))
+    buffers = dict(graph_module.named_buffers(remove_duplicate=False))
+    bindings: dict[str, LiftedBinding] = {}
+    values: dict[str, Any] = {}
+    for node in graph_module.graph.nodes:
+        if node.op != "get_attr":
+            continue
+        target = str(node.target)
+        value = graph_module
+        for component in target.split("."):
+            value = getattr(value, component)
+        role = "weight" if target in parameters else "state" if target in buffers else "constant"
+        bindings[node.name] = LiftedBinding(node.name, target, role, target in buffers)
+        values[target] = value
+    return bindings, values
+
+
+def _fx_mutation_effects(graph_module: Any) -> tuple[EffectFact, ...]:
+    effects = []
+    for node in graph_module.graph.nodes:
+        if node.op != "call_function":
+            continue
+        schema = getattr(node.target, "_schema", None)
+        writes = any(
+            getattr(getattr(argument, "alias_info", None), "is_write", False)
+            for argument in getattr(schema, "arguments", ())
+        )
+        target = _stable_target(node.target)
+        if writes or target.split(".")[-2:-1] and target.split(".")[-2].endswith("_"):
+            state = node.args[0] if node.args else None
+            effects.append(EffectFact(node.name, "fx_mutation", getattr(state, "name", None)))
+    return tuple(effects)
+
+
 def capture_exported_program(
     exported_program: Any,
     *,
@@ -363,7 +476,9 @@ def capture_exported_program(
         source_kind="exported_program",
         policy=policy,
         state_bindings=normalized_states,
+        source_exported_program=exported_program,
     )
+    program = seed_origins(program, exported_program.graph_module)
     if step_abi is not None:
         if not isinstance(step_abi, StepABI):
             raise TypeError("step_abi must be a StepABI")
@@ -424,8 +539,9 @@ def capture_graph_module(
     state_bindings: Mapping[str, Any] | None = None,
     step_abi: StepABI | None = None,
     policy: Any = None,
+    reexport: bool = True,
 ) -> NormalizedProgram:
-    """Capture a GraphModule through export using caller-provided examples only."""
+    """Capture explicit FX inputs directly, or verify a re-export adapter."""
 
     if example_args is None or input_spec is None:
         raise FrontendError("GraphModule capture requires example_args and input_spec")
@@ -444,6 +560,45 @@ def capture_graph_module(
     if len(placeholders) != len(args):
         raise BindingError(f"GraphModule expects {len(placeholders)} positional inputs, got {len(args)} examples")
     normalized_states = _normalize_state_bindings(graph_module, state_bindings)
+    if not reexport:
+        from copy import deepcopy
+        working = deepcopy(graph_module)
+        try:
+            from torch.fx.passes.shape_prop import ShapeProp
+            ShapeProp(working).propagate(*_as_args(_clone_tree(args)))
+        except Exception as exc:
+            raise UnsupportedGraphError(f"could not collect direct FX example metadata: {type(exc).__name__}: {exc}") from exc
+        bindings, values = _module_bindings(graph_module)
+        effects = _fx_mutation_effects(graph_module) + _state_update_effects(graph_module, normalized_states)
+        original_args = _clone_tree(args)
+        try:
+            output = graph_module(*original_args)
+        except Exception as exc:
+            raise UnsupportedGraphError(f"could not execute direct FX reference: {type(exc).__name__}: {exc}") from exc
+        if output_spec is not None:
+            _validate_tree(output, output_spec)
+        program = NormalizedProgram(
+            graph_module=working,
+            reference=graph_module,
+            export_signature=None,
+            lifted_bindings=bindings,
+            binding_values=values,
+            effects=effects,
+            input_spec=input_spec,
+            output_tree_spec=output_spec,
+            value_ids=_value_ids(working),
+            source_kind="graph_module",
+            policy=policy,
+            state_bindings=normalized_states,
+        )
+        program = seed_origins(program, graph_module)
+        if step_abi is not None:
+            expected = tuple(item["placeholder"] for item in step_abi.ordered_user_inputs)
+            if expected != placeholders:
+                raise UnsupportedGraphError(
+                    f"direct GraphModule ABI differs from StepABI: expected {expected!r}, got {placeholders!r}"
+                )
+        return program
     # Export performs functionalization/metadata capture; it does not inspect a device.
     try:
         exported = torch.export.export(graph_module, args, strict=False)

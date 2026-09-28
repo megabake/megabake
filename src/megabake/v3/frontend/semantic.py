@@ -195,3 +195,9 @@ def recognize(program: NormalizedProgram, *, facts: FactTable | None = None,
                                           (facts.node_to_value[node.name],) if node.name in facts.node_to_value else (),
                                           program.run_reference))
     return SemanticGraph(program, facts, tuple(operations), tuple(references))
+
+
+def index_program(program: NormalizedProgram, *, facts: FactTable | None = None) -> Any:
+    """Build the canonical origin-indexed program alongside legacy matchers."""
+    from ..semantics.indexed import lower_indexed_program
+    return lower_indexed_program(program, facts=facts)

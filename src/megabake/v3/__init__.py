@@ -23,7 +23,8 @@ from .diagnostics import (
     EvidenceVector,
     TaskHandoff,
 )
-from .frontend import NormalizedProgram, SemanticGraph, collect_facts, normalize_fx, recognize
+from .frontend import NormalizedProgram, SemanticGraph, collect_facts, index_program, normalize_fx, recognize
+from .semantics import IndexedTensorProgram, lower_indexed_program
 
 __all__ = [
     "BenchmarkCell",
@@ -40,6 +41,9 @@ __all__ = [
     "EvidenceVector",
     "TaskHandoff",
     "NormalizedProgram",
+    "IndexedTensorProgram",
+    "lower_indexed_program",
+    "index_program",
     "SemanticGraph",
     "collect_facts",
     "normalize_fx",
