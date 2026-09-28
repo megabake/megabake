@@ -252,6 +252,11 @@ StepABI/v1 {
 }
 ```
 
+For compatibility with the checked-in capture frontend, an `ExportedProgram`
+buffer binding may use role `state`; this labels a lifted module buffer and is
+distinct from invocation state, which is described by `old_state_inputs`,
+`state_effects` and `new_state_outputs`.
+
 For the first functional cache mode, `run` receives old state, returns new state, and leaves old state unchanged unless the captured reference explicitly permits aliasing. An in-place mode is a separate ABI version/guard, not an implementation detail. The cache convention is `0 <= L < C`, append new K/V at `L`, attend to the declared valid range after that write, and report `L+1`; a different model convention needs a new explicit mapping. Output logits retain the captured output tree and dtype. The optional HF helper may adapt user-facing shapes, but **the same adapter** wraps reference and all baselines.
 
 The first public interface lives at `megabake.v3.compile_fx`, leaving the checked-in `megabake.compile_fx` legacy behavior intact until an explicit migration. Its semantic signature is:

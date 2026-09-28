@@ -1,5 +1,9 @@
+from pathlib import Path
+
+import pytest
 import torch
 
+from megabake.v3.contracts import ContractError, StepABI, StepManifest
 from megabake.v3.frontend.capture import BindingError, capture_exported_program
 
 
@@ -40,6 +44,18 @@ def test_export_capture_keeps_tied_parameter_identity_and_constant_buffers():
     roles = {binding.role for binding in program.lifted_bindings.values()}
     assert {"weight", "state"}.issubset(roles)
     assert torch.equal(program.run_reference(torch.ones(1, 2)), torch.full((1, 2), 6.0))
+
+
+def test_step_abi_accepts_lifted_module_buffer_role_and_rejects_unknown_role():
+    manifest_path = Path(__file__).resolve().parents[3] / "benchmarks/v3/manifests/tiny_cached_step.json"
+    abi = StepManifest.from_json(manifest_path.read_text()).step_abi.to_dict()
+    abi["lifted_bindings"]["b_buffer"] = {
+        "identity": "rotary.inv_freq", "role": "state", "lifetime": "session"
+    }
+    assert StepABI.from_dict(abi).lifted_bindings["b_buffer"]["role"] == "state"
+    abi["lifted_bindings"]["b_buffer"]["role"] = "mystery"
+    with pytest.raises(ContractError, match="role is invalid"):
+        StepABI.from_dict(abi)
 
 
 def test_export_capture_keeps_inplace_mutation_as_an_effect_root():

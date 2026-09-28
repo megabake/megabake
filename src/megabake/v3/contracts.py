@@ -604,7 +604,7 @@ class StepABI:
             if not isinstance(binding, Mapping):
                 raise ContractError(f"lifted_bindings[{placeholder!r}] must be an object")
             _nonempty(binding.get("identity"), f"lifted_bindings[{placeholder!r}].identity")
-            if binding.get("role") not in {"weight", "parameter", "buffer", "constant"}:
+            if binding.get("role") not in {"weight", "parameter", "buffer", "state", "constant"}:
                 raise ContractError(f"lifted_bindings[{placeholder!r}].role is invalid")
             _nonempty(binding.get("lifetime"), f"lifted_bindings[{placeholder!r}].lifetime")
         object.__setattr__(self, "lifted_bindings", bindings)

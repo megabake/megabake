@@ -191,6 +191,8 @@ G1 body work can proceed in parallel with G0 capture on already known exact shap
 
 **Implement:** for each contraction/attention in the full step record B/M/N/K, effective strides/transposes, dtype, accumulation, bias/cast/epilogue, call count, selected vendor/Inductor template path, weight preparation, cache condition and critical-path contribution. Record inspectable Inductor tile/layout/padding/fusion choices with their FX origin and selected target; mark opaque private-library details unknown. Separate semantic bytes, global-address-space bytes and measured HBM/L2 bytes. Identify candidate fused boundary savings only from traces, never by summing assumed launch costs.
 
+If CUDA Graph profiling hides the selected path's Aten operation shapes, use an equivalent same-cell default compile trace for FX-to-Aten shape and call-count matching. Any reference-path event timings must retain that mode label and cannot be attributed to the selected path. Retain the selected trace and kernel names separately; leave its kernel-to-FX mapping unknown unless the trace or generated source proves it.
+
 **Pass:** inventory covers all live hot math including unrecognized FX regions and matches observed baseline operations; each shape has an origin FX region. **Reject:** a tensor-core microbenchmark under hot L2 cannot be compared as a whole-model HBM-bound body rate. **Handoff:** ranked hot-shape list and conservative body-quality budget for the first target.
 
 ### V3R-005 — Build a standalone and lean owner-entry body harness
