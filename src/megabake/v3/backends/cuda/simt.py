@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from math import ceil
 from typing import Any, Mapping
 
+from ...semantics.indexed import IndexedOp, IndexedTensorProgram
+
 
 @dataclass(frozen=True)
 class ContractionShape:
@@ -45,6 +47,67 @@ class ContractionShape:
             accumulation_dtype=str(record["accumulation_dtype"]),
             call_count=int(record["call_count"]),
         )
+
+    @classmethod
+    def from_indexed(cls, program: IndexedTensorProgram, operation: IndexedOp,
+                     *, call_count: int = 1) -> "ContractionShape":
+        """Derive schedule dimensions without replacing indexed semantics."""
+        if operation.kind != "Contraction":
+            raise ValueError("indexed operation is not a contraction")
+        name = str(operation.attributes.get("operator_name", ""))
+        values = {value.value_id: value for value in program.values}
+        if name == "addmm":
+            left_index, right_index = 1, 2
+        elif name in {"mm", "matmul", "bmm", "linear"}:
+            left_index, right_index = 0, 1
+        else:
+            raise ValueError(f"indexed contraction {name!r} has no SIMT schedule descriptor")
+        if name == "bmm":
+            raise ValueError("batched contractions need a batch-aware schedule descriptor")
+        if len(operation.inputs) <= right_index or len(operation.iteration_domain) < 2:
+            raise ValueError("indexed contraction lacks a complete output domain")
+        left, right = values[operation.inputs[left_index]], values[operation.inputs[right_index]]
+        output = values[operation.outputs[0]]
+        shapes = (left.shape, right.shape, output.shape)
+        if any(any(not isinstance(dim, int) or dim <= 0 for dim in shape) for shape in shapes):
+            raise ValueError("SIMT schedule needs positive concrete matrix extents")
+        if any(value.layout not in (None, "strided") for value in (left, right, output)):
+            raise ValueError("SIMT schedule requires dense strided operands")
+        if len(left.shape) != 2 or len(output.shape) != 2:
+            raise ValueError("SIMT schedule currently requires a rank-two contraction")
+        if len(right.shape) != 2 or len(left.strides) != 2 or len(right.strides) != 2:
+            raise ValueError("SIMT schedule needs exact rank-two input strides")
+        if len(operation.input_index_maps) != len(operation.inputs):
+            raise ValueError("indexed contraction does not have one map per operand")
+        m, n = output.shape
+        k = operation.reduction_domain[0].extent if operation.reduction_domain else None
+        if not isinstance(k, int) or left.shape[-1] != k:
+            raise ValueError("indexed K reduction does not match the left matrix")
+        if name == "linear":
+            if right.shape != (n, k):
+                raise ValueError("linear weight must retain its [N,K] map")
+            if (operation.input_index_maps[left_index].expressions != ("i0", "k") or
+                    operation.input_index_maps[right_index].expressions != ("i1", "k")):
+                raise ValueError("linear operand maps are incompatible with its schedule shape")
+            w_n_stride, w_k_stride = right.strides
+        else:
+            if right.shape != (k, n):
+                raise ValueError("matrix RHS must retain its [K,N] map")
+            if (operation.input_index_maps[left_index].expressions != ("i0", "k") or
+                    operation.input_index_maps[right_index].expressions != ("k", "i1")):
+                raise ValueError("matrix operand maps are incompatible with its schedule shape")
+            w_n_stride, w_k_stride = right.strides[1], right.strides[0]
+        if left.shape[0] != m or left.shape[1] != k:
+            raise ValueError("indexed output domain does not match the left matrix")
+        if (left.dtype, right.dtype, output.dtype) not in (
+            ("float16", "float16", "float16"),
+            ("bfloat16", "bfloat16", "bfloat16"),
+        ):
+            raise ValueError("the indexed SIMT schedules require matching fp16/bf16 inputs and output")
+        shape = cls(m, n, k, left.strides[0], left.strides[1], w_n_stride, w_k_stride,
+                    left.dtype, output.dtype, "float32", call_count)
+        shape.validate()
+        return shape
 
     def validate(self) -> None:
         if min(self.m, self.n, self.k, self.call_count) <= 0:

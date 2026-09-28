@@ -10,10 +10,11 @@ from .capture import FrontendError, NormalizedProgram
 
 _DTYPE_BYTES = {
     "float16": 2, "bfloat16": 2, "float32": 4, "float64": 8,
+    "complex64": 8, "complex128": 16,
     "float8_e4m3fn": 1, "float8_e5m2": 1, "int8": 1, "uint8": 1,
     "int16": 2, "int32": 4, "int64": 8, "bool": 1,
 }
-_ALIAS_VIEWS = {"view", "as_strided", "transpose", "permute", "slice", "select", "squeeze", "unsqueeze", "expand", "detach", "alias"}
+_ALIAS_VIEWS = {"view", "as_strided", "transpose", "permute", "t", "slice", "select", "squeeze", "unsqueeze", "expand", "detach", "alias"}
 
 
 class FactError(FrontendError):
@@ -42,6 +43,7 @@ class TensorFacts:
     cast_origin: str | None = None
     write_effects: tuple[str, ...] = ()
     non_overlapping: bool | None = None
+    layout: str = "strided"
 
     @property
     def has_zero_stride(self) -> bool:
@@ -94,16 +96,17 @@ def _tensor_fact(value: Any, *, value_id: str, node: Any, alias_set: str | None,
     if dtype not in _DTYPE_BYTES:
         raise FactError(f"{node.name}: unknown dtype {dtype}")
     shape = tuple(value.shape)
+    layout = str(getattr(value, "layout", "torch.strided")).removeprefix("torch.")
     stride = getattr(value, "stride", None)
-    strides = tuple(stride()) if callable(stride) else tuple(getattr(value, "stride", ()) or ())
-    offset = value.storage_offset() if callable(getattr(value, "storage_offset", None)) else None
+    strides = (tuple(stride()) if callable(stride) else tuple(getattr(value, "stride", ()) or ())) if layout == "strided" else ()
+    offset = value.storage_offset() if layout == "strided" and callable(getattr(value, "storage_offset", None)) else None
     # TensorMetadata from direct GraphModule ShapeProp has no device/storage identity.
     device = str(getattr(value, "device", "unknown"))
     return TensorFacts(value_id, shape, dtype, _DTYPE_BYTES[dtype], device, strides, offset,
                        None, alias_set, role, mutability, node.name if node.op != "placeholder" else None,
                        tuple(user.name for user in node.users), (node.name,), constraints,
                        alias_kind, alias_sources, cast_origin, write_effects,
-                       _non_overlapping(shape, strides))
+                       _non_overlapping(shape, strides), layout)
 
 
 def _first_node(value: Any) -> Any | None:
@@ -169,7 +172,7 @@ def collect_facts(program: NormalizedProgram) -> FactTable:
         elif operator in _ALIAS_VIEWS and source is not None:
             source_alias, _ = aliases.get(source.name, (None, "unknown"))
             alias, alias_kind, alias_sources = source_alias, "view", (node_to_value[source.name],)
-        elif operator == "reshape" and source is not None:
+        elif operator in {"reshape", "flatten"} and source is not None:
             source_fact = facts.get(node_to_value.get(source.name, ""))
             meta = node.meta.get("val", node.meta.get("tensor_meta")) if hasattr(node, "meta") else None
             new_shape = tuple(getattr(meta, "shape", ()))

@@ -76,6 +76,7 @@ class IndexedValue:
     consumers: tuple[str, ...] = ()
     cast_origin: str | None = None
     effects: tuple[str, ...] = ()
+    layout: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {"value_id": self.value_id, "fx_node": self.fx_node, "origin_ids": list(self.origin_ids),
@@ -85,7 +86,7 @@ class IndexedValue:
                 "alias_kind": self.alias_kind, "alias_sources": list(self.alias_sources),
                 "non_overlapping": self.non_overlapping,
                 "role": self.role, "producer": self.producer, "consumers": list(self.consumers),
-                "cast_origin": self.cast_origin, "effects": list(self.effects)}
+                "cast_origin": self.cast_origin, "effects": list(self.effects), "layout": self.layout}
 
 
 @dataclass(frozen=True)
@@ -183,13 +184,15 @@ _KIND_BY_OPERATOR = {
         "_to_copy", "convert_element_type", "maximum", "minimum", "pow",
     )},
     **{name: "Broadcast/View" for name in (
-        "view", "reshape", "transpose", "permute", "slice", "select", "squeeze", "unsqueeze",
-        "expand", "detach", "alias", "flatten", "contiguous", "as_strided",
+        "view", "reshape", "transpose", "permute", "t", "slice", "select", "squeeze", "unsqueeze",
+        "expand", "detach", "alias", "flatten", "as_strided",
     )},
+    "contiguous": "Map",
     **{name: "Reduce" for name in ("sum", "mean", "amax", "max")},
     **{name: "Contraction" for name in ("mm", "bmm", "addmm", "matmul", "linear")},
     **{name: "Gather" for name in ("index_select", "gather", "take")},
     **{name: "Scatter/StateWrite" for name in ("index_copy", "index_put", "slice_scatter", "scatter", "copy")},
+    "_assert_tensor_metadata": "Guard",
 }
 
 
@@ -251,6 +254,16 @@ def _argument(node: Any, position: int, keyword: str, default: Any = None) -> An
     return node.kwargs.get(keyword, default)
 
 
+def _reduction_axes(node: Any, rank: int) -> tuple[int, ...] | None:
+    dimensions = _literal_ints(_argument(node, 1, "dim"))
+    if dimensions is None:
+        dimensions = tuple(range(rank))
+    if any(axis < -rank or axis >= rank for axis in dimensions):
+        return None
+    normalized = tuple(axis + rank if axis < 0 else axis for axis in dimensions)
+    return normalized if len(set(normalized)) == len(normalized) else None
+
+
 def _broadcast_map(input_shape: tuple[Any, ...], output_shape: tuple[Any, ...]) -> tuple[str, ...]:
     if len(input_shape) > len(output_shape):
         return ("UNKNOWN",)
@@ -278,18 +291,24 @@ def _input_maps(node: Any, operator: str, kind: str, inputs: tuple[str, ...],
                      for value, shape in zip(inputs, input_shapes))
     if kind == "Reduce" and input_nodes:
         input_shape = input_shapes[0]
-        dims = _literal_ints(_argument(node, 1, "dim"))
+        dims = _reduction_axes(node, len(input_shape))
         if dims is None:
-            dims = tuple(range(len(input_shape)))
-        if any(dim < -len(input_shape) or dim >= len(input_shape) for dim in dims):
             return (InputIndexMap(inputs[0], ("UNKNOWN",), "reduction"),)
-        dims = tuple(dim + len(input_shape) if dim < 0 else dim for dim in dims)
         keepdim = _argument(node, 2, "keepdim", False)
         if not isinstance(keepdim, bool):
             return (InputIndexMap(inputs[0], ("UNKNOWN",), "reduction"),)
-        expressions = tuple(f"r{axis}" if axis in dims else f"i{axis if keepdim else axis - sum(red < axis for red in dims)}"
-                           for axis in range(len(input_shape)))
-        maps.append(InputIndexMap(inputs[0], expressions, "reduction"))
+        reduction_axes = {axis: reduction for reduction, axis in enumerate(dims)}
+        expressions = []
+        output_axis = 0
+        for axis in range(len(input_shape)):
+            if axis in reduction_axes:
+                expressions.append(f"r{reduction_axes[axis]}")
+            elif keepdim:
+                expressions.append(f"i{axis}")
+            else:
+                expressions.append(f"i{output_axis}")
+                output_axis += 1
+        maps.append(InputIndexMap(inputs[0], tuple(expressions), "reduction"))
         return tuple(maps)
     if kind == "Contraction" and len(inputs) >= 2:
         if operator == "addmm" and len(inputs) >= 3:
@@ -323,43 +342,52 @@ def _input_maps(node: Any, operator: str, kind: str, inputs: tuple[str, ...],
         return tuple(maps)
     if kind == "Broadcast/View" and inputs:
         shape = input_shapes[0]
-        if operator in {"transpose", "permute"}:
-            dims = (node.args[1:3] if operator == "transpose" else node.args[1])
+        if operator in {"transpose", "permute", "t"}:
             permutation = list(range(len(shape)))
-            if operator == "transpose" and len(dims) == 2:
+            if operator == "t" and len(shape) > 2:
+                maps.append(InputIndexMap(inputs[0], ("UNKNOWN",), "permutation"))
+                return tuple(maps)
+            elif operator == "t" and len(shape) == 2:
+                permutation[-2], permutation[-1] = permutation[-1], permutation[-2]
+            elif operator == "transpose":
+                dims = node.args[1:3]
+                if len(dims) != 2:
+                    return (InputIndexMap(inputs[0], ("UNKNOWN",), "permutation"),)
                 first, second = (dim + len(shape) if dim < 0 else dim for dim in dims)
+                if first == second or not (0 <= first < len(shape) and 0 <= second < len(shape)):
+                    return (InputIndexMap(inputs[0], ("UNKNOWN",), "permutation"),)
                 permutation[first], permutation[second] = permutation[second], permutation[first]
-            elif isinstance(dims, (tuple, list)) and len(dims) == len(shape):
-                permutation = [dim + len(shape) if dim < 0 else dim for dim in dims]
+            elif operator == "permute":
+                dims = node.args[1] if len(node.args) > 1 else None
+                if isinstance(dims, (tuple, list)) and len(dims) == len(shape):
+                    permutation = [dim + len(shape) if dim < 0 else dim for dim in dims]
+                    if sorted(permutation) != list(range(len(shape))):
+                        return (InputIndexMap(inputs[0], ("UNKNOWN",), "permutation"),)
+                else:
+                    return (InputIndexMap(inputs[0], ("UNKNOWN",), "permutation"),)
             inverse = {source_axis: out_axis for out_axis, source_axis in enumerate(permutation)}
             maps.append(InputIndexMap(inputs[0], tuple(f"i{inverse[axis]}" for axis in range(len(shape))), "permutation"))
         elif operator == "expand":
             maps.append(InputIndexMap(inputs[0], _broadcast_map(shape, output_shape), "zero_stride_broadcast"))
         elif operator == "as_strided":
-            strides = _literal_ints(node.args[2]) if len(node.args) > 2 else None
-            offset = node.args[3] if len(node.args) > 3 else None
-            if strides is None or len(strides) != len(output_shape):
-                maps.append(InputIndexMap(inputs[0], ("UNKNOWN",), "strided_view"))
-            elif offset is not None:
-                # The indexed ABI uses logical tensor pointers; translating an
-                # absolute storage offset therefore needs a proved base offset.
-                source_fact = facts.for_node(input_nodes[0]) if input_nodes else None
-                if not isinstance(offset, int) or source_fact is None or source_fact.storage_offset is None:
-                    maps.append(InputIndexMap(inputs[0], ("UNKNOWN",), "strided_view"))
-                else:
-                    relative_offset = offset - source_fact.storage_offset
-                    expression = " + ".join([str(relative_offset)] + [f"i{axis}*{stride}" for axis, stride in enumerate(strides)])
-                    maps.append(InputIndexMap(inputs[0], (expression,), "strided_view"))
-            else:
-                expression = " + ".join(["0"] + [f"i{axis}*{stride}" for axis, stride in enumerate(strides)])
-                maps.append(InputIndexMap(inputs[0], (expression,), "strided_view"))
-        elif operator in {"reshape", "view", "flatten", "contiguous"}:
+            # Storage bounds are not represented in TensorFacts yet.  Even a
+            # syntactically affine map can escape the input's allocation.
+            maps.append(InputIndexMap(inputs[0], ("UNKNOWN",), "strided_view"))
+        elif operator in {"reshape", "view", "flatten"}:
             maps.append(InputIndexMap(inputs[0], (f"unravel(ravel(i0..i{max(rank - 1, 0)}),{_stable(shape)})",), "reshape"))
         elif operator == "select":
             dim = node.args[1] if len(node.args) > 1 else 0
             selected = node.args[2] if len(node.args) > 2 else "index"
             axes = [f"i{i}" for i in range(rank)]
             dim = dim + len(shape) if dim < 0 else dim
+            if (not isinstance(dim, int) or not 0 <= dim < len(shape) or
+                    not isinstance(selected, int) or not isinstance(shape[dim], int)):
+                maps.append(InputIndexMap(inputs[0], ("UNKNOWN",), "select"))
+                return tuple(maps)
+            selected = selected + shape[dim] if selected < 0 else selected
+            if not 0 <= selected < shape[dim]:
+                maps.append(InputIndexMap(inputs[0], ("UNKNOWN",), "select"))
+                return tuple(maps)
             axes.insert(dim, str(selected))
             maps.append(InputIndexMap(inputs[0], tuple(axes), "select"))
         elif operator == "squeeze":
@@ -387,6 +415,12 @@ def _input_maps(node: Any, operator: str, kind: str, inputs: tuple[str, ...],
             dim = dim + len(shape) if dim < 0 else dim
             start = 0 if start is None else start
             step = 1 if step is None else step
+            if (not isinstance(dim, int) or not 0 <= dim < len(shape) or
+                    not isinstance(start, int) or not isinstance(step, int) or step <= 0 or
+                    not isinstance(shape[dim], int)):
+                maps.append(InputIndexMap(inputs[0], ("UNKNOWN",), "slice"))
+                return tuple(maps)
+            start = max(start + shape[dim], 0) if start < 0 else min(start, shape[dim])
             axes = [f"i{i}" for i in range(len(shape))]
             axes[dim] = f"{start}+i{dim}*{step}"
             maps.append(InputIndexMap(inputs[0], tuple(axes), "slice"))
@@ -437,15 +471,12 @@ def _reduction_domain(node: Any, operator: str, kind: str,
     if kind != "Reduce" or not input_nodes:
         return ()
     shape = _shape(facts.for_node(input_nodes[0]), input_nodes[0])
-    dims = _literal_ints(_argument(node, 1, "dim"))
+    dims = _reduction_axes(node, len(shape))
     if dims is None:
-        dims = tuple(range(len(shape)))
-    if any(dim < -len(shape) or dim >= len(shape) for dim in dims):
         return (IterationAxis("r0", "UNKNOWN"),)
     axes = []
     for index, dim in enumerate(dims):
-        axis = dim + len(shape) if dim < 0 else dim
-        axes.append(IterationAxis(f"r{index}", shape[axis] if axis < len(shape) else "UNKNOWN"))
+        axes.append(IterationAxis(f"r{index}", shape[dim] if dim < len(shape) else "UNKNOWN"))
     return tuple(axes)
 
 
@@ -485,6 +516,7 @@ def lower_indexed_program(program: NormalizedProgram, *, facts: FactTable | None
             fact.role if fact else ("input" if node.op == "placeholder" else "intermediate"),
             fact.producer if fact else None, fact.consumers if fact else tuple(user.name for user in node.users),
             fact.cast_origin if fact else None, fact.write_effects if fact else (),
+            fact.layout if fact else None,
         ))
         if node.op in {"placeholder", "get_attr", "output"}:
             continue
@@ -553,7 +585,26 @@ def lower_indexed_program(program: NormalizedProgram, *, facts: FactTable | None
             for origin_id in program.origin_map.get(effect.node_id, ())
             if effect.node_id == node.name or origin_id in source_origins
         )
-        attrs = {"arguments": refs.to_dict()["args"], "keywords": refs.to_dict()["kwargs"]}
+        attrs = {"arguments": refs.to_dict()["args"], "keywords": refs.to_dict()["kwargs"],
+                 "operator_name": operator}
+        if kind == "Guard":
+            attrs["guard_kind"] = "tensor_metadata"
+        if kind == "Reduce" and input_nodes:
+            reduction_axes = _reduction_axes(node, len(_shape(facts.for_node(input_nodes[0]), input_nodes[0])))
+            operation_name = operator
+            attrs["reduction"] = {
+                "axes": list(reduction_axes) if reduction_axes is not None else None,
+                "keepdim": _argument(node, 2, "keepdim", False),
+                "initial": float("-inf") if operation_name in {"amax", "max"} else 0.0,
+                "accumulation_dtype": "float32",
+                "final_dtype": output_fact.dtype if output_fact else None,
+            }
+        if kind == "Contraction":
+            attrs["contraction"] = {
+                "operator": operator,
+                "alpha": _argument(node, 4, "alpha", 1.0) if operator == "addmm" else 1.0,
+                "beta": _argument(node, 3, "beta", 1.0) if operator == "addmm" else 0.0,
+            }
         dtype_expr = {
             "operator": rendered_target,
             "input_dtypes": [fact.dtype if fact else None for fact in input_facts],
