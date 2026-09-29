@@ -89,6 +89,8 @@ def map_indices(region: RegionMap, variables: Mapping[str, int], *,
                 dynamic_inputs: Mapping[str, Any] = ()) -> tuple[int, ...]:
     """Evaluate a supported map without executing arbitrary expression code."""
     dynamic_inputs = {} if dynamic_inputs == () else dynamic_inputs
+    if region.mode == "attention_row":
+        raise AccessMapError("attention reads a complete masked cache row; use the whole-producer dependency")
     if region.mode == "reshape":
         if any(not isinstance(dim, int) for dim in region.iteration_shape):
             raise AccessMapError("reshape map has symbolic iteration extent")
@@ -161,6 +163,10 @@ def enumerate_region(region: RegionMap, tile: TileInstance, *,
 def index_expressions_supported(operation: Any) -> bool:
     try:
         for access in operation.input_index_maps:
+            if access.mode == "attention_row":
+                if operation.kind != "Attention" or not operation.attributes.get("attention"):
+                    return False
+                continue
             # Indirect maps remain exact symbolic guards; enumeration needs values.
             if access.mode in {"indirect_select", "index"}:
                 continue

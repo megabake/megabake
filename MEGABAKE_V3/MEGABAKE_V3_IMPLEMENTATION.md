@@ -386,6 +386,10 @@ If CUDA Graph profiling hides the selected path's Aten operation shapes, use an 
 
 **Pass:** `ATTENTION_TINY` and `STATE_POISON` at positions 0/1/15/16, long-context diagnostic, consecutive advancing steps and all masked-row edge cases agree with reference under policy. **Reject:** reading current-token cache before publish, including masked scores in denominator, wrong GQA mapping or `-inf - -inf` NaN. **Handoff:** attention algorithm guard/body resources, state proof and target-specific exact-shape comparison to strong external attention.
 
+For a fixed-capacity SDPA input, the boolean mask must exclude every cache slot at or after the new valid length `L+1`; validate this at invocation when the mask is caller supplied. Shape guards alone cannot prove the attend range. Charge any device-to-host validation transfer to complete-call latency.
+
+A warp attention body may expand each output row into 32 physical work items, one per lane. Its owner must assign complete warps, prove unique row output ownership, and keep every lane in each warp collective; a physical work-item count is then distinct from output tensor elements. The default entry launch uses the caller's active CUDA stream so producer writes and the owned grid remain ordered.
+
 ### V3R-028 — Deliver a correct complete strict cached-step session
 
 **Depends / lane / review:** 001–003 including 002H, 016–027; GPU, R3. **Edit surface:** proposed `runtime/session.py`, V3 `compile_fx` entry, CUDA binding/launch and full-step tests/report.

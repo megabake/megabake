@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import math
 from typing import Any, Mapping
 
 from ..diagnostics import DiagnosticCode, DiagnosticRecord, DiagnosticSeverity
@@ -209,6 +210,7 @@ class IndexedTensorProgram:
     def _payload(self) -> dict[str, Any]:
         return {"schema_version": 1,
                 "source_graph_hash": graph_hash(self.source_program),
+                "numerical_policy_hash": getattr(self.source_program.policy, "contract_hash", None),
                 "strict_supported": self.strict_supported,
                 "values": [value.to_dict() for value in self.values],
                 "operations": [operation.to_dict() for operation in self.operations],
@@ -233,6 +235,7 @@ _KIND_BY_OPERATOR = {
     **{name: "Contraction" for name in ("mm", "bmm", "addmm", "matmul", "linear")},
     **{name: "Gather" for name in ("index_select", "gather", "take")},
     **{name: "Scatter/StateWrite" for name in ("index_copy", "index_put", "slice_scatter", "scatter", "copy")},
+    "scaled_dot_product_attention": "Attention",
     "_assert_tensor_metadata": "Guard",
 }
 
@@ -327,6 +330,19 @@ def _input_maps(node: Any, operator: str, kind: str, inputs: tuple[str, ...],
     maps = []
     rank = len(output_shape)
     input_shapes = [_shape(facts.for_node(item), item) for item in input_nodes]
+    if kind == "Attention" and len(inputs) == 4:
+        heads_per_kv = (input_shapes[0][1] // input_shapes[1][1]
+                        if len(input_shapes[0]) > 1 and len(input_shapes[1]) > 1 and
+                        isinstance(input_shapes[0][1], int) and
+                        isinstance(input_shapes[1][1], int) and input_shapes[1][1] else "UNKNOWN")
+        return (
+            InputIndexMap(inputs[0], ("i0", "i1", "0", "0:D"), "attention_row"),
+            InputIndexMap(inputs[1], ("i0", f"i1//{heads_per_kv}", "0:C", "0:D"), "attention_row"),
+            InputIndexMap(inputs[2], ("i0", f"i1//{heads_per_kv}", "0:C", "0:D"), "attention_row"),
+            InputIndexMap(inputs[3], ("i0", "0" if len(input_shapes[3]) > 1 and
+                                      input_shapes[3][1] == 1 else "i1",
+                                      "0", "0:C"), "attention_row"),
+        )
     if kind == "Map":
         return tuple(InputIndexMap(value, _broadcast_map(shape, output_shape), "broadcast")
                      for value, shape in zip(inputs, input_shapes))
@@ -530,6 +546,48 @@ def _cache_axis(layout: str, rank: int) -> int | None:
     return axes.index("capacity")
 
 
+def _attention_contract(input_facts: list[TensorFacts | None], output_fact: TensorFacts | None,
+                        node: Any, inputs: tuple[str, ...],
+                        transitions: Mapping[str, StateTransition]) -> Mapping[str, Any] | None:
+    if len(inputs) != 4 or any(fact is None for fact in input_facts) or output_fact is None:
+        return None
+    q, k, v, mask = input_facts
+    assert q is not None and k is not None and v is not None and mask is not None
+    if any(len(fact.shape) != 4 for fact in (q, k, v, mask, output_fact)):
+        return None
+    batch, heads_q, query_length, depth = q.shape
+    _, heads_kv, capacity, _ = k.shape
+    if (not all(isinstance(dim, int) and dim > 0 for dim in (batch, heads_q, heads_kv, capacity, depth))
+            or query_length != 1 or k.shape != v.shape or output_fact.shape != q.shape
+            or k.shape[0] != batch or k.shape[-1] != depth or heads_q % heads_kv
+            or mask.shape != (batch, mask.shape[1], 1, capacity)
+            or mask.shape[1] not in (1, heads_q) or mask.dtype != "bool"
+            or q.dtype not in {"float16", "bfloat16", "float32"}
+            or any(fact.dtype != q.dtype for fact in (k, v, output_fact))
+            or any(tuple(fact.strides) != tuple(math.prod(fact.shape[i + 1:])
+                                                     for i in range(4)) for fact in (k, v))):
+        return None
+    k_state, v_state = transitions.get(inputs[1]), transitions.get(inputs[2])
+    if (k_state is None or v_state is None or k_state.state_id == v_state.state_id
+            or k_state.index_value != v_state.index_value
+            or any(item.capacity != capacity or item.axis != 2 for item in (k_state, v_state))):
+        return None
+    dropout = _argument(node, 4, "dropout_p", 0.0)
+    causal = _argument(node, 5, "is_causal", False)
+    scale = _argument(node, 6, "scale")
+    gqa = _argument(node, 7, "enable_gqa", False)
+    if (dropout not in (0, 0.0) or causal is not False or
+            gqa is not (heads_q != heads_kv) or
+            scale is not None and (not isinstance(scale, (int, float)) or
+                                   not math.isfinite(scale))):
+        return None
+    return {"batch": batch, "heads_q": heads_q, "heads_kv": heads_kv,
+            "capacity": capacity, "head_dim": depth, "mask_heads": mask.shape[1],
+            "scale": float(scale) if scale is not None else depth ** -0.5,
+            "state_effects": (k_state.effect_id, v_state.effect_id),
+            "mask_rule": "boolean_true_attends; caller supplies causal/window alignment; runtime rejects true beyond L"}
+
+
 def _cache_transition(program: NormalizedProgram, node: Any, facts: FactTable,
                       inputs: tuple[str, ...], output_id: str) -> tuple[StateTransition | None, DiagnosticRecord | None]:
     effects = tuple(effect for effect in program.effects if effect.node_id == node.name and effect.required)
@@ -664,6 +722,23 @@ def _bounded_state_index(program: NormalizedProgram, index_node: Any, state_id: 
             "upper_exclusive": state["capacity"], "guard": "StepABI/v1:L<capacity"}
 
 
+def _bounded_declared_index(program: NormalizedProgram, index_node: Any,
+                            source_shape: tuple[Any, ...], axis: int,
+                            index_fact: TensorFacts | None) -> Mapping[str, Any] | None:
+    abi = program.step_abi
+    if abi is None or index_fact is None or index_fact.dtype not in {"int32", "int64"}:
+        return None
+    declared = abi.guard_set.get("index_bounds")
+    if not isinstance(declared, Mapping):
+        return None
+    bounds = declared.get(getattr(index_node, "name", None))
+    if (not isinstance(bounds, (list, tuple)) or len(bounds) != 2 or
+            tuple(bounds) != (0, source_shape[axis])):
+        return None
+    return {"value_id": index_fact.value_id, "lower": 0,
+            "upper_exclusive": source_shape[axis], "guard": "StepABI/v1:index_bounds"}
+
+
 def _output_leaves(value: Any, path: tuple[Any, ...] = ()) -> list[tuple[tuple[Any, ...], Any]]:
     if hasattr(value, "op") and hasattr(value, "name"):
         return [(path, value)]
@@ -765,6 +840,21 @@ def lower_indexed_program(program: NormalizedProgram, *, facts: FactTable | None
                     program, input_nodes[1], source_state or "", source_fact.shape, dim,
                     facts.for_node(input_nodes[1]),
                 )
+                if index_bounds is None:
+                    index_bounds = _bounded_declared_index(
+                        program, input_nodes[1], source_fact.shape, dim,
+                        facts.for_node(input_nodes[1]),
+                    )
+        attention = None
+        if kind == "Attention":
+            attention = _attention_contract(input_facts, output_fact, node, inputs, transitions_by_output)
+            if attention is None:
+                diagnostics.append(DiagnosticRecord(
+                    DiagnosticCode.UNSUPPORTED_SEMANTICS,
+                    f"cached attention {node.name} lacks a proved one-token boolean-mask/GQA/KV contract",
+                    DiagnosticSeverity.ERROR, node_id=node.name,
+                    details={"negative_case": "mask, state publication, shape, dropout or causal alignment is unsupported"},
+                ))
         if transition_diagnostic is not None:
             diagnostics.append(transition_diagnostic)
         if any("UNKNOWN" in item.expressions for item in maps) and kind != "Unsupported":
@@ -815,6 +905,8 @@ def lower_indexed_program(program: NormalizedProgram, *, facts: FactTable | None
             attrs["index_bounds"] = dict(index_bounds)
         if transition is not None:
             attrs["state_transition"] = transition.to_dict()
+        if attention is not None:
+            attrs["attention"] = dict(attention)
         if kind == "Guard":
             attrs["guard_kind"] = "tensor_metadata"
         if kind == "Reduce" and input_nodes:

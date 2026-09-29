@@ -49,6 +49,9 @@ class WorkerStage:
             "output_type": self.output_type,
             "output_elements": self.output_elements,
             "body_kind": self.body_kind,
+            "work_item_map": ("row=linear//32; lane=linear%32; one full warp owns one attention row"
+                              if self.body_kind == "online_cached_attention_warp32"
+                              else "linear is a flattened output element"),
         }
 
 
@@ -61,6 +64,10 @@ class WorkerProgram:
     block_threads: int
     grid_ctas: int
     value_ids: tuple[str, ...]
+    value_guards: tuple[Mapping[str, Any], ...]
+    state_ownership: tuple[tuple[str, str], ...]
+    input_value_ids: tuple[str, ...]
+    fresh_value_ids: tuple[str, ...]
     stages: tuple[WorkerStage, ...]
     body_search: tuple[Mapping[str, Any], ...]
     runtime_guards: tuple[Mapping[str, Any], ...]
@@ -77,13 +84,17 @@ class WorkerProgram:
             "block_threads": self.block_threads,
             "grid_ctas": self.grid_ctas,
             "value_ids": list(self.value_ids),
+            "value_guards": [dict(item) for item in self.value_guards],
+            "state_ownership": [list(item) for item in self.state_ownership],
+            "input_value_ids": list(self.input_value_ids),
+            "fresh_value_ids": list(self.fresh_value_ids),
             "stages": [stage.to_dict() for stage in self.stages],
             "body_search": [dict(item) for item in self.body_search],
             "runtime_guards": [dict(item) for item in self.runtime_guards],
             "source_hash": hashlib.sha256(self.source.encode()).hexdigest(),
             "program_hash": self.program_hash,
             "progress_proof": {
-                "dispatch": "blockIdx.x is a worker id; each worker owns one contiguous output interval per stage",
+                "dispatch": "blockIdx.x is a worker id; each worker owns one contiguous work-item interval per stage",
                 "phase_order": [stage.operation_id for stage in self.stages],
                 "join": "uniform cooperative grid.sync after every non-final stage",
                 "idle_workers_join": True,
@@ -172,18 +183,19 @@ extern \"C\" __global__ __launch_bounds__({block_threads})
 void megabake_v3_entry(V3WorkerBindings p) {{
   cooperative_groups::grid_group grid = cooperative_groups::this_grid();
   const int64_t worker = static_cast<int64_t>(blockIdx.x);
-  const int64_t tile_begin = worker * static_cast<int64_t>(blockDim.x);
 """
     for index, stage in enumerate(stages):
-        source += (f"  const int64_t tile_end_{index} = tile_begin + blockDim.x < {stage.output_elements} "
-                   f"? tile_begin + blockDim.x : {stage.output_elements};\n")
-        source += f"  const int64_t stage_begin_{index} = tile_begin;\n"
-        source += f"  const int64_t stage_end_{index} = tile_end_{index};\n"
+        source += (f"  for (int64_t stage_begin_{index} = worker * blockDim.x; "
+                   f"stage_begin_{index} < {stage.output_elements}; "
+                   f"stage_begin_{index} += static_cast<int64_t>(gridDim.x) * blockDim.x) {{\n")
+        source += (f"    const int64_t stage_end_{index} = "
+                   f"stage_begin_{index} + blockDim.x < {stage.output_elements} "
+                   f"? stage_begin_{index} + blockDim.x : {stage.output_elements};\n")
         args = [f"static_cast<const {dtype} *>(p.values[{value_index[value_id]}])"
                 for dtype, value_id in zip(stage.input_types, stage.input_value_ids)]
         args.extend((f"static_cast<{stage.output_type} *>(p.values[{value_index[stage.output_value_id]}])",
                      f"stage_begin_{index}", f"stage_end_{index}"))
-        source += f"  {stage.entry_point}({', '.join(args)});\n"
+        source += f"    {stage.entry_point}({', '.join(args)});\n  }}\n"
         if index + 1 < len(stages):
             source += "  grid.sync();\n"
     source += "}\n"
@@ -234,6 +246,13 @@ def lower_worker_program(program: IndexedTensorProgram, logical_plan: LogicalExe
                 producer = effect_producers.get(effect_id)
                 if producer is None or producer >= order:
                     raise WorkerProgramError("state read is not ordered after its publishing write")
+        if operation.kind == "Attention":
+            choices = enumerate_algorithm_choices(program)
+            online = next((choice for choice in choices if choice.algorithm == "online_softmax"
+                           and operation.op_id in choice.operation_ids), None)
+            if online is None or online.choice_id not in logical_plan.selected_choice_ids:
+                raise WorkerProgramError(
+                    f"{operation.op_id} needs a selected, policy-guarded online-softmax choice")
         try:
             body = emit_cuda_body(program, operation)
         except CudaBodyError:
@@ -252,6 +271,10 @@ def lower_worker_program(program: IndexedTensorProgram, logical_plan: LogicalExe
             raise WorkerProgramError(f"{operation.op_id} has no complete one-output body ABI")
         output_id = operation.outputs[0]
         output_elements = _value_elements(values[output_id], operation.op_id)
+        if body.body_kind == "online_cached_attention_warp32":
+            if block_threads % 32:
+                raise WorkerProgramError("warp attention needs a block size divisible by 32")
+            output_elements = body.output_elements
         stages.append(WorkerStage(
             operation_id=operation.op_id,
             origin_id=operation.origin_ids[0] if operation.origin_ids else operation.op_id,
@@ -276,11 +299,43 @@ def lower_worker_program(program: IndexedTensorProgram, logical_plan: LogicalExe
                 "lower": int(bounds["lower"]),
                 "upper_exclusive": int(bounds["upper_exclusive"]),
             })
+        if operation.kind == "Gather" and operation.attributes.get("operator_name") == "index_select":
+            bounds = operation.attributes.get("index_bounds")
+            if not isinstance(bounds, Mapping):
+                raise WorkerProgramError(f"gather {operation.op_id} lacks a bounded index contract")
+            runtime_guards.append({
+                "operation_id": operation.op_id,
+                "value_id": bounds["value_id"],
+                "lower": int(bounds["lower"]),
+                "upper_exclusive": int(bounds["upper_exclusive"]),
+                "vector": True,
+            })
+        if operation.kind == "Attention":
+            transition = transitions_by_output.get(operation.inputs[1])
+            if transition is None:
+                raise WorkerProgramError("cached attention lacks its publishing K transition")
+            runtime_guards.append({
+                "operation_id": operation.op_id,
+                "mask_value_id": operation.inputs[3],
+                "index_value_id": transition.index_value,
+            })
     if not stages:
         raise WorkerProgramError("indexed program has no executable worker stages")
     max_outputs = max(stage.output_elements for stage in stages)
-    grid_ctas = math.ceil(max_outputs / block_threads)
+    visible_sms = profile.device_facts.get("visible_sms")
+    if visible_sms is None or not isinstance(visible_sms.value, int) or visible_sms.value <= 0:
+        raise WorkerProgramError("visible SM count is required to bound a resident worker grid")
+    grid_ctas = min(math.ceil(max_outputs / block_threads), visible_sms.value)
     value_ids = tuple(value.value_id for value in program.values)
+    value_guards = tuple({"value_id": value.value_id, "shape": tuple(value.shape),
+                          "strides": tuple(value.strides), "dtype": value.dtype}
+                         for value in program.values if value.shape and value.dtype)
+    state_ownership = tuple((item.old_value, item.new_value)
+                            for item in program.state_transitions)
+    input_value_ids = tuple(value.value_id for value in program.values
+                            if value.role == "input" and value.shape and value.dtype)
+    fresh_value_ids = tuple(value.value_id for value in program.values
+                            if value.alias_kind == "fresh" and value.shape and value.dtype)
     source = _emit_source(stages, value_ids, block_threads)
     payload = {
         "indexed_program_hash": program.structural_hash,
@@ -290,6 +345,10 @@ def lower_worker_program(program: IndexedTensorProgram, logical_plan: LogicalExe
         "block_threads": block_threads,
         "grid_ctas": grid_ctas,
         "value_ids": value_ids,
+        "value_guards": value_guards,
+        "state_ownership": state_ownership,
+        "input_value_ids": input_value_ids,
+        "fresh_value_ids": fresh_value_ids,
         "stages": [stage.to_dict() for stage in stages],
         "body_search": [dict(item) for item in body_search],
         "runtime_guards": runtime_guards,
@@ -297,7 +356,8 @@ def lower_worker_program(program: IndexedTensorProgram, logical_plan: LogicalExe
     }
     return WorkerProgram(
         program.structural_hash, logical_plan.structural_hash, profile.profile_key,
-        target, block_threads, grid_ctas, value_ids, tuple(stages),
+        target, block_threads, grid_ctas, value_ids, value_guards,
+        state_ownership, input_value_ids, fresh_value_ids, tuple(stages),
         tuple(body_search), tuple(runtime_guards), source,
         hashlib.sha256(canonical_json(payload).encode()).hexdigest(),
     )
@@ -406,6 +466,66 @@ def _worker_library(path: str | Path, value_count: int):
     return library, bindings_type
 
 
+def _binding_error(worker: WorkerProgram, values: Sequence[Any], device_index: int) -> str | None:
+    import torch
+
+    by_id = dict(zip(worker.value_ids, values))
+    for guard in worker.value_guards:
+        value = by_id.get(guard["value_id"])
+        if (not isinstance(value, torch.Tensor) or value.device.type != "cuda" or
+                value.device.index != device_index or tuple(value.shape) != tuple(guard["shape"]) or
+                tuple(value.stride()) != tuple(guard["strides"]) or
+                str(value.dtype).removeprefix("torch.") != guard["dtype"]):
+            return f"binding {guard['value_id']} differs from its compiled device/shape/stride/dtype guard"
+    state_values = [by_id[item] for pair in worker.state_ownership for item in pair]
+    if len({value.untyped_storage().data_ptr() for value in state_values}) != len(state_values):
+        return "functional state inputs and outputs must own distinct storage"
+    occupied = {by_id[item].untyped_storage().data_ptr() for item in worker.input_value_ids}
+    for value_id in worker.fresh_value_ids:
+        storage = by_id[value_id].untyped_storage().data_ptr()
+        if storage in occupied:
+            return f"fresh value {value_id} overlaps an input or another fresh value"
+        occupied.add(storage)
+    return None
+
+
+def _runtime_guard_error(worker: WorkerProgram, values: Sequence[Any]) -> dict[str, Any] | None:
+    by_id = dict(zip(worker.value_ids, values))
+    indices: dict[str, int] = {}
+    index_vectors: dict[str, Any] = {}
+    for guard in worker.runtime_guards:
+        value_id = guard.get("value_id", guard.get("index_value_id"))
+        value = by_id.get(value_id)
+        if guard.get("vector"):
+            if value is None or not hasattr(value, "numel"):
+                return {"launched": False, "return_code": -4,
+                        "reason": f"gather index for {guard['operation_id']} is not a tensor"}
+            if value_id not in index_vectors:
+                index_vectors[value_id] = value.detach().cpu()
+            indices_cpu = index_vectors[value_id]
+            if bool(((indices_cpu < guard["lower"]) | (indices_cpu >= guard["upper_exclusive"])).any()):
+                return {"launched": False, "return_code": -5,
+                        "reason": f"gather index for {guard['operation_id']} is outside the declared bounds"}
+            continue
+        if value is None or not hasattr(value, "numel") or value.numel() != 1:
+            return {"launched": False, "return_code": -4,
+                    "reason": f"state index for {guard['operation_id']} is not a scalar tensor"}
+        if value_id not in indices:
+            indices[value_id] = int(value.reshape(-1)[0].item())
+        index = indices[value_id]
+        if "mask_value_id" in guard:
+            mask = by_id[guard["mask_value_id"]]
+            # The mask is caller owned. Inspect it on the host before launching the
+            # only compute grid, so no unwritten cache slot can enter softmax.
+            if index + 1 < mask.shape[-1] and bool(mask.detach().cpu()[..., index + 1:].any()):
+                return {"launched": False, "return_code": -11,
+                        "reason": "attention mask exposes an unwritten future cache slot"}
+        elif not guard["lower"] <= index < guard["upper_exclusive"]:
+            return {"launched": False, "return_code": -5,
+                    "reason": f"state index {index} is outside [{guard['lower']}, {guard['upper_exclusive']})"}
+    return None
+
+
 class WorkerEntrySession:
     """Hold one admitted function and its by-value pointer binding record."""
 
@@ -420,6 +540,7 @@ class WorkerEntrySession:
         self.runtime_target = _runtime_device(profile)
         self.worker = worker
         self.profile = profile
+        self.profile_key = profile.profile_key
         self.admission = admission
         self.library, self.bindings_type = _worker_library(library_path, len(worker.value_ids))
         self.library.mb3_worker_program_hash.argtypes = []
@@ -433,23 +554,19 @@ class WorkerEntrySession:
         self.resident_ctas = admission["compiled_function"]["cooperative_resident_ctas"]
 
     def launch(self, values: Sequence[Any], *, grid_ctas: int | None = None,
-               stream: int = 0) -> dict[str, Any]:
+               stream: int | None = None) -> dict[str, Any]:
         if len(values) != len(self.worker.value_ids):
             raise ValueError(f"worker ABI expects {len(self.worker.value_ids)} values, got {len(values)}")
         import torch
         if torch.cuda.current_device() != self.profile.device_index:
             return {"launched": False, "return_code": -9,
                     "reason": "current CUDA device differs from the admitted worker target"}
-        by_id = dict(zip(self.worker.value_ids, values))
-        for guard in self.worker.runtime_guards:
-            value = by_id.get(guard["value_id"])
-            if value is None or not hasattr(value, "numel") or value.numel() != 1:
-                return {"launched": False, "return_code": -4,
-                        "reason": f"state index for {guard['operation_id']} is not a scalar tensor"}
-            index = int(value.reshape(-1)[0].item())
-            if not guard["lower"] <= index < guard["upper_exclusive"]:
-                return {"launched": False, "return_code": -5,
-                        "reason": f"state index {index} is outside [{guard['lower']}, {guard['upper_exclusive']})"}
+        binding_error = _binding_error(self.worker, values, self.profile.device_index)
+        if binding_error:
+            return {"launched": False, "return_code": -10, "reason": binding_error}
+        guard_error = _runtime_guard_error(self.worker, values)
+        if guard_error:
+            return guard_error
         requested = self.worker.grid_ctas if grid_ctas is None else grid_ctas
         if not isinstance(requested, int) or requested <= 0:
             return {"launched": False, "return_code": -1, "reason": "worker grid must be positive"}
@@ -468,8 +585,10 @@ class WorkerEntrySession:
         for index, value in enumerate(values):
             bindings.values[index] = int(value.data_ptr()) if hasattr(value, "data_ptr") else 0
         import ctypes
+        stream_value = (torch.cuda.current_stream(self.profile.device_index).cuda_stream
+                        if stream is None else stream)
         code = self.library.mb3_launch_worker_entry(
-            ctypes.byref(bindings), requested, stream
+            ctypes.byref(bindings), requested, stream_value
         )
         return {"launched": code == 0, "return_code": code,
                 "reason": None if code == 0 else "cooperative worker launch failed",
@@ -591,10 +710,11 @@ def launch_worker_entry(library_path: str | Path, worker: WorkerProgram,
                         grid_ctas: int | None = None,
                         admission: Mapping[str, Any] | None = None,
                         session: WorkerEntrySession | None = None,
-                        stream: int = 0) -> dict[str, Any]:
+                        stream: int | None = None) -> dict[str, Any]:
     """Validate state-index guards and launch only the admitted static grid."""
     if session is not None:
-        if session.worker.program_hash != worker.program_hash or session.profile.profile_key != profile.profile_key:
+        if (session.worker.program_hash != worker.program_hash or
+                session.profile is not profile and session.profile_key != profile.profile_key):
             return {"launched": False, "return_code": -8,
                     "reason": "worker session does not match the selected program and target"}
         return session.launch(values, grid_ctas=grid_ctas, stream=stream)
@@ -603,16 +723,12 @@ def launch_worker_entry(library_path: str | Path, worker: WorkerProgram,
         raise EntryAdmissionError("worker program belongs to a different target profile")
     if len(values) != len(worker.value_ids):
         raise ValueError(f"worker ABI expects {len(worker.value_ids)} values, got {len(values)}")
-    by_id = dict(zip(worker.value_ids, values))
-    for guard in worker.runtime_guards:
-        value = by_id.get(guard["value_id"])
-        if value is None or not hasattr(value, "numel") or value.numel() != 1:
-            return {"launched": False, "return_code": -4,
-                    "reason": f"state index for {guard['operation_id']} is not a scalar tensor"}
-        index = int(value.reshape(-1)[0].item())
-        if not guard["lower"] <= index < guard["upper_exclusive"]:
-            return {"launched": False, "return_code": -5,
-                    "reason": f"state index {index} is outside [{guard['lower']}, {guard['upper_exclusive']})"}
+    binding_error = _binding_error(worker, values, profile.device_index)
+    if binding_error:
+        return {"launched": False, "return_code": -10, "reason": binding_error}
+    guard_error = _runtime_guard_error(worker, values)
+    if guard_error:
+        return guard_error
     runtime = _runtime_device(profile)
     library, bindings_type = _worker_library(library_path, len(worker.value_ids))
     library.mb3_worker_program_hash.argtypes = []
@@ -660,7 +776,10 @@ def launch_worker_entry(library_path: str | Path, worker: WorkerProgram,
         int(value.data_ptr()) if hasattr(value, "data_ptr") else 0 for value in values
     ])
     bindings = bindings_type(pointers)
-    code = library.mb3_launch_worker_entry(ctypes.byref(bindings), requested, stream)
+    import torch
+    stream_value = (torch.cuda.current_stream(profile.device_index).cuda_stream
+                    if stream is None else stream)
+    code = library.mb3_launch_worker_entry(ctypes.byref(bindings), requested, stream_value)
     return {"launched": code == 0, "return_code": code,
             "reason": None if code == 0 else "cooperative worker launch failed",
             "requested_ctas": requested,

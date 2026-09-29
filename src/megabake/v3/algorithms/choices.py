@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from ..contracts import ContractError
 from ..frontend.capture import graph_hash
 from ..frontend.facts import collect_facts
 from ..frontend.semantic import SemanticNode, recognize
@@ -167,7 +168,24 @@ def enumerate_algorithm_choices(program: IndexedTensorProgram, *, numerical_poli
     by_id = {operation.op_id: operation for operation in program.operations}
     # Every lowerable operation keeps an exact, one-op fallback.
     for operation in program.operations:
-        if operation.kind != "Unsupported":
+        if operation.kind == "Attention":
+            choices.append(_make_choice(program, "materialized_attention", (operation,), policy=policy))
+            if (policy is not None and callable(getattr(policy, "tolerance_for", None))
+                    and policy.reassociation_allowed("scaled_dot_product_attention")
+                    and operation.attributes.get("attention")):
+                try:
+                    dtype = next(value.dtype for value in program.values
+                                 if value.value_id == operation.outputs[0])
+                    policy.tolerance_for("scaled_dot_product_attention", dtype)
+                except (StopIteration, ContractError):
+                    pass
+                else:
+                    choices.append(_make_choice(
+                        program, "online_softmax", (operation,), policy=policy,
+                        numerical_requirements={"reassociation": "required",
+                                                "operation": "scaled_dot_product_attention"},
+                    ))
+        elif operation.kind != "Unsupported":
             choices.append(_make_choice(program, "indexed", (operation,), policy=policy))
 
     for operation in program.operations:

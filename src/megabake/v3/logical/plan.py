@@ -95,7 +95,7 @@ def lower_logical_plan(program: IndexedTensorProgram, choices: tuple[AlgorithmCh
         raise LogicalPlanError("selected algorithm choices do not cover the indexed program")
 
     selected = [choice for choice in choices if choice.choice_id in set(selected_choice_ids)]
-    if any(choice.algorithm != "indexed" for choice in selected):
+    if any(choice.algorithm not in {"indexed", "online_softmax"} for choice in selected):
         raise LogicalPlanError("logical tile derivation currently requires the selected indexed expansion")
     choice_for_op = {op_id: choice for choice in selected for op_id in choice.operation_ids}
     operation_ids = tuple(dict.fromkeys(op_id for choice in selected for op_id in choice.operation_ids))

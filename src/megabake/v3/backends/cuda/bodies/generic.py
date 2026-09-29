@@ -8,6 +8,7 @@ import math
 import re
 from typing import Any, Mapping
 
+from ....contracts import ContractError
 from ....diagnostics import DiagnosticCode, DiagnosticRecord, DiagnosticSeverity
 from ....semantics.indexed import IndexedOp, IndexedValue
 
@@ -607,6 +608,131 @@ def _emit_index_copy(operation: IndexedOp, values: Mapping[str, IndexedValue],
                     _numel(output_shape), "state_write", node_id, dict(bounds))
 
 
+def _emit_attention(operation: IndexedOp, values: Mapping[str, IndexedValue],
+                    output: IndexedValue, output_shape: tuple[int, ...], node_id: str,
+                    policy: Any) -> CudaBody:
+    contract = operation.attributes.get("attention")
+    if not isinstance(contract, Mapping) or len(operation.inputs) != 4:
+        raise CudaBodyError(node_id, "cached attention has no proved semantic contract")
+    if policy is None or not policy.reassociation_allowed("scaled_dot_product_attention"):
+        raise CudaBodyError(node_id, "online softmax needs an explicit reassociation policy")
+    try:
+        policy.tolerance_for("scaled_dot_product_attention", output.dtype)
+    except ContractError as exc:
+        raise CudaBodyError(node_id, "online softmax needs an output-dtype tolerance") from exc
+    q, k, v, mask = (values[item] for item in operation.inputs)
+    for item in (q, k, v, mask):
+        _static_shape(item, node_id)
+    dtype = _dtype(q, node_id)
+    if (dtype not in {"__half", "__nv_bfloat16", "float"} or
+            any(_dtype(item, node_id) != dtype for item in (k, v, output)) or
+            _dtype(mask, node_id) != "bool" or
+            output.non_overlapping is not True or output.strides[-1] != 1 or
+            contract["head_dim"] > 128):
+        raise CudaBodyError(node_id, "cached attention requires dense output, supported dtype and D<=128")
+    depth = contract["head_dim"]
+    capacity = contract["capacity"]
+    prefix, entry = _name(operation), f"{_name(operation)}_tile"
+    if depth <= 32:
+        work_items = contract["batch"] * contract["heads_q"] * 32
+        lines = [
+            "const int64_t row = linear / 32;",
+            "const int lane = static_cast<int>(linear % 32);",
+            f"const int64_t batch = row / {contract['heads_q']};",
+            f"const int64_t head = row % {contract['heads_q']};",
+            f"const int64_t kv_head = head / {contract['heads_q'] // contract['heads_kv']};",
+            f"float accumulator[{depth}] = {{0.0f}};",
+            "float maximum = -INFINITY;",
+            "float normalizer = 0.0f;",
+            "unsigned has_nan = 0;",
+            f"for (int64_t token = lane; token < {capacity}; token += 32) {{",
+            f"  if (!in3[batch*{mask.strides[0]} + (head % {contract['mask_heads']})*{mask.strides[1]} + token*{mask.strides[3]}]) continue;",
+            "  float score = 0.0f;",
+            f"  for (int d = 0; d < {depth}; ++d) {{",
+            f"    const float query = {prefix}_load(in0, batch*{q.strides[0]} + head*{q.strides[1]} + d*{q.strides[3]});",
+            f"    const float key = {prefix}_load(in1, batch*{k.strides[0]} + kv_head*{k.strides[1]} + token*{k.strides[2]} + d*{k.strides[3]});",
+            "    score += query * key;",
+            "  }",
+            f"  score *= {repr(contract['scale'])}f;",
+            "  if (isnan(score)) { has_nan = 1; continue; }",
+            "  const float next_maximum = fmaxf(maximum, score);",
+            "  const float old_scale = normalizer == 0.0f ? 0.0f : expf(maximum - next_maximum);",
+            "  const float weight = expf(score - next_maximum);",
+            "  normalizer = normalizer * old_scale + weight;",
+            f"  for (int d = 0; d < {depth}; ++d) {{",
+            f"    const float value = {prefix}_load(in2, batch*{v.strides[0]} + kv_head*{v.strides[1]} + token*{v.strides[2]} + d*{v.strides[3]});",
+            "    accumulator[d] = accumulator[d] * old_scale + weight * value;",
+            "  }",
+            "  maximum = next_maximum;",
+            "}",
+            "float group_maximum = maximum;",
+            "for (int offset = 16; offset > 0; offset >>= 1) {",
+            "  group_maximum = fmaxf(group_maximum, __shfl_xor_sync(0xffffffff, group_maximum, offset));",
+            "  has_nan |= __shfl_xor_sync(0xffffffff, has_nan, offset);",
+            "}",
+            "const float rescale = normalizer == 0.0f ? 0.0f : expf(maximum - group_maximum);",
+            "normalizer *= rescale;",
+            f"for (int d = 0; d < {depth}; ++d) accumulator[d] *= rescale;",
+            "for (int offset = 16; offset > 0; offset >>= 1) {",
+            "  normalizer += __shfl_xor_sync(0xffffffff, normalizer, offset);",
+            f"  for (int d = 0; d < {depth}; ++d) accumulator[d] += __shfl_xor_sync(0xffffffff, accumulator[d], offset);",
+            "}",
+            "if (lane == 0) {",
+            f"  for (int d = 0; d < {depth}; ++d) {{",
+            "    const float result = has_nan ? NAN : (normalizer == 0.0f ? 0.0f : accumulator[d] / normalizer);",
+            f"    out[batch*{output.strides[0]} + head*{output.strides[1]} + d] = {prefix}_store(result, ({dtype}*)0);",
+            "  }",
+            "}",
+        ]
+        source = _helpers(prefix) + _body_loop(
+            entry, _pointer_arguments((dtype, dtype, dtype, "bool"), dtype),
+            work_items, lines)
+        return CudaBody(source, entry, (dtype, dtype, dtype, "bool"), dtype,
+                        work_items, "online_cached_attention_warp32", node_id,
+                        {"numerical_policy_hash": policy.contract_hash, "warp_size": 32})
+    lines = [
+        f"if (linear % {depth}) continue;",
+        f"const int64_t row = linear / {depth};",
+        f"const int64_t batch = row / {contract['heads_q']};",
+        f"const int64_t head = row % {contract['heads_q']};",
+        f"const int64_t kv_head = head / {contract['heads_q'] // contract['heads_kv']};",
+        f"float accumulator[{depth}] = {{0.0f}};",
+        "float maximum = -INFINITY;",
+        "float normalizer = 0.0f;",
+        "bool has_nan = false;",
+        f"for (int64_t token = 0; token < {capacity}; ++token) {{",
+        f"  if (!in3[batch*{mask.strides[0]} + (head % {contract['mask_heads']})*{mask.strides[1]} + token*{mask.strides[3]}]) continue;",
+        "  float score = 0.0f;",
+        f"  for (int d = 0; d < {depth}; ++d) {{",
+        f"    const float query = {prefix}_load(in0, batch*{q.strides[0]} + head*{q.strides[1]} + d*{q.strides[3]});",
+        f"    const float key = {prefix}_load(in1, batch*{k.strides[0]} + kv_head*{k.strides[1]} + token*{k.strides[2]} + d*{k.strides[3]});",
+        "    score += query * key;",
+        "  }",
+        f"  score *= {repr(contract['scale'])}f;",
+        "  if (isnan(score)) { has_nan = true; continue; }",
+        "  const float next_maximum = fmaxf(maximum, score);",
+        "  const float old_scale = normalizer == 0.0f ? 0.0f : expf(maximum - next_maximum);",
+        "  const float weight = expf(score - next_maximum);",
+        "  normalizer = normalizer * old_scale + weight;",
+        f"  for (int d = 0; d < {depth}; ++d) {{",
+        f"    const float value = {prefix}_load(in2, batch*{v.strides[0]} + kv_head*{v.strides[1]} + token*{v.strides[2]} + d*{v.strides[3]});",
+        "    accumulator[d] = accumulator[d] * old_scale + weight * value;",
+        "  }",
+        "  maximum = next_maximum;",
+        "}",
+        f"for (int d = 0; d < {depth}; ++d) {{",
+        "  const float result = has_nan ? NAN : (normalizer == 0.0f ? 0.0f : accumulator[d] / normalizer);",
+        f"  out[batch*{output.strides[0]} + head*{output.strides[1]} + d] = {prefix}_store(result, ({dtype}*)0);",
+        "}",
+    ]
+    source = _helpers(prefix) + _body_loop(
+        entry, _pointer_arguments((dtype, dtype, dtype, "bool"), dtype),
+        _numel(output_shape), lines)
+    return CudaBody(source, entry, (dtype, dtype, dtype, "bool"), dtype,
+                    _numel(output_shape), "online_cached_attention", node_id,
+                    {"numerical_policy_hash": policy.contract_hash})
+
+
 def emit_cuda_body(program: Any, operation: IndexedOp | str) -> CudaBody:
     """Emit one conservative in-grid body or exact view address map.
 
@@ -639,6 +765,9 @@ def emit_cuda_body(program: Any, operation: IndexedOp | str) -> CudaBody:
         return _emit_index_select(operation, values, output, output_shape, node_id)
     if operation.kind == "Scatter/StateWrite" and _operator(operation) == "index_copy":
         return _emit_index_copy(operation, values, output, output_shape, node_id)
+    if operation.kind == "Attention" and _operator(operation) == "scaled_dot_product_attention":
+        return _emit_attention(operation, values, output, output_shape, node_id,
+                               program.source_program.policy)
     raise CudaBodyError(node_id, f"indexed operation kind {operation.kind!r} has no generic CUDA body")
 
 
