@@ -118,14 +118,39 @@ def _selected_target(profile: CudaTargetProfile) -> str:
     return target
 
 
+def _prelaunch_index_source(program: IndexedTensorProgram, value_id: str) -> str | None:
+    """Trace exact alias/copy chains to a bound value readable before the grid."""
+    values = {value.value_id: value for value in program.values}
+    operations = {output: operation for operation in program.operations
+                  for output in operation.outputs}
+    seen: set[str] = set()
+    while value_id not in seen:
+        seen.add(value_id)
+        value = values.get(value_id)
+        if value is None:
+            return None
+        if value.role in {"input", "constant"}:
+            return value_id
+        if value.alias_kind == "view" and len(value.alias_sources) == 1:
+            value_id = value.alias_sources[0]
+            continue
+        operation = operations.get(value_id)
+        if operation is None or operation.kind != "Copy" or len(operation.inputs) != 1:
+            return None
+        value_id = operation.inputs[0]
+    return None
+
+
 def _value_elements(value: Any, operation_id: str) -> int:
-    if not value.shape or any(not isinstance(dim, int) or dim < 0 for dim in value.shape):
-        raise WorkerProgramError(f"{operation_id} has a scalar or dynamic output shape")
+    if any(not isinstance(dim, int) or dim < 0 for dim in value.shape):
+        raise WorkerProgramError(f"{operation_id} has a dynamic or invalid output shape")
     return math.prod(value.shape)
 
 
 def _body_search(program: IndexedTensorProgram, logical_plan: LogicalExecutionPlan,
-                 profile: CudaTargetProfile, operation: Any, body: Any) -> Mapping[str, Any]:
+                 profile: CudaTargetProfile, operation: Any, body: Any,
+                 selected_choices: Mapping[str, Any], *,
+                 enumerate_tactics: bool) -> Mapping[str, Any]:
     if body.body_kind == "view_map":
         output = next(value for value in program.values if value.value_id == operation.outputs[0])
         return {"operation_id": operation.op_id, "candidates": [
@@ -138,12 +163,15 @@ def _body_search(program: IndexedTensorProgram, logical_plan: LogicalExecutionPl
     }]
     rejections: list[Mapping[str, Any]] = []
     if operation.kind == "Contraction":
-        choices = enumerate_algorithm_choices(program)
-        choice = next((item for item in choices
-                       if item.choice_id in logical_plan.selected_choice_ids and
-                       operation.op_id in item.operation_ids), None)
+        choice = selected_choices.get(operation.op_id)
         if choice is None:
             raise WorkerProgramError(f"{operation.op_id} has no selected logical algorithm choice")
+        if not enumerate_tactics:
+            return {"operation_id": operation.op_id, "candidates": candidates,
+                    "provider_rejections": [{"provider": "tactic_registry",
+                                             "reason": "not enumerated while lowering the complete worker"}],
+                    "selected": "generic.indexed",
+                    "reason": "selected the emitted generic worker body; tactic alternatives remain unmeasured"}
         registry = query_body_tactics(program, operation, choice, profile)
         generic = next((item for item in registry.compatible_tactics
                         if item.provider == "generic" and item.tactic_id == "generic.indexed"), None)
@@ -203,7 +231,8 @@ void megabake_v3_entry(V3WorkerBindings p) {{
 
 
 def lower_worker_program(program: IndexedTensorProgram, logical_plan: LogicalExecutionPlan,
-                         profile: CudaTargetProfile, *, block_threads: int = 128) -> WorkerProgram:
+                         profile: CudaTargetProfile, *, block_threads: int = 128,
+                         enumerate_tactics: bool = True) -> WorkerProgram:
     """Turn a verified indexed expansion into ordered, uniformly joined CUDA stages."""
     if not program.strict_supported:
         raise WorkerProgramError("worker lowering requires strict-supported indexed semantics")
@@ -220,11 +249,20 @@ def lower_worker_program(program: IndexedTensorProgram, logical_plan: LogicalExe
         raise WorkerProgramError("worker block size exceeds or lacks a proven target limit")
     target = _selected_target(profile)
     values = {item.value_id: item for item in program.values}
+    choices = enumerate_algorithm_choices(program)
+    selected_choices: dict[str, Any] = {}
+    for choice in choices:
+        if choice.choice_id not in logical_plan.selected_choice_ids:
+            continue
+        for operation_id in choice.operation_ids:
+            selected_choices.setdefault(operation_id, choice)
     producer_order: dict[str, int] = {}
     stages: list[WorkerStage] = []
     body_search: list[Mapping[str, Any]] = []
     runtime_guards: list[Mapping[str, Any]] = []
     transitions_by_output = {item.new_value: item for item in program.state_transitions}
+    transitions_by_writer = {value: item for item in program.state_transitions
+                             for value in item.writer_values}
     transition_orders = []
     effect_producers = {}
     for order, operation in enumerate(program.operations):
@@ -247,7 +285,6 @@ def lower_worker_program(program: IndexedTensorProgram, logical_plan: LogicalExe
                 if producer is None or producer >= order:
                     raise WorkerProgramError("state read is not ordered after its publishing write")
         if operation.kind == "Attention":
-            choices = enumerate_algorithm_choices(program)
             online = next((choice for choice in choices if choice.algorithm == "online_softmax"
                            and operation.op_id in choice.operation_ids), None)
             if online is None or online.choice_id not in logical_plan.selected_choice_ids:
@@ -257,9 +294,24 @@ def lower_worker_program(program: IndexedTensorProgram, logical_plan: LogicalExe
             body = emit_cuda_body(program, operation)
         except CudaBodyError:
             raise
-        body_search.append(_body_search(program, logical_plan, profile, operation, body))
+        body_search.append(_body_search(
+            program, logical_plan, profile, operation, body, selected_choices,
+            enumerate_tactics=enumerate_tactics,
+        ))
         if operation.kind == "Guard":
-            raise WorkerProgramError(f"runtime guard {operation.op_id} has no worker-entry implementation")
+            proof = operation.attributes.get("metadata_guard")
+            runtime_asserted = proof.get("runtime_asserted", {}) if isinstance(proof, Mapping) else None
+            if (not isinstance(proof, Mapping) or proof.get("statically_proven") is not True or
+                    len(operation.inputs) != 1 or proof.get("value_id") != operation.inputs[0]):
+                raise WorkerProgramError(f"runtime guard {operation.op_id} lacks an exact static metadata proof")
+            if runtime_asserted:
+                if (not isinstance(runtime_asserted, Mapping) or set(runtime_asserted) != {"device"} or
+                        runtime_asserted["device"] != f"cuda:{profile.device_index}"):
+                    raise WorkerProgramError(
+                        f"runtime guard {operation.op_id} has metadata not enforced by the target binding")
+            for output_id in operation.outputs:
+                producer_order[output_id] = order
+            continue
         if body.body_kind == "view_map":
             output = values[operation.outputs[0]]
             if output.alias_kind != "view":
@@ -275,6 +327,9 @@ def lower_worker_program(program: IndexedTensorProgram, logical_plan: LogicalExe
             if block_threads % 32:
                 raise WorkerProgramError("warp attention needs a block size divisible by 32")
             output_elements = body.output_elements
+        if output_elements == 0:
+            producer_order[output_id] = order
+            continue
         stages.append(WorkerStage(
             operation_id=operation.op_id,
             origin_id=operation.origin_ids[0] if operation.origin_ids else operation.op_id,
@@ -289,16 +344,30 @@ def lower_worker_program(program: IndexedTensorProgram, logical_plan: LogicalExe
         ))
         producer_order[output_id] = order
         if operation.kind == "Scatter/StateWrite":
-            transition = transitions_by_output.get(output_id)
+            transition = transitions_by_output.get(output_id) or transitions_by_writer.get(output_id)
             bounds = operation.attributes.get("index_bounds")
             if transition is None or not isinstance(bounds, Mapping):
                 raise WorkerProgramError(f"state write {operation.op_id} lacks a bounded StepABI transition")
-            runtime_guards.append({
+            guard = {
                 "operation_id": operation.op_id,
                 "value_id": transition.index_value,
                 "lower": int(bounds["lower"]),
                 "upper_exclusive": int(bounds["upper_exclusive"]),
-            })
+            }
+            if transition.alias_rule == "functional_grouped_new_value":
+                position = program.source_program.step_abi.guard_set.get("position", {})
+                specialized = position.get("specialized") if isinstance(position, Mapping) else None
+                if (not isinstance(specialized, int) or
+                        bounds.get("guard") != "StepABI/v1:L<capacity;captured_index==L"):
+                    raise WorkerProgramError(f"grouped state write {operation.op_id} lacks an exact L index guard")
+                guard["equals"] = specialized
+                source_id = _prelaunch_index_source(program, transition.index_value)
+                if source_id is None:
+                    raise WorkerProgramError(
+                        f"grouped state index {transition.index_value} has no bound prelaunch guard source")
+                guard["index_value_id"] = transition.index_value
+                guard["value_id"] = source_id
+            runtime_guards.append(guard)
         if operation.kind == "Gather" and operation.attributes.get("operator_name") == "index_select":
             bounds = operation.attributes.get("index_bounds")
             if not isinstance(bounds, Mapping):
@@ -311,14 +380,29 @@ def lower_worker_program(program: IndexedTensorProgram, logical_plan: LogicalExe
                 "vector": True,
             })
         if operation.kind == "Attention":
-            transition = transitions_by_output.get(operation.inputs[1])
-            if transition is None:
-                raise WorkerProgramError("cached attention lacks its publishing K transition")
-            runtime_guards.append({
-                "operation_id": operation.op_id,
-                "mask_value_id": operation.inputs[3],
-                "index_value_id": transition.index_value,
-            })
+            attention = operation.attributes.get("attention")
+            if not isinstance(attention, Mapping) or not isinstance(attention.get("position"), int):
+                raise WorkerProgramError(f"cached attention {operation.op_id} lacks an exact mask/position proof")
+            if attention.get("mask_rule") == (
+                    "captured_boolean_true_prefix_[0,L+1); no unwritten slot is in the key/value tensors"):
+                if attention.get("capacity") != attention["position"] + 1:
+                    raise WorkerProgramError(f"cached attention {operation.op_id} has an invalid compact prefix")
+            elif attention.get("mask_rule") == (
+                    "caller_boolean_mask; runtime rejects true entries at or beyond L+1"):
+                index_id = attention.get("position_value_id")
+                source_id = _prelaunch_index_source(program, index_id) if isinstance(index_id, str) else None
+                mask_id = attention.get("mask_value_id")
+                if (source_id is None or mask_id not in operation.inputs or
+                        attention.get("capacity") != attention.get("cache_capacity")):
+                    raise WorkerProgramError(f"cached attention {operation.op_id} lacks a runtime mask guard source")
+                runtime_guards.append({
+                    "operation_id": operation.op_id, "value_id": source_id,
+                    "index_value_id": index_id, "mask_value_id": mask_id,
+                    "lower": 0, "upper_exclusive": attention["cache_capacity"],
+                    "equals": attention["position"],
+                })
+            else:
+                raise WorkerProgramError(f"cached attention {operation.op_id} has an unsupported mask proof")
     if not stages:
         raise WorkerProgramError("indexed program has no executable worker stages")
     max_outputs = max(stage.output_elements for stage in stages)
@@ -329,7 +413,7 @@ def lower_worker_program(program: IndexedTensorProgram, logical_plan: LogicalExe
     value_ids = tuple(value.value_id for value in program.values)
     value_guards = tuple({"value_id": value.value_id, "shape": tuple(value.shape),
                           "strides": tuple(value.strides), "dtype": value.dtype}
-                         for value in program.values if value.shape and value.dtype)
+                         for value in program.values if value.dtype)
     state_ownership = tuple((item.old_value, item.new_value)
                             for item in program.state_transitions)
     input_value_ids = tuple(value.value_id for value in program.values
@@ -477,12 +561,17 @@ def _binding_error(worker: WorkerProgram, values: Sequence[Any], device_index: i
                 tuple(value.stride()) != tuple(guard["strides"]) or
                 str(value.dtype).removeprefix("torch.") != guard["dtype"]):
             return f"binding {guard['value_id']} differs from its compiled device/shape/stride/dtype guard"
-    state_values = [by_id[item] for pair in worker.state_ownership for item in pair]
+    state_values = [by_id[item] for pair in worker.state_ownership for item in pair
+                    if by_id[item].numel()]
     if len({value.untyped_storage().data_ptr() for value in state_values}) != len(state_values):
         return "functional state inputs and outputs must own distinct storage"
-    occupied = {by_id[item].untyped_storage().data_ptr() for item in worker.input_value_ids}
+    occupied = {by_id[item].untyped_storage().data_ptr() for item in worker.input_value_ids
+                if by_id[item].numel()}
     for value_id in worker.fresh_value_ids:
-        storage = by_id[value_id].untyped_storage().data_ptr()
+        value = by_id[value_id]
+        if not value.numel():
+            continue
+        storage = value.untyped_storage().data_ptr()
         if storage in occupied:
             return f"fresh value {value_id} overlaps an input or another fresh value"
         occupied.add(storage)
@@ -513,16 +602,23 @@ def _runtime_guard_error(worker: WorkerProgram, values: Sequence[Any]) -> dict[s
         if value_id not in indices:
             indices[value_id] = int(value.reshape(-1)[0].item())
         index = indices[value_id]
+        if not guard["lower"] <= index < guard["upper_exclusive"]:
+            return {"launched": False, "return_code": -5,
+                    "reason": f"state index {index} is outside [{guard['lower']}, {guard['upper_exclusive']})"}
+        if "equals" in guard and index != guard["equals"]:
+            return {"launched": False, "return_code": -12,
+                    "reason": f"state index {index} differs from specialized position {guard['equals']}"}
         if "mask_value_id" in guard:
             mask = by_id[guard["mask_value_id"]]
+            if (not hasattr(mask, "shape") or not hasattr(mask, "dtype") or mask.ndim < 1 or
+                    mask.shape[-1] != guard["upper_exclusive"] or str(mask.dtype) != "torch.bool"):
+                return {"launched": False, "return_code": -13,
+                        "reason": "attention mask shape or dtype differs from its state capacity"}
             # The mask is caller owned. Inspect it on the host before launching the
             # only compute grid, so no unwritten cache slot can enter softmax.
             if index + 1 < mask.shape[-1] and bool(mask.detach().cpu()[..., index + 1:].any()):
                 return {"launched": False, "return_code": -11,
                         "reason": "attention mask exposes an unwritten future cache slot"}
-        elif not guard["lower"] <= index < guard["upper_exclusive"]:
-            return {"launched": False, "return_code": -5,
-                    "reason": f"state index {index} is outside [{guard['lower']}, {guard['upper_exclusive']})"}
     return None
 
 
@@ -798,8 +894,6 @@ def bind_worker_values(program: IndexedTensorProgram,
     if len(placeholders) != len(user_args):
         raise ValueError(f"worker graph expects {len(placeholders)} inputs, got {len(user_args)}")
     by_node = dict(zip(placeholders, user_args))
-    operations_by_output = {output: operation for operation in program.operations
-                            for output in operation.outputs}
     dtype_by_name = {
         "float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32,
         "bool": torch.bool, "int32": torch.int32, "int64": torch.int64,
@@ -816,10 +910,11 @@ def bind_worker_values(program: IndexedTensorProgram,
             for part in str(node.target).split("."):
                 attr = getattr(attr, part)
             bound[value.value_id] = attr
-        elif value.shape and value.dtype:
-            operation = operations_by_output.get(value.value_id)
-            if value.alias_kind == "view" and operation and len(operation.inputs) == 1:
-                base = bound.get(operation.inputs[0])
+        elif value.dtype:
+            if value.alias_kind == "view":
+                if len(value.alias_sources) != 1:
+                    raise WorkerProgramError(f"view {value.fx_node} has no exact alias source")
+                base = bound.get(value.alias_sources[0])
                 if not isinstance(base, torch.Tensor):
                     raise WorkerProgramError(f"view {value.fx_node} has no bound tensor base")
                 offset = value.storage_offset

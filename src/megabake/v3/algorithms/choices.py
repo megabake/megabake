@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Mapping, Sequence
 
 from ..contracts import ContractError
@@ -74,12 +75,20 @@ def _policy(program: IndexedTensorProgram, explicit: Any) -> Any:
 
 
 def _make_choice(program: IndexedTensorProgram, algorithm: str, operations: Sequence[IndexedOp], *,
+                 context: tuple[Mapping[str, int], Mapping[str, Any], str, str] | None = None,
                  semantic: SemanticNode | None = None,
                  guard_conditions: Sequence[Mapping[str, Any]] = (),
                  preparation_actions: Sequence[Mapping[str, Any]] = (),
                  numerical_requirements: Mapping[str, Any] | None = None,
                  policy: Any = None) -> AlgorithmChoice:
-    positions = {operation.op_id: index for index, operation in enumerate(program.operations)}
+    if context is None:
+        context = (
+            {operation.op_id: index for index, operation in enumerate(program.operations)},
+            {value.value_id: value for value in program.values},
+            program.structural_hash,
+            graph_hash(program.source_program),
+        )
+    positions, values, indexed_hash, source_hash = context
     ordered = tuple(sorted(operations, key=lambda item: positions[item.op_id]))
     op_ids = tuple(operation.op_id for operation in ordered)
     input_values = tuple(dict.fromkeys(
@@ -95,7 +104,6 @@ def _make_choice(program: IndexedTensorProgram, algorithm: str, operations: Sequ
          "alias_rule": edge.alias_rule}
         for operation in ordered for edge in operation.effect_edges
     )
-    values = {value.value_id: value for value in program.values}
     guard_values = tuple(dict.fromkeys(input_values + output_values))
     policy_hash = getattr(policy, "contract_hash", None)
     requirements = dict(numerical_requirements or {})
@@ -103,8 +111,8 @@ def _make_choice(program: IndexedTensorProgram, algorithm: str, operations: Sequ
     guards = {
         "choice_id": f"{algorithm}:{'+'.join(op_ids)}",
         "algorithm": algorithm,
-        "indexed_program_hash": program.structural_hash,
-        "source_graph_hash": graph_hash(program.source_program),
+        "indexed_program_hash": indexed_hash,
+        "source_graph_hash": source_hash,
         "reference_expansion": list(op_ids),
         "operations": [operation.to_dict() for operation in ordered],
         "values": [values[value_id].to_dict() for value_id in guard_values if value_id in values],
@@ -135,14 +143,15 @@ def _region_operations(program: IndexedTensorProgram, node_names: Sequence[str],
 
 
 def _add_semantic_choice(program: IndexedTensorProgram, result: list[AlgorithmChoice],
-                         semantic: SemanticNode, algorithm: str, *, policy: Any = None,
+                         semantic: SemanticNode, algorithm: str, *, make_choice: Any,
+                         policy: Any = None,
                          numerical_requirements: Mapping[str, Any] | None = None,
                          include_unsupported: bool = False) -> None:
     operations = _region_operations(program, semantic.origin_nodes, include_unsupported=include_unsupported)
     if operations and len({operation.local_reference.node_name for operation in operations}) == len(
             set(semantic.origin_nodes)):
-        result.append(_make_choice(program, algorithm, operations, semantic=semantic,
-                                   numerical_requirements=numerical_requirements, policy=policy))
+        result.append(make_choice(algorithm, operations, semantic=semantic,
+                                  numerical_requirements=numerical_requirements, policy=policy))
 
 
 def _linear_for_value(semantic_ops: Sequence[SemanticNode], value_id: str) -> SemanticNode | None:
@@ -166,10 +175,17 @@ def enumerate_algorithm_choices(program: IndexedTensorProgram, *, numerical_poli
     policy = _policy(program, numerical_policy)
     choices: list[AlgorithmChoice] = []
     by_id = {operation.op_id: operation for operation in program.operations}
+    context = (
+        {operation.op_id: index for index, operation in enumerate(program.operations)},
+        {value.value_id: value for value in program.values},
+        program.structural_hash,
+        graph_hash(program.source_program),
+    )
+    make_choice = partial(_make_choice, program, context=context)
     # Every lowerable operation keeps an exact, one-op fallback.
     for operation in program.operations:
         if operation.kind == "Attention":
-            choices.append(_make_choice(program, "materialized_attention", (operation,), policy=policy))
+            choices.append(make_choice("materialized_attention", (operation,), policy=policy))
             if (policy is not None and callable(getattr(policy, "tolerance_for", None))
                     and policy.reassociation_allowed("scaled_dot_product_attention")
                     and operation.attributes.get("attention")):
@@ -180,28 +196,28 @@ def enumerate_algorithm_choices(program: IndexedTensorProgram, *, numerical_poli
                 except (StopIteration, ContractError):
                     pass
                 else:
-                    choices.append(_make_choice(
-                        program, "online_softmax", (operation,), policy=policy,
+                    choices.append(make_choice(
+                        "online_softmax", (operation,), policy=policy,
                         numerical_requirements={"reassociation": "required",
                                                 "operation": "scaled_dot_product_attention"},
                     ))
         elif operation.kind != "Unsupported":
-            choices.append(_make_choice(program, "indexed", (operation,), policy=policy))
+            choices.append(make_choice("indexed", (operation,), policy=policy))
 
     for operation in program.operations:
         if operation.kind != "Contraction":
             continue
         base = (operation,)
         if len(operation.iteration_domain) >= 2 and operation.reduction_domain:
-            choices.append(_make_choice(
-                program, "projection_output_major", base, policy=policy,
+            choices.append(make_choice(
+                "projection_output_major", base, policy=policy,
                 guard_conditions=({"kind": "contraction_rank_at_least", "op_id": operation.op_id,
                                    "rank": 2, "has_reduction": True},),
                 numerical_requirements={"reassociation": "preserved", "orientation": "output_major"},
             ))
             reassociation_key = str(operation.attributes.get("operator_name", "contraction"))
-            choices.append(_make_choice(
-                program, "projection_k_parallel", base, policy=policy,
+            choices.append(make_choice(
+                "projection_k_parallel", base, policy=policy,
                 guard_conditions=({"kind": "contraction_rank_at_least", "op_id": operation.op_id,
                                    "rank": 2, "has_reduction": True},),
                 numerical_requirements={"reassociation": "required", "operation": reassociation_key},
@@ -210,8 +226,8 @@ def enumerate_algorithm_choices(program: IndexedTensorProgram, *, numerical_poli
                             if value.value_id == operation.inputs[1]), None)
                       if len(operation.inputs) > 1 else None)
             if weight is not None and _stable_weight(program, weight.value_id):
-                choices.append(_make_choice(
-                    program, "projection_transposed_tensorcore", base, policy=policy,
+                choices.append(make_choice(
+                    "projection_transposed_tensorcore", base, policy=policy,
                     guard_conditions=({"kind": "contraction_rank_at_least", "op_id": operation.op_id,
                                        "rank": 2, "has_reduction": True},
                                       {"kind": "stable_binding", "value_id": weight.value_id}),
@@ -221,8 +237,8 @@ def enumerate_algorithm_choices(program: IndexedTensorProgram, *, numerical_poli
                     numerical_requirements={"reassociation": "required", "operation": reassociation_key,
                                             "orientation": "transposed_weight"},
                 ))
-                choices.append(_make_choice(
-                    program, "stable_weight_pack", base, policy=policy,
+                choices.append(make_choice(
+                    "stable_weight_pack", base, policy=policy,
                     guard_conditions=({"kind": "stable_binding", "value_id": weight.value_id},),
                     preparation_actions=({"kind": "pack_weight", "value_id": weight.value_id,
                                           "lifetime": "session", "cost": "UNKNOWN",
@@ -234,19 +250,19 @@ def enumerate_algorithm_choices(program: IndexedTensorProgram, *, numerical_poli
     semantic_ops = semantic_graph.operations
     for semantic in semantic_ops:
         if semantic.name == "RMSNorm":
-            _add_semantic_choice(program, choices, semantic, "rmsnorm_exact", policy=policy,
+            _add_semantic_choice(program, choices, semantic, "rmsnorm_exact", make_choice=make_choice, policy=policy,
                                  numerical_requirements={"reassociation": "preserved",
                                                          "cast_order": "reference_exact"})
         elif semantic.name == "SDPA":
-            _add_semantic_choice(program, choices, semantic, "attention_online_softmax", policy=policy,
+            _add_semantic_choice(program, choices, semantic, "attention_online_softmax", make_choice=make_choice, policy=policy,
                                  numerical_requirements={"reassociation": "required",
                                                          "operation": "softmax"},
                                  include_unsupported=True)
         elif semantic.name == "RoPE":
-            _add_semantic_choice(program, choices, semantic, "rope_exact", policy=policy,
+            _add_semantic_choice(program, choices, semantic, "rope_exact", make_choice=make_choice, policy=policy,
                                  numerical_requirements={"reassociation": "preserved"})
         elif semantic.name == "SwiGLU":
-            _add_semantic_choice(program, choices, semantic, "swiglu_exact", policy=policy,
+            _add_semantic_choice(program, choices, semantic, "swiglu_exact", make_choice=make_choice, policy=policy,
                                  numerical_requirements={"activation": semantic.attributes.get("activation"),
                                                          "cast_order": "reference_exact"})
 
@@ -262,7 +278,7 @@ def enumerate_algorithm_choices(program: IndexedTensorProgram, *, numerical_poli
                 weights = tuple(item.inputs[1] for item in semantic_group
                                 if item.name == "Linear" and len(item.inputs) > 1)
                 stable_weights = bool(weights) and all(_stable_weight(program, value_id) for value_id in weights)
-                choices.append(_make_choice(program, "qkv_separate", operations, policy=policy,
+                choices.append(make_choice("qkv_separate", operations, policy=policy,
                                             guard_conditions=({"kind": "same_input", "operation_ids":
                                                                [item.op_id for item in operations],
                                                                "input_index": 0},
@@ -270,8 +286,8 @@ def enumerate_algorithm_choices(program: IndexedTensorProgram, *, numerical_poli
                                                                [_semantic_snapshot(item) for item in semantic_group]}),
                                             numerical_requirements={"output_partition": "reference_exact"}))
                 if stable_weights:
-                    choices.append(_make_choice(
-                        program, "qkv_packed", operations, policy=policy,
+                    choices.append(make_choice(
+                        "qkv_packed", operations, policy=policy,
                         guard_conditions=({"kind": "same_input", "operation_ids":
                                            [item.op_id for item in operations], "input_index": 0},
                                           {"kind": "stable_binding", "value_ids": list(weights)},
@@ -288,7 +304,7 @@ def enumerate_algorithm_choices(program: IndexedTensorProgram, *, numerical_poli
                 node for item in semantic_group for node in item.origin_nodes
             ))
             if operations:
-                choices.append(_make_choice(program, composite.kind, operations, policy=policy,
+                choices.append(make_choice(composite.kind, operations, policy=policy,
                                             guard_conditions=({"kind": "semantic_group", "matches":
                                                                [_semantic_snapshot(item) for item in semantic_group]},),
                                             numerical_requirements={"reference_relation": "exact"}))
@@ -309,7 +325,7 @@ def enumerate_algorithm_choices(program: IndexedTensorProgram, *, numerical_poli
         ))
         if not operations:
             continue
-        choices.append(_make_choice(program, "gated_mlp_full", operations, policy=policy,
+        choices.append(make_choice("gated_mlp_full", operations, policy=policy,
                                     semantic=swiglu,
                                     numerical_requirements={"activation": "silu",
                                                             "hidden_materialization": "full",
@@ -319,8 +335,8 @@ def enumerate_algorithm_choices(program: IndexedTensorProgram, *, numerical_poli
                 candidate.op_id for candidate in program.operations
                 if candidate.local_reference.node_name == down.origin_nodes[-1]
             }), None)
-            choices.append(_make_choice(
-                program, "gated_mlp_streamed", operations, policy=policy,
+            choices.append(make_choice(
+                "gated_mlp_streamed", operations, policy=policy,
                 semantic=swiglu,
                 numerical_requirements={"activation": "silu", "hidden_materialization": "streamed",
                                         "reassociation": "required",
@@ -332,8 +348,8 @@ def enumerate_algorithm_choices(program: IndexedTensorProgram, *, numerical_poli
         flat_nodes = tuple(repeat.expand_to_flat())
         operations = tuple(by_id[op_id] for op_id in flat_nodes if op_id in by_id)
         if operations and len(operations) == len(flat_nodes):
-            choices.append(_make_choice(
-                program, "repeat_unroll", operations, policy=policy,
+            choices.append(make_choice(
+                "repeat_unroll", operations, policy=policy,
                 numerical_requirements={"flat_fx_order": list(flat_nodes), "reassociation": "preserved"},
             ))
 
@@ -346,18 +362,28 @@ def enumerate_algorithm_choices(program: IndexedTensorProgram, *, numerical_poli
 
 
 def choice_guard_failures(program: IndexedTensorProgram, choice: AlgorithmChoice, *,
-                          numerical_policy: Any = None) -> tuple[str, ...]:
+                          numerical_policy: Any = None,
+                          _context: Mapping[str, Any] | None = None) -> tuple[str, ...]:
     """Check the stored structural/fact/numerical guards without backend queries."""
     failures: list[str] = []
     if choice.choice_id != choice.guards.get("choice_id"):
         failures.append("choice identity changed")
     if choice.algorithm != choice.guards.get("algorithm"):
         failures.append("algorithm choice changed")
-    if choice.guards.get("indexed_program_hash") != program.structural_hash:
+    context = _context or {}
+    indexed_hash = (context["indexed_program_hash"] if "indexed_program_hash" in context
+                    else program.structural_hash)
+    source_hash = (context["source_graph_hash"] if "source_graph_hash" in context
+                   else graph_hash(program.source_program))
+    current_ops = context.get("operations") or {operation.op_id: operation for operation in program.operations}
+    current_values = context.get("values") or {value.value_id: value for value in program.values}
+    positions = context.get("positions") or {
+        operation.op_id: index for index, operation in enumerate(program.operations)
+    }
+    if choice.guards.get("indexed_program_hash") != indexed_hash:
         failures.append("indexed program hash changed")
-    if choice.guards.get("source_graph_hash") != graph_hash(program.source_program):
+    if choice.guards.get("source_graph_hash") != source_hash:
         failures.append("source graph hash changed")
-    current_ops = {operation.op_id: operation for operation in program.operations}
     guarded_operation_records = tuple(choice.guards.get("operations", ()))
     guarded_operation_order = tuple(item.get("op_id") for item in guarded_operation_records)
     expected_ops = {item.get("op_id"): item for item in guarded_operation_records}
@@ -367,8 +393,8 @@ def choice_guard_failures(program: IndexedTensorProgram, choice: AlgorithmChoice
         failures.append("guarded reference expansion changed")
     if tuple(choice.operation_ids) != guarded_operation_order:
         failures.append("guarded indexed operation order changed")
-    program_order = tuple(operation.op_id for operation in program.operations
-                           if operation.op_id in set(choice.operation_ids))
+    program_order = tuple(sorted((op_id for op_id in choice.operation_ids if op_id in positions),
+                                 key=positions.__getitem__))
     if tuple(choice.operation_ids) != program_order:
         failures.append("reference expansion differs from indexed program order")
     if len(set(choice.operation_ids)) != len(choice.operation_ids):
@@ -406,7 +432,6 @@ def choice_guard_failures(program: IndexedTensorProgram, choice: AlgorithmChoice
         failures.append("preparation action or cost record changed")
     if _stable(choice.numerical_requirements) != choice.guards.get("numerical_requirements"):
         failures.append("candidate numerical requirements changed")
-    current_values = {value.value_id: value for value in program.values}
     expected_values = {item.get("value_id"): item for item in choice.guards.get("values", ())}
     for value_id, expected in expected_values.items():
         if value_id not in current_values or current_values[value_id].to_dict() != expected:

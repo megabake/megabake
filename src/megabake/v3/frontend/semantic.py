@@ -7,7 +7,7 @@ import hashlib
 import json
 from typing import Any, Callable, Mapping
 
-from .capture import NormalizedProgram
+from .capture import NormalizedProgram, inline_grad_disabled_regions
 from .facts import FactTable, collect_facts
 
 
@@ -200,4 +200,8 @@ def recognize(program: NormalizedProgram, *, facts: FactTable | None = None,
 def index_program(program: NormalizedProgram, *, facts: FactTable | None = None) -> Any:
     """Build the canonical origin-indexed program alongside legacy matchers."""
     from ..semantics.indexed import lower_indexed_program
+    source_graph = program.graph_module
+    program = inline_grad_disabled_regions(program)
+    if program.graph_module is not source_graph:
+        facts = None
     return lower_indexed_program(program, facts=facts)

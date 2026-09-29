@@ -102,21 +102,27 @@ def map_indices(region: RegionMap, variables: Mapping[str, int], *,
         for index, extent in zip(output_index, region.iteration_shape):
             flat = flat * extent + index
         return _unravel(flat, region.source_shape)
-    if region.mode in {"indirect_select", "index"}:
-        if region.mode == "indirect_select":
+    if region.mode in {"indirect_select", "index", "embedding", "embedding_index"}:
+        if region.mode in {"indirect_select", "embedding"}:
             values = dynamic_inputs.get("index")
             if values is None:
                 raise AccessMapError("indirect index requires a runtime index binding")
             import torch
             result = []
             for expression in region.expressions:
-                indirect = re.fullmatch(r"index\[(i\d+)\]", expression)
+                indirect = re.fullmatch(r"index\[((?:i\d+)(?:,i\d+)*)\]", expression)
                 if indirect is None:
                     result.append(_eval(expression, variables))
                     continue
-                index = variables[indirect.group(1)]
-                result.append(int(values[index].item()) if isinstance(values, torch.Tensor)
-                              else int(values[index]))
+                index = tuple(variables[axis] for axis in indirect.group(1).split(","))
+                value = values[index] if isinstance(values, torch.Tensor) else values
+                if not isinstance(values, torch.Tensor):
+                    for coordinate in index:
+                        value = value[coordinate]
+                selected = int(value.item()) if isinstance(value, torch.Tensor) else int(value)
+                if region.mode == "embedding" and not 0 <= selected < region.source_shape[0]:
+                    raise AccessMapError("embedding index is outside the vocabulary bounds")
+                result.append(selected)
             return tuple(result)
         return tuple(_eval(expr, variables) for expr in region.expressions)
     if region.mode in {"indirect", "strided_view"} or any(expr == "UNKNOWN" for expr in region.expressions):
@@ -162,10 +168,29 @@ def enumerate_region(region: RegionMap, tile: TileInstance, *,
 
 def index_expressions_supported(operation: Any) -> bool:
     try:
+        def probe_variables(expressions: tuple[str, ...]) -> dict[str, int]:
+            names = {name for expression in expressions
+                     for name in re.findall(r"\b(?:i\d+|k|r\d+)\b", expression)}
+            return {name: 1 for name in names}
+
         for access in operation.input_index_maps:
             if access.mode == "attention_row":
                 if operation.kind != "Attention" or not operation.attributes.get("attention"):
                     return False
+                continue
+            if access.mode == "embedding":
+                bounds = operation.attributes.get("index_bounds", {})
+                embedding = operation.attributes.get("embedding", {})
+                if (operation.kind != "Gather" or operation.attributes.get("operator_name") != "embedding" or
+                        not isinstance(bounds, Mapping) or bounds.get("lower") != 0 or
+                        bounds.get("upper_exclusive") != embedding.get("vocabulary")):
+                    return False
+                for expression in access.expressions:
+                    if expression.startswith("index["):
+                        if not re.fullmatch(r"index\[((?:i\d+)(?:,i\d+)*)\]", expression):
+                            return False
+                    else:
+                        _eval(expression, probe_variables((expression,)))
                 continue
             # Indirect maps remain exact symbolic guards; enumeration needs values.
             if access.mode in {"indirect_select", "index"}:
@@ -174,13 +199,11 @@ def index_expressions_supported(operation: Any) -> bool:
                 continue
             for expression in access.expressions:
                 if expression != "UNKNOWN":
-                    _eval(expression, {"i0": 1, "i1": 1, "i2": 1, "i3": 1,
-                                       "k": 1, "r0": 1, "r1": 1, "r2": 1})
+                    _eval(expression, probe_variables((expression,)))
         for expression in operation.output_index_map:
             if expression == "UNKNOWN":
                 return False
-            _eval(expression, {"i0": 1, "i1": 1, "i2": 1, "i3": 1,
-                               "k": 1, "r0": 1, "r1": 1, "r2": 1})
+            _eval(expression, probe_variables((expression,)))
         return not any(expression == "UNKNOWN" for access in operation.input_index_maps
                        for expression in access.expressions)
     except AccessMapError:

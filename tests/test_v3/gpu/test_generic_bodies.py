@@ -2,7 +2,7 @@ import torch
 import pytest
 
 from tests.test_v3.body_codegen import compile_library, index_module, run_indexed_gpu, source_bundle
-from tests.test_v3.cpu.test_generic_bodies import AddMM, Gate, MMKn, NormCastOrder, SliceReshapeExpand
+from tests.test_v3.cpu.test_generic_bodies import AddMM, CatStack, Gate, MMKn, NormCastOrder, SliceReshapeExpand
 from tests.test_v3.fixtures import (
     GATE_TINY,
     LINEAR_TINY,
@@ -92,3 +92,21 @@ def test_v3r013_generated_slice_reshape_expand_maps_match_gpu_views(v3_device, v
     expected = SliceReshapeExpand()(x)
     torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
     torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+
+@pytest.mark.v3_gpu
+def test_v3r028_cat_stack_bodies_copy_empty_identity_and_static_segments(v3_device, v3_toolchain, tmp_path):
+    examples = (
+        torch.empty((0,), device=v3_device, dtype=torch.float16),
+        torch.arange(12, device=v3_device, dtype=torch.float16).reshape(1, 3, 2, 2),
+        torch.arange(12, device=v3_device, dtype=torch.float16).reshape(1, 3, 2, 2) + 10,
+        torch.arange(12, device=v3_device, dtype=torch.float16).reshape(1, 3, 1, 4) + 20,
+    )
+    program, indexed = index_module(CatStack(), *examples)
+    assert indexed.strict_supported
+    source, bodies = source_bundle(indexed)
+    library, _ = compile_library(v3_toolchain, source, tmp_path / "v3_cat_stack")
+
+    actual = run_indexed_gpu(indexed, program, examples, library, bodies)
+    expected = CatStack()(*examples)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

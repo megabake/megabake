@@ -7,7 +7,7 @@ from collections import Counter
 from typing import Any, Mapping
 
 from ..diagnostics import DiagnosticCode, DiagnosticRecord, DiagnosticSeverity
-from ..frontend.capture import NormalizedProgram, _ORIGIN_META
+from ..frontend.capture import NormalizedProgram, _ORIGIN_META, canonical_output_leaves
 from .indexed import IndexedOp, OutputLeaf, StateTransition
 
 
@@ -178,16 +178,51 @@ def verify_indexed_program(program: NormalizedProgram, operations: tuple[Indexed
                 DiagnosticSeverity.ERROR, node_id=transition.new_value,
             ))
         transitions_by_effect[transition.effect_id] = transition
-        writers = [operation for operation in operations
-                   if any(edge.effect_id == transition.effect_id and edge.writes == (transition.new_value,)
-                          for edge in operation.effect_edges)]
-        if len(writers) != 1 or transition.alias_rule != "functional_new_value":
+        expected_writes = transition.writer_values or (transition.new_value,)
+        if len(set(expected_writes)) != len(expected_writes):
             diagnostics.append(DiagnosticRecord(
                 DiagnosticCode.UNSUPPORTED_SEMANTICS,
-                f"state transition {transition.effect_id} has no unique functional writer",
+                f"state transition {transition.effect_id} repeats a writer value",
                 DiagnosticSeverity.ERROR, node_id=transition.new_value,
-                details={"writer_count": len(writers), "alias_rule": transition.alias_rule},
+                details={"negative_case": "duplicate grouped writer value"},
             ))
+        writer_edges = [(operation, edge) for operation in operations for edge in operation.effect_edges
+                        if edge.effect_id == transition.effect_id and edge.kind == "functional_state_update"]
+        actual_writes = [value for _, edge in writer_edges for value in edge.writes]
+        expected_alias = "functional_grouped_new_value" if transition.writer_values else "functional_new_value"
+        if (len(actual_writes) != len(expected_writes) or set(actual_writes) != set(expected_writes) or
+                transition.alias_rule != expected_alias):
+            diagnostics.append(DiagnosticRecord(
+                DiagnosticCode.UNSUPPORTED_SEMANTICS,
+                f"state transition {transition.effect_id} does not have its exact writer set",
+                DiagnosticSeverity.ERROR, node_id=transition.new_value,
+                details={"expected_writers": list(expected_writes), "actual_writes": actual_writes,
+                         "alias_rule": transition.alias_rule,
+                         "negative_case": "missing, duplicate, or unowned grouped writer"},
+            ))
+        for value in expected_writes:
+            owners = [(operation, edge) for operation, edge in writer_edges if edge.writes == (value,)]
+            if len(owners) != 1:
+                diagnostics.append(DiagnosticRecord(
+                    DiagnosticCode.UNSUPPORTED_SEMANTICS,
+                    f"state writer value {value} has {len(owners)} owners",
+                    DiagnosticSeverity.ERROR, node_id=transition.new_value,
+                    details={"negative_case": "overlapping or omitted writer ownership"},
+                ))
+        if transition.writer_values:
+            writer_records = transition.write_footprint.get("writers", ())
+            record_values = [item.get("value") for item in writer_records if isinstance(item, Mapping)]
+            coordinates = [tuple(item.get("coordinates", ())) for item in writer_records
+                           if isinstance(item, Mapping)]
+            if (len(record_values) != len(expected_writes) or set(record_values) != set(expected_writes) or
+                    len(set(coordinates)) != len(coordinates) or
+                    transition.new_value not in {output.value_id for output in outputs}):
+                diagnostics.append(DiagnosticRecord(
+                    DiagnosticCode.MISSING_FACTS,
+                    f"grouped state transition {transition.effect_id} lacks complete writer or aggregate-output coverage",
+                    DiagnosticSeverity.ERROR, node_id=transition.new_value,
+                    details={"negative_case": "incomplete partition proof or absent aggregate state output"},
+                ))
     for operation in operations:
         for edge in operation.effect_edges:
             if edge.kind != "state_read_after_publish":
@@ -267,6 +302,7 @@ def verify_algorithm_choice_cover(program: Any, choices: tuple[Any, ...],
                                   ]:
     """Verify a selected guarded choice set covers indexed work, outputs and effects."""
     from ..algorithms.choices import choice_guard_failures
+    from ..frontend.capture import graph_hash
 
     diagnostics: list[DiagnosticRecord] = []
     choices_by_id: dict[str, Any] = {}
@@ -278,6 +314,14 @@ def verify_algorithm_choice_cover(program: Any, choices: tuple[Any, ...],
                 DiagnosticSeverity.ERROR, action_id=choice.choice_id,
             ))
         choices_by_id[choice.choice_id] = choice
+
+    validation_context = {
+        "indexed_program_hash": program.structural_hash,
+        "source_graph_hash": graph_hash(program.source_program),
+        "operations": {operation.op_id: operation for operation in program.operations},
+        "positions": {operation.op_id: index for index, operation in enumerate(program.operations)},
+        "values": {value.value_id: value for value in program.values},
+    }
 
     if not selected_choice_ids:
         diagnostics.append(DiagnosticRecord(
@@ -302,7 +346,9 @@ def verify_algorithm_choice_cover(program: Any, choices: tuple[Any, ...],
                 DiagnosticSeverity.ERROR, action_id=choice_id,
             ))
             continue
-        failures = choice_guard_failures(program, choice, numerical_policy=numerical_policy)
+        failures = choice_guard_failures(
+            program, choice, numerical_policy=numerical_policy, _context=validation_context
+        )
         for failure in failures:
             code = (DiagnosticCode.FAILED_NUMERICAL_GATE if "numerical policy" in failure
                     or "reassociation" in failure else DiagnosticCode.MISSING_FACTS)
@@ -348,9 +394,11 @@ def verify_algorithm_choice_cover(program: Any, choices: tuple[Any, ...],
     source_graph = program.source_program.graph_module
     source_output_node = next((node for node in reversed(tuple(source_graph.graph.nodes))
                                if node.op == "output"), None)
-    source_output_refs = ({json.dumps(path, separators=(",", ":"), default=str): (node_name, literal)
-                          for path, node_name, literal in _output_references(source_output_node.args[0])}
-                         if source_output_node is not None else {})
+    source_output_refs = ({
+        json.dumps(path, separators=(",", ":"), default=str):
+        (value.name, None) if hasattr(value, "op") and hasattr(value, "name") else (None, value)
+        for path, value in canonical_output_leaves(program.source_program, source_output_node.args[0])
+    } if source_output_node is not None else {})
     expected_output_paths = set(program.source_program.output_origins)
     if set(source_output_refs) != expected_output_paths:
         diagnostics.append(DiagnosticRecord(

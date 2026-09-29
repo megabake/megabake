@@ -211,6 +211,10 @@ reference expansion and comparative fixture evidence
 
 Treat an FX effect as observable even when its result has no users. A normalized in-place cache write can become an old/new functional state pair, but its ordering relative to all consumers remains. An allocation may be reused only after the last ordinary and asynchronous reader retires. A `view` is a change of indexing and aliasing, not an instruction to copy; a `reshape` that materializes cannot be recorded as an alias. Missing facts remain `UNKNOWN` and either force a conservative body/layout or a diagnostic.
 
+**Grouped state writers are a first-class proof case.** A logical cache append can be expanded into multiple disjoint writes (such as key and value updates for each layer) whose old operands are views of one declared cache input, then assembled into one returned cache. The transition record therefore needs a writer set and aggregate output source, not an assumption that one `index_copy` directly consumes the state placeholder and is itself the final state. Verify view ancestry, each writer's guarded index and slice, complete region coverage, alias preservation, and assembly of the returned state. Reject unknown, overlapping-unordered, or incomplete writer sets.
+
+The StepABI contract hash is part of the indexed-program identity. A compiled worker cannot be opened with a different runtime shape/stride/dtype, state, position, or output-ownership contract even if the FX operator graph is unchanged.
+
 For an `addmm` expression, preserve `beta * input + alpha * (mat1 @ mat2)` and the point at which each multiply, accumulation and output cast happens under the captured reference. The notation `Y^T = W X^T` changes the legal algorithm's orientation, not the reference's alpha/beta or rounding contract. Split-K and online softmax are guarded numerical algorithms: they change reduction order and may require a declared tolerance and edge-case checks. No generic reassociation flag silently applies to every op.
 
 ## 12. End-to-end tiny derivation

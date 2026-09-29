@@ -31,6 +31,18 @@ def test_facts_guard_shape_stride_and_reject_expanded_writes():
         require_safe_write(expanded)
 
 
+def test_detach_inplace_fact_preserves_the_source_storage_alias():
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    detached = graph.call_function(torch.ops.aten.detach_.default, (x,))
+    graph.output(detached)
+    module = torch.fx.GraphModule({}, graph)
+    facts = collect_facts(normalize_fx(module, (torch.ones(2, 3),), input_spec={}))
+    fact = facts.for_node(detached)
+    assert fact.alias_kind == "view"
+    assert fact.alias_sources == (facts.node_to_value["x"],)
+
+
 def _reshape_graph(shape):
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
@@ -56,6 +68,16 @@ def test_reshape_transfer_distinguishes_noncontiguous_view_from_copy():
     copy_fact = copied.for_node(copy_name)
     assert copy_fact.alias_kind == "copy" and copy_fact.alias_set is not None
     assert copy_fact.alias_set != copied.for_node("x").alias_set
+
+    class ExpandedReshape(torch.nn.Module):
+        def forward(self, x):
+            return x.expand(2, 3).reshape(6)
+
+    expanded = torch.export.export(ExpandedReshape(), (torch.ones(1, 3),))
+    expanded_facts = collect_facts(normalize_fx(expanded, input_spec={}))
+    expanded_copy = next(fact for fact in expanded_facts.facts.values() if fact.shape == (6,))
+    assert expanded_copy.alias_kind == "copy"
+    assert expanded_copy.alias_set != expanded_facts.for_node("x").alias_set
 
 
 def test_tied_parameters_cache_effects_cast_points_and_unknown_alignment():

@@ -9,6 +9,7 @@ from megabake.v3.backends.cuda.tensor_core import enumerate_tensor_core_schedule
 from megabake.v3.frontend.facts import FactError, collect_facts, require_safe_write
 from megabake.v3.frontend.normalize import normalize_fx
 from megabake.v3.frontend.semantic import index_program
+from megabake.v3.frontend.semantic import index_program
 from tests.test_v3.body_codegen import index_module
 from tests.test_v3.fixtures import GATE_TINY, LINEAR_TINY, NORM_VARIANTS
 
@@ -42,6 +43,26 @@ class MMKn(torch.nn.Module):
         return torch.mm(x, weight_kn)
 
 
+class BatchedMatmul(torch.nn.Module):
+    def forward(self, left, right):
+        return torch.matmul(left, right)
+
+
+class ExpandedReshape(torch.nn.Module):
+    def forward(self, x):
+        return x.expand(2, 3).reshape(6)
+
+
+class IntegerMaps(torch.nn.Module):
+    def forward(self, x):
+        return x + 1, x <= 2, x.to(torch.float32)
+
+
+class IntegerOnes(torch.nn.Module):
+    def forward(self, x):
+        return torch.ones((2, 3), dtype=torch.int64, device=x.device)
+
+
 class Gate(torch.nn.Module):
     def forward(self, gate, up):
         return torch.nn.functional.silu(gate) * up
@@ -63,6 +84,13 @@ class SliceReshapeExpand(torch.nn.Module):
         flattened = sliced.reshape(4)
         expanded = x[:, :1].expand(4, 3)
         return flattened, expanded
+
+
+class CatStack(torch.nn.Module):
+    def forward(self, empty, x, y, token):
+        joined = torch.cat((x, y), dim=-1)
+        appended = torch.cat((empty, joined, token), dim=-2)
+        return torch.stack((appended, appended), dim=1)
 
 
 def test_v3r013_unfamiliar_map_view_reduce_emits_device_bodies_and_keeps_origins():
@@ -135,6 +163,131 @@ def test_v3r013_slice_reshape_and_expand_keep_exact_view_maps():
     assert any(operation.input_index_maps[0].mode == "zero_stride_broadcast"
                for operation in indexed.operations if operation.kind == "Broadcast/View")
     torch.testing.assert_close(indexed.evaluate({"x": x}), SliceReshapeExpand()(x), rtol=0, atol=0)
+
+
+def test_v3r028_cat_stack_maps_and_cuda_body_reject_bad_segment_proof():
+    empty = torch.empty((0,), dtype=torch.float16)
+    x = torch.arange(12, dtype=torch.float16).reshape(1, 3, 2, 2)
+    y = torch.arange(12, dtype=torch.float16).reshape(1, 3, 2, 2) + 10
+    token = torch.arange(12, dtype=torch.float16).reshape(1, 3, 1, 4) + 20
+    _, indexed = index_module(CatStack(), empty, x, y, token)
+
+    assert indexed.strict_supported
+    cats = [item for item in indexed.operations if item.attributes["operator_name"] == "cat"]
+    cat, append = cats
+    stack = next(item for item in indexed.operations if item.attributes["operator_name"] == "stack")
+    assert cat.attributes["tensor_construct"] == {
+        "operator": "cat", "dimension": 3, "segments": [2, 2]
+    }
+    assert append.attributes["tensor_construct"] == {
+        "operator": "cat", "dimension": 2, "segments": [0, 2, 1]
+    }
+    assert [item.mode for item in append.input_index_maps] == ["empty_cat", "cat", "cat"]
+    assert stack.attributes["tensor_construct"] == {
+        "operator": "stack", "dimension": 1, "segments": [1, 1]
+    }
+    actual = indexed.evaluate({"empty": empty, "x": x, "y": y, "token": token})
+    expected = CatStack()(empty, x, y, token)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert all(emit_cuda_body(indexed, item).body_kind == "tensor_construct"
+               for item in (*cats, stack))
+
+    malformed = dict(append.attributes)
+    malformed["tensor_construct"] = {**append.attributes["tensor_construct"], "segments": [1, 2, 1]}
+    with pytest.raises(CudaBodyError, match="segment proof"):
+        emit_cuda_body(indexed, replace(append, attributes=malformed))
+
+
+def test_v3r028_batched_matmul_maps_broadcast_batches_and_rejects_bad_maps():
+    left = torch.randn(2, 1, 4, 5, dtype=torch.float16)
+    right = torch.randn(1, 3, 5, 6, dtype=torch.float16)
+    _, indexed = index_module(BatchedMatmul(), left, right)
+    operation = next(item for item in indexed.operations if item.attributes["operator_name"] == "matmul")
+
+    assert indexed.strict_supported
+    assert operation.input_index_maps[0].expressions == ("i0", "0", "i2", "k")
+    assert operation.input_index_maps[1].expressions == ("0", "i1", "k", "i3")
+    body = emit_cuda_body(indexed, operation)
+    assert body.body_kind == "contraction"
+    assert "red[0]" in body.source and "idx[3]" in body.source
+    torch.testing.assert_close(indexed.evaluate({"left": left, "right": right}),
+                               BatchedMatmul()(left, right), rtol=0, atol=0)
+
+    bad_map = replace(operation.input_index_maps[1], expressions=("0", "i1", "i3", "k"))
+    with pytest.raises(CudaBodyError, match="exact contraction map"):
+        emit_cuda_body(indexed, replace(
+            operation, input_index_maps=(operation.input_index_maps[0], bad_map)
+        ))
+
+
+def test_v3r028_zero_stride_reshape_materializes_and_rejects_unknown_ownership():
+    source = torch.tensor([[1.0, 2.0, 3.0]])
+    _, indexed = index_module(ExpandedReshape(), source)
+    reshape = next(item for item in indexed.operations if item.attributes["operator_name"] == "reshape")
+
+    assert indexed.strict_supported
+    assert next(value for value in indexed.values if value.value_id == reshape.outputs[0]).alias_kind == "copy"
+    assert emit_cuda_body(indexed, reshape).body_kind == "view_copy"
+    torch.testing.assert_close(indexed.evaluate({"x": source}), ExpandedReshape()(source), rtol=0, atol=0)
+
+    values = tuple(replace(value, alias_kind="unknown")
+                   if value.value_id == reshape.outputs[0] else value for value in indexed.values)
+    with pytest.raises(CudaBodyError, match="alias or materialization relation"):
+        emit_cuda_body(replace(indexed, values=values), reshape)
+
+
+def test_v3r028_integer_maps_keep_int64_comparison_add_and_copy_exact():
+    x = torch.tensor([2**54, 2, -(2**54)], dtype=torch.int64)
+    _, indexed = index_module(IntegerMaps(), x)
+    arithmetic = next(item for item in indexed.operations if item.attributes["operator_name"] == "add")
+    comparison = next(item for item in indexed.operations if item.attributes["operator_name"] == "le")
+
+    assert indexed.strict_supported
+    assert "static_cast<uint64_t>" in emit_cuda_body(indexed, arithmetic).source
+    assert "int64_t v0" in emit_cuda_body(indexed, comparison).source
+    actual = indexed.evaluate({"x": x})
+    expected = IntegerMaps()(x)
+    for actual_value, expected_value in zip(actual, expected):
+        torch.testing.assert_close(actual_value, expected_value, rtol=0, atol=0)
+
+
+def test_v3r028_int64_fresh_copy_preserves_bits_and_rejects_wrong_dtype():
+    graph = torch.fx.Graph()
+    value = graph.placeholder("value")
+    copied = graph.call_function(torch.ops.aten.lift_fresh_copy.default, (value,))
+    graph.output(copied)
+    module = torch.fx.GraphModule({}, graph)
+    x = torch.tensor([2**54, 2, -(2**54)], dtype=torch.int64)
+    program = normalize_fx(module, (x,), input_spec={})
+    indexed = index_program(program)
+    copy = next(item for item in indexed.operations if item.attributes["operator_name"] == "lift_fresh_copy")
+
+    assert indexed.strict_supported
+    body = emit_cuda_body(indexed, copy)
+    assert "out[idx[0]*1] = in0[(idx[0])*1]" in body.source
+    actual = indexed.evaluate({"value": x})
+    torch.testing.assert_close(actual, x.clone(), rtol=0, atol=0)
+    assert actual.data_ptr() != x.data_ptr()
+
+    values = tuple(replace(value, dtype="int32") if value.value_id == copy.outputs[0] else value
+                   for value in indexed.values)
+    with pytest.raises(CudaBodyError, match="copy shape, dtype, map"):
+        emit_cuda_body(replace(indexed, values=values), copy)
+
+
+def test_v3r028_ones_constructor_emits_coordinates_and_rejects_shape_mismatch():
+    _, indexed = index_module(IntegerOnes(), torch.ones(1))
+    constructor = next(item for item in indexed.operations
+                       if item.attributes["operator_name"] == "ones")
+    body = emit_cuda_body(indexed, constructor)
+
+    assert indexed.strict_supported
+    assert "idx[0] = idx_remaining % 2" in body.source
+    assert "idx[1] = idx_remaining % 3" in body.source
+    malformed = dict(constructor.attributes)
+    malformed["constructor"] = {**malformed["constructor"], "shape": [3, 2]}
+    with pytest.raises(CudaBodyError, match="constructor output ownership or shape"):
+        emit_cuda_body(indexed, replace(constructor, attributes=malformed))
 
 
 def test_v3r013_rejects_as_strided_without_storage_bounds():

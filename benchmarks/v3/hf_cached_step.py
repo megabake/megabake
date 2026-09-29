@@ -166,7 +166,11 @@ def make_step_inputs(
         if valid_length:
             state[i, 0, :, :, :valid_length, :].copy_(layer.keys)
             state[i, 1, :, :, :valid_length, :].copy_(layer.values)
-    return StepInputs(next_ids[:, :1].contiguous(), state, next_ids[:, 1:].contiguous(), seed)
+    input_ids = torch.empty((batch_size, 1), dtype=next_ids.dtype, device=device)
+    next_input_ids = torch.empty_like(input_ids)
+    input_ids.copy_(next_ids[:, :1])
+    next_input_ids.copy_(next_ids[:, 1:])
+    return StepInputs(input_ids, state, next_input_ids, seed)
 
 
 def native_reference_step(
@@ -325,7 +329,8 @@ def make_step_abi(
             "capacity": {"old_cache": capacity},
             "position": {"specialized": valid_length},
             "numerical_policy_hash": numerical_policy_hash,
-            "features": ["transformers.DynamicCache", "functional_append", "causal_attention"],
+            "features": ["transformers.DynamicCache", "functional_append", "causal_attention",
+                         "inference_only"],
         },
         state_mode="advancing",
         cache_update_mode="functional_append",
@@ -338,7 +343,9 @@ def make_numerical_policy(config: Any, dtype: torch.dtype, valid_length: int) ->
         intermediate_casts=("checkpoint/model operator cast boundaries",),
         accumulation_dtypes={"projection": "float32", "normalization": "float32", "attention": "float32"},
         output_casts={"logits": str(dtype).removeprefix("torch."), "kv": str(dtype).removeprefix("torch."), "valid_length": "int64"},
-        permitted_reassociation={"*": False},
+        # SDPA's online-softmax CUDA body reassociates the reference reduction;
+        # admit that one operation only under the declared output tolerance.
+        permitted_reassociation={"scaled_dot_product_attention": True},
         tolerances={"*": {"float16": ToleranceSpec(atol=OUTPUT_ATOL, rtol=OUTPUT_RTOL, equal_nan=False)}},
         exceptional_value_policy=ExceptionalValuePolicy(False, False, False),
     )
@@ -407,6 +414,9 @@ def export_and_capture(
     example_args: tuple[torch.Tensor, torch.Tensor],
 ) -> tuple[Any, Any, StepABI]:
     exported = torch.export.export(step, example_args, strict=False)
+    policy = make_numerical_policy(
+        step.model.config, example_args[1].dtype, step.valid_length
+    )
     abi = make_step_abi(
         exported,
         valid_length=step.valid_length,
@@ -414,12 +424,11 @@ def export_and_capture(
         batch_size=example_args[0].shape[0],
         dtype=example_args[1].dtype,
         config=step.model.config,
-        numerical_policy_hash=make_numerical_policy(
-            step.model.config, example_args[1].dtype, step.valid_length
-        ).contract_hash,
+        numerical_policy_hash=policy.contract_hash,
     )
     program = capture_exported_program(
         exported,
+        policy=policy,
         state_bindings={"old_cache": "kv"},
         step_abi=abi,
     )

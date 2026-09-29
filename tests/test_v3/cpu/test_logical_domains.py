@@ -1,6 +1,7 @@
 from dataclasses import replace
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,6 +12,8 @@ from megabake.v3.frontend.semantic import index_program
 from megabake.v3.logical import (LogicalPlanError, TileAxis, TileDomain, enumerate_region,
                                  lower_logical_plan)
 from megabake.v3.logical.maps import tile_variables
+from megabake.v3.semantics.indexed import InputIndexMap
+from megabake.v3.logical.maps import index_expressions_supported, map_indices, RegionMap
 from tests.test_v3.fixtures import LINEAR_TINY
 
 
@@ -134,6 +137,26 @@ def test_domains_reject_unknown_maps_and_nonpositive_tile_sizes():
                                 if choice.algorithm == "indexed")
     with pytest.raises(LogicalPlanError, match="access map that cannot be proved"):
         lower_logical_plan(bad_output_program, bad_output_choices, bad_output_selected)
+
+
+def test_rank_six_static_select_map_is_supported_and_unknown_axes_reject():
+    select = SimpleNamespace(
+        kind="Broadcast/View",
+        attributes={},
+        input_index_maps=(InputIndexMap("state", ("0", "i0", "i1", "i2", "i3", "i4"), "select"),),
+        output_index_map=("i0", "i1", "i2", "i3", "i4"),
+    )
+    assert index_expressions_supported(select)
+    region = RegionMap("state", select.input_index_maps[0].expressions, "select",
+                       ("i0", "i1", "i2", "i3", "i4"),
+                       (30, 2, 1, 3, 2050, 64), (2, 1, 3, 2050, 64))
+    assert map_indices(region, {f"i{axis}": axis + 1 for axis in range(5)}) == (0, 1, 2, 3, 4, 5)
+    malformed = SimpleNamespace(
+        kind="Broadcast/View", attributes={},
+        input_index_maps=(InputIndexMap("state", ("0", "i0", "i1", "i2", "i3", "UNKNOWN"), "select"),),
+        output_index_map=select.output_index_map,
+    )
+    assert not index_expressions_supported(malformed)
 
 
 def test_common_logical_import_does_not_load_cuda_backend():

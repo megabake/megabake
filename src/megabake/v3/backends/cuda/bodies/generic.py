@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 from ....contracts import ContractError
 from ....diagnostics import DiagnosticCode, DiagnosticRecord, DiagnosticSeverity
-from ....semantics.indexed import IndexedOp, IndexedValue
+from ....semantics.indexed import IndexedOp, IndexedValue, InputIndexMap
 
 
 _CUDA_TYPES = {
@@ -23,12 +23,12 @@ _CUDA_TYPES = {
 }
 _MATH_MAPS = {
     "add", "sub", "mul", "div", "neg", "exp", "rsqrt", "sqrt", "square",
-    "sigmoid", "tanh", "relu", "silu", "gelu", "where", "eq", "ne", "gt",
-    "ge", "lt", "le", "to", "_to_copy", "convert_element_type", "maximum",
+    "sigmoid", "tanh", "relu", "silu", "gelu", "cos", "sin", "where", "eq", "ne", "gt",
+    "ge", "lt", "le", "__and__", "to", "_to_copy", "convert_element_type", "maximum",
     "minimum", "pow",
 }
 _VIEWS = {"view", "reshape", "transpose", "permute", "t", "slice", "select",
-          "squeeze", "unsqueeze", "expand", "detach", "alias", "flatten"}
+          "squeeze", "unsqueeze", "expand", "detach", "detach_", "alias", "flatten"}
 _CONTRACTIONS = {"mm", "bmm", "addmm", "matmul", "linear"}
 
 
@@ -177,6 +177,8 @@ __device__ __forceinline__ float {prefix}_load(const float* p, int64_t i) {{ ret
 __device__ __forceinline__ float {prefix}_load(const __half* p, int64_t i) {{ return __half2float(p[i]); }}
 __device__ __forceinline__ float {prefix}_load(const __nv_bfloat16* p, int64_t i) {{ return __bfloat162float(p[i]); }}
 __device__ __forceinline__ float {prefix}_load(const bool* p, int64_t i) {{ return p[i] ? 1.0f : 0.0f; }}
+__device__ __forceinline__ float {prefix}_load(const int32_t* p, int64_t i) {{ return static_cast<float>(p[i]); }}
+__device__ __forceinline__ float {prefix}_load(const int64_t* p, int64_t i) {{ return static_cast<float>(p[i]); }}
 __device__ __forceinline__ float {prefix}_store(float x, float*) {{ return x; }}
 __device__ __forceinline__ __half {prefix}_store(float x, __half*) {{ return __float2half_rn(x); }}
 __device__ __forceinline__ __nv_bfloat16 {prefix}_store(float x, __nv_bfloat16*) {{ return __float2bfloat16_rn(x); }}
@@ -195,6 +197,47 @@ def _value_expression(value: Any, loaded: Mapping[str, str], node_id: str) -> st
     if isinstance(value, (tuple, list)):
         return "(" + ", ".join(_value_expression(item, loaded, node_id) for item in value) + ")"
     return _literal(value, node_id)
+
+
+def _integer_expression(value: Any, loaded: Mapping[str, str], node_id: str) -> str:
+    if isinstance(value, dict):
+        if "value" in value:
+            try:
+                return loaded[str(value["value"])]
+            except KeyError as exc:
+                raise CudaBodyError(node_id, f"integer operand {value['value']!r} has no proved index map") from exc
+        raise CudaBodyError(node_id, "typed or dynamic integer scalar operand is unsupported")
+    if isinstance(value, bool):
+        return "1LL" if value else "0LL"
+    if isinstance(value, int):
+        return f"{value}LL"
+    if isinstance(value, (tuple, list)):
+        return "(" + ", ".join(_integer_expression(item, loaded, node_id) for item in value) + ")"
+    raise CudaBodyError(node_id, f"non-integral operand {value!r} is unsupported for integer maps")
+
+
+def _integer_map_expression(operation: IndexedOp, loaded: Mapping[str, str], node_id: str) -> str:
+    name = _operator(operation)
+    args = operation.attributes.get("arguments", ())
+    kwargs = operation.attributes.get("keywords", {})
+    if name in {"add", "sub"}:
+        if len(args) < 2:
+            raise CudaBodyError(node_id, f"integer {name} requires two operands")
+        alpha = kwargs.get("alpha", args[2] if len(args) > 2 else 1)
+        alpha = alpha.get("value") if isinstance(alpha, dict) else alpha
+        if not isinstance(alpha, int) or isinstance(alpha, bool):
+            raise CudaBodyError(node_id, "integer add/sub requires an integer alpha")
+        left, right = (_integer_expression(item, loaded, node_id) for item in args[:2])
+        symbol = "+" if name == "add" else "-"
+        return (f"static_cast<int64_t>(static_cast<uint64_t>({left}) {symbol} "
+                f"(static_cast<uint64_t>({alpha}LL) * static_cast<uint64_t>({right})))")
+    if name in {"eq", "ne", "gt", "ge", "lt", "le"}:
+        if len(args) < 2:
+            raise CudaBodyError(node_id, f"integer {name} requires two operands")
+        left, right = (_integer_expression(item, loaded, node_id) for item in args[:2])
+        symbol = {"eq": "==", "ne": "!=", "gt": ">", "ge": ">=", "lt": "<", "le": "<="}[name]
+        return f"({left} {symbol} {right} ? 1.0f : 0.0f)"
+    raise CudaBodyError(node_id, f"integer map operator {name!r} is unsupported")
 
 
 def _map_expression(operation: IndexedOp, loaded: Mapping[str, str], node_id: str) -> str:
@@ -248,6 +291,11 @@ def _map_expression(operation: IndexedOp, loaded: Mapping[str, str], node_id: st
             raise CudaBodyError(node_id, f"{name} requires two operands")
         symbol = {"eq": "==", "ne": "!=", "gt": ">", "ge": ">=", "lt": "<", "le": "<="}[name]
         return f"({values[0]} {symbol} {values[1]} ? 1.0f : 0.0f)"
+    if name == "__and__":
+        values = [_value_expression(item, loaded, node_id) for item in args[:2]]
+        if len(values) != 2:
+            raise CudaBodyError(node_id, "boolean and requires two operands")
+        return f"(({values[0]} != 0.0f) && ({values[1]} != 0.0f) ? 1.0f : 0.0f)"
     values = [_value_expression(item, loaded, node_id) for item in args[:1]]
     if name == "neg": return f"(-{values[0]})"
     if name == "exp": return f"expf({values[0]})"
@@ -256,6 +304,8 @@ def _map_expression(operation: IndexedOp, loaded: Mapping[str, str], node_id: st
     if name == "square": return f"({values[0]} * {values[0]})"
     if name == "sigmoid": return f"(1.0f / (1.0f + expf(-{values[0]})))"
     if name == "tanh": return f"tanhf({values[0]})"
+    if name == "cos": return f"cosf({values[0]})"
+    if name == "sin": return f"sinf({values[0]})"
     if name == "relu": return f"(isnan({values[0]}) ? NAN : fmaxf({values[0]}, 0.0f))"
     if name == "silu": return f"({values[0]} / (1.0f + expf(-{values[0]})))"
     raise CudaBodyError(node_id, f"map operator {name!r} is unsupported")
@@ -362,6 +412,18 @@ def _emit_map_or_view(operation: IndexedOp, values: Mapping[str, IndexedValue],
     input_values = [values[value_id] for value_id in operation.inputs]
     input_types = tuple(_dtype(value, node_id) for value in input_values)
     output_type = _dtype(output, node_id)
+    if name == "__and__" and (input_types != ("bool", "bool") or output_type != "bool"):
+        raise CudaBodyError(node_id, "logical and body requires boolean inputs and output")
+    integer_types = {"int32_t", "int64_t"}
+    integer_arithmetic = (name in {"add", "sub"} and output_type in integer_types and
+                          all(item in integer_types for item in input_types))
+    integer_comparison = (name in {"eq", "ne", "gt", "ge", "lt", "le"} and
+                          bool(input_types) and all(item in integer_types for item in input_types))
+    integer_cast = (name in {"to", "_to_copy", "convert_element_type"} and
+                    output_type in integer_types and len(input_types) == 1 and
+                    input_types[0] in integer_types)
+    if output_type in integer_types and not (integer_arithmetic or integer_cast):
+        raise CudaBodyError(node_id, "integer output map needs an exact integer body")
     prefix = _name(operation)
     entry = f"{prefix}_tile"
     lines = _coordinates(output_shape)
@@ -369,10 +431,21 @@ def _emit_map_or_view(operation: IndexedOp, values: Mapping[str, IndexedValue],
     for index, (value_id, value, index_map) in enumerate(zip(operation.inputs, input_values, operation.input_index_maps)):
         offset = _input_offset(index_map, value, output_shape, node_id)
         name_i = f"v{index}"
-        lines.append(f"const float {name_i} = {prefix}_load(in{index}, {offset});")
+        if integer_arithmetic or integer_comparison or integer_cast:
+            lines.append(f"const int64_t {name_i} = static_cast<int64_t>(in{index}[{offset}]);")
+        else:
+            lines.append(f"const float {name_i} = {prefix}_load(in{index}, {offset});")
         loaded[value_id] = name_i
-    expression = _map_expression(operation, loaded, node_id)
-    lines.append(f"out[{_output_offset(output, output_shape, node_id)}] = {prefix}_store({expression}, ({output_type}*)0);")
+    if integer_arithmetic or integer_comparison:
+        expression = _integer_map_expression(operation, loaded, node_id)
+    elif integer_cast:
+        expression = f"static_cast<{output_type}>(v0)"
+    else:
+        expression = _map_expression(operation, loaded, node_id)
+    if integer_arithmetic or integer_cast:
+        lines.append(f"out[{_output_offset(output, output_shape, node_id)}] = {expression};")
+    else:
+        lines.append(f"out[{_output_offset(output, output_shape, node_id)}] = {prefix}_store({expression}, ({output_type}*)0);")
     source = _helpers(prefix) + _body_loop(entry, _pointer_arguments(input_types, output_type),
                                            _numel(output_shape), lines)
     return CudaBody(source, entry, input_types, output_type, _numel(output_shape), "map", node_id)
@@ -460,14 +533,45 @@ def _emit_contraction(operation: IndexedOp, values: Mapping[str, IndexedValue],
             raise CudaBodyError(node_id, "addmm bias map is not the exact declared broadcast")
         beta = operation.attributes.get("contraction", {}).get("beta", 1.0)
         alpha = operation.attributes.get("contraction", {}).get("alpha", 1.0)
-    elif name in {"mm", "matmul"}:
+    elif name == "mm":
         if len(shapes) != 2 or len(shapes[0]) != 2 or len(shapes[1]) != 2 or len(output_shape) != 2:
-            raise CudaBodyError(node_id, f"{name} supports dense rank-two operands in this body")
+            raise CudaBodyError(node_id, "mm requires dense rank-two operands")
         left, right = shapes
         if left[1] != right[0] or output_shape != (left[0], right[1]):
-            raise CudaBodyError(node_id, f"{name} dimensions or output map are incompatible")
+            raise CudaBodyError(node_id, "mm dimensions or output map are incompatible")
         require_map(0, ("i0", "k"))
         require_map(1, ("k", "i1"))
+        beta, alpha = 0.0, 1.0
+    elif name == "matmul":
+        if len(shapes) != 2 or not shapes[0] or not shapes[1]:
+            raise CudaBodyError(node_id, "matmul requires non-scalar dense operands")
+        left, right = shapes
+        left_vector, right_vector = len(left) == 1, len(right) == 1
+        left_k = left[-1]
+        right_k = right[-1] if right_vector else right[-2]
+        batch_rank = max(len(left) - 2, len(right) - 2, 0)
+        left_batch, right_batch = left[:-2] if not left_vector else (), \
+            right[:-2] if not right_vector else ()
+        padded_left = (1,) * (batch_rank - len(left_batch)) + left_batch
+        padded_right = (1,) * (batch_rank - len(right_batch)) + right_batch
+        batch_shape = tuple(max(a, b) for a, b in zip(padded_left, padded_right))
+        if (left_k != right_k or any(a not in (1, extent) or b not in (1, extent)
+                                     for a, b, extent in zip(padded_left, padded_right, batch_shape))):
+            raise CudaBodyError(node_id, "matmul K or batch dimensions are incompatible")
+        expected_shape = batch_shape + (() if left_vector and right_vector else
+            ((right[-1],) if left_vector else ()))
+        if not left_vector and not right_vector:
+            expected_shape = batch_shape + (left[-2], right[-1])
+        elif right_vector and not left_vector:
+            expected_shape = batch_shape + (left[-2],)
+        left_map = (("k",) if left_vector else
+                    _broadcast_map(left_batch, batch_shape) + (f"i{batch_rank}", "k"))
+        right_map = (_broadcast_map(right_batch, batch_shape) + ("k",) if right_vector else
+                     _broadcast_map(right_batch, batch_shape) + ("k", f"i{batch_rank + 1}"))
+        if output_shape != expected_shape:
+            raise CudaBodyError(node_id, "matmul output shape differs from broadcast matrix dimensions")
+        require_map(0, left_map)
+        require_map(1, right_map)
         beta, alpha = 0.0, 1.0
     elif name == "bmm":
         if len(shapes) != 2 or len(shapes[0]) != 3 or len(shapes[1]) != 3 or len(output_shape) != 3:
@@ -526,6 +630,120 @@ def _emit_contraction(operation: IndexedOp, values: Mapping[str, IndexedValue],
     return CudaBody(source, entry, input_types, output_type, _numel(output_shape), "contraction", node_id)
 
 
+def _emit_cat_stack(operation: IndexedOp, values: Mapping[str, IndexedValue],
+                    output: IndexedValue, output_shape: tuple[int, ...], node_id: str) -> CudaBody:
+    name = _operator(operation)
+    contract = operation.attributes.get("tensor_construct")
+    if (name not in {"cat", "stack"} or not isinstance(contract, Mapping) or
+            contract.get("operator") != name or not operation.inputs or
+            len(operation.input_index_maps) != len(operation.inputs)):
+        raise CudaBodyError(node_id, "cat/stack has no exact tensor construction contract")
+    sources = [values[value_id] for value_id in operation.inputs]
+    shapes = [_static_shape(value, node_id) for value in sources]
+    input_types = tuple(_dtype(value, node_id) for value in sources)
+    output_type = _dtype(output, node_id)
+    if (any(item != output_type for item in input_types) or output.non_overlapping is not True or
+            not isinstance(contract.get("dimension"), int) or
+            not isinstance(contract.get("segments"), (tuple, list)) or
+            len(contract["segments"]) != len(sources)):
+        raise CudaBodyError(node_id, "cat/stack requires equal dtypes, disjoint output, and a valid dimension")
+
+    dimension = contract["dimension"]
+    segments = tuple(contract["segments"])
+    if any(not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in segments):
+        raise CudaBodyError(node_id, "cat/stack segment sizes must be non-negative constants")
+    expected_maps = []
+    if name == "cat":
+        if not output_shape or not 0 <= dimension < len(output_shape):
+            raise CudaBodyError(node_id, "cat dimension is outside the output rank")
+        normalized_shapes = []
+        for shape in shapes:
+            if shape == (0,) and len(shape) != len(output_shape):
+                normalized_shapes.append(None)
+            elif len(shape) == len(output_shape):
+                normalized_shapes.append(shape)
+            else:
+                raise CudaBodyError(node_id, "cat input rank differs from the output rank")
+        nonempty = [shape for shape in normalized_shapes if shape is not None]
+        if not nonempty and output_shape != (0,):
+            raise CudaBodyError(node_id, "all-empty cat must produce an empty vector")
+        if nonempty and any(any(shape[axis] != nonempty[0][axis]
+                                for axis in range(len(output_shape)) if axis != dimension)
+                            for shape in nonempty[1:]):
+            raise CudaBodyError(node_id, "cat non-concatenated dimensions differ")
+        exact_segments = tuple(0 if shape is None else shape[dimension] for shape in normalized_shapes)
+        expected_shape = list(nonempty[0] if nonempty else (0,))
+        expected_shape[dimension] = sum(exact_segments)
+        if tuple(expected_shape) != output_shape or segments != exact_segments:
+            raise CudaBodyError(node_id, "cat output shape or segment proof is inconsistent")
+        offset = 0
+        for value_id, shape, size in zip(operation.inputs, normalized_shapes, exact_segments):
+            if shape is None:
+                expected_maps.append(InputIndexMap(value_id, ("0",), "empty_cat"))
+            else:
+                expressions = [f"i{axis}" for axis in range(len(output_shape))]
+                expressions[dimension] = f"i{dimension}-{offset}" if offset else f"i{dimension}"
+                expected_maps.append(InputIndexMap(value_id, tuple(expressions), "cat"))
+            offset += size
+    else:
+        if not output_shape or not 0 <= dimension < len(output_shape):
+            raise CudaBodyError(node_id, "stack dimension is outside the output rank")
+        if any(len(shape) != len(output_shape) - 1 or shape != shapes[0] for shape in shapes):
+            raise CudaBodyError(node_id, "stack inputs must have identical shapes one rank below the output")
+        expected_shape = list(shapes[0])
+        expected_shape.insert(dimension, len(sources))
+        if tuple(expected_shape) != output_shape or segments != (1,) * len(sources):
+            raise CudaBodyError(node_id, "stack output shape or segment proof is inconsistent")
+        expected_maps = [InputIndexMap(
+            value_id, tuple(f"i{axis if axis < dimension else axis + 1}"
+                            for axis in range(len(output_shape) - 1)), "stack"
+        ) for value_id in operation.inputs]
+    if tuple(expected_maps) != operation.input_index_maps:
+        raise CudaBodyError(node_id, "cat/stack input maps do not match their exact source regions")
+
+    entry = f"{_name(operation)}_tile"
+    lines = _coordinates(output_shape) if _numel(output_shape) else []
+    if _numel(output_shape) and name == "cat":
+        start = 0
+        branches = 0
+        for index, size in enumerate(segments):
+            end = start + size
+            if size:
+                condition = f"idx[{dimension}] >= {start} && idx[{dimension}] < {end}"
+                lines.append(("if" if branches == 0 else "else if") + f" ({condition}) {{")
+                coordinates = [f"idx[{axis}]" for axis in range(len(output_shape))]
+                coordinates[dimension] = f"idx[{dimension}] - {start}"
+                offset = " + ".join(
+                    f"({coordinate})*{stride}"
+                    for coordinate, stride in zip(coordinates, sources[index].strides) if stride
+                ) or "0"
+                lines.append(f"  out[{_output_offset(output, output_shape, node_id)}] = in{index}[{offset}];")
+                lines.append("}")
+                branches += 1
+            start = end
+        if branches:
+            lines.append("else { continue; }")
+    elif _numel(output_shape):
+        branches = 0
+        for index, source in enumerate(sources):
+            lines.append(("if" if branches == 0 else "else if") + f" (idx[{dimension}] == {index}) {{")
+            source_axes = [axis for axis in range(len(output_shape)) if axis != dimension]
+            offset = " + ".join(
+                f"idx[{output_axis}]*{stride}"
+                for output_axis, stride in zip(source_axes, source.strides) if stride
+            ) or "0"
+            lines.append(f"  out[{_output_offset(output, output_shape, node_id)}] = in{index}[{offset}];")
+            lines.append("}")
+            branches += 1
+        if branches:
+            lines.append("else { continue; }")
+    source = "#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <cuda_bf16.h>\n#include <stdint.h>\n" + _body_loop(
+        entry, _pointer_arguments(input_types, output_type), _numel(output_shape), lines
+    )
+    return CudaBody(source, entry, input_types, output_type, _numel(output_shape),
+                    "tensor_construct", node_id)
+
+
 def _emit_index_select(operation: IndexedOp, values: Mapping[str, IndexedValue],
                        output: IndexedValue, output_shape: tuple[int, ...], node_id: str) -> CudaBody:
     if len(operation.inputs) != 2 or len(operation.input_index_maps) != 2:
@@ -561,6 +779,162 @@ def _emit_index_select(operation: IndexedOp, values: Mapping[str, IndexedValue],
                     _numel(output_shape), "gather", node_id, dict(bounds))
 
 
+def _emit_constructor(operation: IndexedOp, values: Mapping[str, IndexedValue],
+                      output: IndexedValue, output_shape: tuple[int, ...], node_id: str) -> CudaBody:
+    contract = operation.attributes.get("constructor")
+    name = _operator(operation)
+    if not isinstance(contract, Mapping) or contract.get("operator") != name:
+        raise CudaBodyError(node_id, "constructor has no exact static output contract")
+    output_type = _dtype(output, node_id)
+    if output.non_overlapping is not True or tuple(contract.get("shape", output_shape)) != output_shape:
+        raise CudaBodyError(node_id, "constructor output ownership or shape differs from its proof")
+    inputs = [values[value_id] for value_id in operation.inputs]
+    input_types = tuple(_dtype(value, node_id) for value in inputs)
+    if (name == "new_ones" and len(inputs) != 1) or (name != "new_ones" and inputs):
+        raise CudaBodyError(node_id, "constructor input metadata differs from its exact operator form")
+    if name == "arange":
+        start, stop, step = contract.get("start"), contract.get("stop"), contract.get("step")
+        if (len(output_shape) != 1 or output_type not in {"int32_t", "int64_t"} or
+                not all(isinstance(value, int) and not isinstance(value, bool)
+                        for value in (start, stop, step)) or step == 0 or
+                len(range(start, stop, step)) != output_shape[0]):
+            raise CudaBodyError(node_id, "arange bounds do not match its dense integer output")
+        expression = f"({start} + linear * {step})"
+        lines = [f"out[linear] = static_cast<{output_type}>({expression});"]
+    elif name in {"ones", "new_ones"}:
+        if contract.get("fill") != 1 or output_type not in {"bool", "int32_t", "int64_t", "float", "__half", "__nv_bfloat16"}:
+            raise CudaBodyError(node_id, "ones constructor has an unsupported value or dtype")
+        lines = _coordinates(output_shape)
+        lines.append(f"out[{_output_offset(output, output_shape, node_id)}] = {_helpers_store_one(output_type)};")
+    else:
+        raise CudaBodyError(node_id, f"constructor {name!r} has no CUDA body")
+    prefix, entry = _name(operation), f"{_name(operation)}_tile"
+    # Constructor bodies intentionally consume metadata-only new_ones inputs so
+    # the worker ABI still preserves the FX dependency and device provenance.
+    source = _helpers(prefix) + _body_loop(
+        entry, _pointer_arguments(input_types, output_type), _numel(output_shape), lines
+    )
+    return CudaBody(source, entry, input_types, output_type, _numel(output_shape),
+                    "constructor", node_id, dict(contract))
+
+
+def _helpers_store_one(dtype: str) -> str:
+    return {"bool": "true", "int32_t": "1", "int64_t": "1", "float": "1.0f",
+            "__half": "__float2half_rn(1.0f)",
+            "__nv_bfloat16": "__float2bfloat16_rn(1.0f)"}.get(dtype, "1")
+
+
+def _emit_copy(operation: IndexedOp, values: Mapping[str, IndexedValue],
+               output: IndexedValue, output_shape: tuple[int, ...], node_id: str) -> CudaBody:
+    if len(operation.inputs) != 1 or len(operation.input_index_maps) != 1:
+        raise CudaBodyError(node_id, "copy requires one exact source map")
+    source = values[operation.inputs[0]]
+    source_shape = _static_shape(source, node_id)
+    source_type, output_type = _dtype(source, node_id), _dtype(output, node_id)
+    expected = InputIndexMap(operation.inputs[0], tuple(f"i{axis}" for axis in range(len(output_shape))), "copy")
+    if (source_shape != output_shape or source_type != output_type or
+            operation.input_index_maps[0] != expected or output.alias_kind != "fresh" or
+            output.non_overlapping is not True):
+        raise CudaBodyError(node_id, "copy shape, dtype, map, or output ownership differs from its proof")
+    prefix, entry = _name(operation), f"{_name(operation)}_tile"
+    lines = _coordinates(output_shape)
+    source_offset = _input_offset(expected, source, output_shape, node_id)
+    lines.append(f"out[{_output_offset(output, output_shape, node_id)}] = in0[{source_offset}];")
+    source_code = _helpers(prefix) + _body_loop(
+        entry, _pointer_arguments((source_type,), output_type), _numel(output_shape), lines
+    )
+    return CudaBody(source_code, entry, (source_type,), output_type, _numel(output_shape),
+                    "copy", node_id)
+
+
+def _emit_advanced_index(operation: IndexedOp, values: Mapping[str, IndexedValue],
+                         output: IndexedValue, output_shape: tuple[int, ...], node_id: str) -> CudaBody:
+    contract = operation.attributes.get("advanced_index")
+    if (not isinstance(contract, Mapping) or len(operation.inputs) != 3 or
+            len(operation.input_index_maps) != 3):
+        raise CudaBodyError(node_id, "advanced index requires its exact bounded two-axis proof")
+    base, row_index, column_index = (values[value_id] for value_id in operation.inputs)
+    base_shape = _static_shape(base, node_id)
+    row_shape, column_shape = _static_shape(row_index, node_id), _static_shape(column_index, node_id)
+    input_types = tuple(_dtype(value, node_id) for value in (base, row_index, column_index))
+    output_type = _dtype(output, node_id)
+    if (tuple(contract.get("base_shape", ())) != base_shape or
+            tuple(contract.get("output_shape", ())) != output_shape or len(base_shape) != 2 or
+            input_types[1:] not in {("int32_t", "int32_t"), ("int64_t", "int64_t"),
+                                    ("int32_t", "int64_t"), ("int64_t", "int32_t")} or
+            output_type != input_types[0] or output.alias_kind != "fresh" or
+            output.non_overlapping is not True):
+        raise CudaBodyError(node_id, "advanced index base, output, indices, or ownership differ from its proof")
+    expected_maps = [InputIndexMap(
+        operation.inputs[0], tuple(contract["base_axis_expressions"]), "advanced_index")
+    ]
+    for value_id, shape in zip(operation.inputs[1:], (row_shape, column_shape)):
+        padded = (1,) * (len(output_shape) - len(shape)) + shape
+        expected_maps.append(InputIndexMap(
+            value_id, tuple("0" if size == 1 else f"i{axis}"
+                            for axis, size in enumerate(padded)), "advanced_index_value"
+        ))
+    if tuple(expected_maps) != operation.input_index_maps:
+        raise CudaBodyError(node_id, "advanced index tensors do not match the exact output-axis maps")
+    prefix, entry = _name(operation), f"{_name(operation)}_tile"
+    lines = _coordinates(output_shape)
+    row_offset = _input_offset(operation.input_index_maps[1], row_index, output_shape, node_id)
+    column_offset = _input_offset(operation.input_index_maps[2], column_index, output_shape, node_id)
+    lines.append(f"const int64_t row = static_cast<int64_t>(in1[{row_offset}]);")
+    lines.append(f"const int64_t column = static_cast<int64_t>(in2[{column_offset}]);")
+    lines.append(f"if (row < 0 || row >= {base_shape[0]} || column < 0 || column >= {base_shape[1]}) return;")
+    base_offset = f"row * {base.strides[0]} + column * {base.strides[1]}"
+    lines.append(f"const float value = {prefix}_load(in0, {base_offset});")
+    lines.append(f"out[{_output_offset(output, output_shape, node_id)}] = {prefix}_store(value, ({output_type}*)0);")
+    source = _helpers(prefix) + _body_loop(
+        entry, _pointer_arguments(input_types, output_type), _numel(output_shape), lines
+    )
+    return CudaBody(source, entry, input_types, output_type, _numel(output_shape),
+                    "advanced_index", node_id, dict(contract))
+
+
+def _emit_embedding(operation: IndexedOp, values: Mapping[str, IndexedValue],
+                    output: IndexedValue, output_shape: tuple[int, ...], node_id: str) -> CudaBody:
+    contract = operation.attributes.get("embedding")
+    if (not isinstance(contract, Mapping) or len(operation.inputs) != 2 or
+            len(operation.input_index_maps) != 2):
+        raise CudaBodyError(node_id, "embedding requires an exact weight, index, and output contract")
+    weight, indices = (values[value_id] for value_id in operation.inputs)
+    weight_shape, index_shape = _static_shape(weight, node_id), _static_shape(indices, node_id)
+    weight_type, index_type, output_type = (
+        _dtype(weight, node_id), _dtype(indices, node_id), _dtype(output, node_id)
+    )
+    if (len(weight_shape) != 2 or output_shape != index_shape + (weight_shape[1],) or
+            contract.get("vocabulary") != weight_shape[0] or
+            contract.get("embedding_dim") != weight_shape[1]):
+        raise CudaBodyError(node_id, "embedding dimensions differ from its proof")
+    bounds = operation.attributes.get("index_bounds")
+    expected_maps = (
+        InputIndexMap(operation.inputs[0], ("index[" + ",".join(f"i{axis}" for axis in range(len(index_shape))) + "]",
+                                             f"i{len(index_shape)}"), "embedding"),
+        InputIndexMap(operation.inputs[1], tuple(f"i{axis}" for axis in range(len(index_shape))), "embedding_index"),
+    )
+    if (weight_type != output_type or index_type not in {"int32_t", "int64_t"} or
+            tuple(expected_maps) != operation.input_index_maps or not isinstance(bounds, Mapping) or
+            bounds.get("upper_exclusive") != weight_shape[0] or
+            output.alias_kind != "fresh" or output.non_overlapping is not True):
+        raise CudaBodyError(node_id, "embedding index map, dtype, bounds, or output ownership differ from its proof")
+    prefix, entry = _name(operation), f"{_name(operation)}_tile"
+    lines = _coordinates(output_shape)
+    index_offset = " + ".join(f"idx[{axis}]*{stride}"
+                               for axis, stride in enumerate(indices.strides)) or "0"
+    lines.append(f"const int64_t token = static_cast<int64_t>(in1[{index_offset}]);")
+    lines.append(f"if (token < 0 || token >= {weight_shape[0]}) return;")
+    weight_offset = f"token * {weight.strides[0]} + idx[{len(index_shape)}] * {weight.strides[1]}"
+    lines.append(f"const float value = {prefix}_load(in0, {weight_offset});")
+    lines.append(f"out[{_output_offset(output, output_shape, node_id)}] = {prefix}_store(value, ({output_type}*)0);")
+    source = _helpers(prefix) + _body_loop(
+        entry, _pointer_arguments((weight_type, index_type), output_type), _numel(output_shape), lines
+    )
+    return CudaBody(source, entry, (weight_type, index_type), output_type,
+                    _numel(output_shape), "embedding", node_id, dict(bounds))
+
+
 def _emit_index_copy(operation: IndexedOp, values: Mapping[str, IndexedValue],
                      output: IndexedValue, output_shape: tuple[int, ...], node_id: str) -> CudaBody:
     if len(operation.inputs) != 3 or len(operation.input_index_maps) != 3:
@@ -577,11 +951,16 @@ def _emit_index_copy(operation: IndexedOp, values: Mapping[str, IndexedValue],
     dim = dim + len(old_shape) if isinstance(dim, int) and dim < 0 else dim
     bounds = operation.attributes.get("index_bounds")
     transition = operation.attributes.get("state_transition")
+    alias_rule = transition.get("alias_rule") if isinstance(transition, Mapping) else None
+    transition_writers = transition.get("writer_values", ()) if isinstance(transition, Mapping) else ()
+    transition_owns_output = (alias_rule == "functional_new_value" or
+                              alias_rule == "functional_grouped_new_value" and
+                              output.value_id in transition_writers)
     if (not isinstance(dim, int) or not 0 <= dim < len(old_shape) or output_shape != old_shape or
             index_shape != (1,) or update_shape != old_shape[:dim] + (1,) + old_shape[dim + 1:] or
             old_type != output_type or update_type != output_type or index_type not in {"int32_t", "int64_t"} or
             not isinstance(bounds, Mapping) or bounds.get("upper_exclusive") != old_shape[dim] or
-            not isinstance(transition, Mapping) or transition.get("alias_rule") != "functional_new_value"):
+            not isinstance(transition, Mapping) or not transition_owns_output):
         raise CudaBodyError(node_id, "index_copy lacks an exact functional append and bounds contract")
     prefix = _name(operation)
     entry = f"{prefix}_tile"
@@ -761,6 +1140,16 @@ def emit_cuda_body(program: Any, operation: IndexedOp | str) -> CudaBody:
         return _emit_reduce(operation, values, output, output_shape, node_id)
     if operation.kind == "Contraction":
         return _emit_contraction(operation, values, output, output_shape, node_id)
+    if operation.kind == "Cat/Stack":
+        return _emit_cat_stack(operation, values, output, output_shape, node_id)
+    if operation.kind == "Constructor":
+        return _emit_constructor(operation, values, output, output_shape, node_id)
+    if operation.kind == "Copy":
+        return _emit_copy(operation, values, output, output_shape, node_id)
+    if operation.kind == "Gather" and _operator(operation) == "index":
+        return _emit_advanced_index(operation, values, output, output_shape, node_id)
+    if operation.kind == "Gather" and _operator(operation) == "embedding":
+        return _emit_embedding(operation, values, output, output_shape, node_id)
     if operation.kind == "Gather" and _operator(operation) == "index_select":
         return _emit_index_select(operation, values, output, output_shape, node_id)
     if operation.kind == "Scatter/StateWrite" and _operator(operation) == "index_copy":

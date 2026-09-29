@@ -1,5 +1,6 @@
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -7,6 +8,7 @@ import torch.nn.functional as F
 from megabake.v3.algorithms import choice_guard_failures, enumerate_algorithm_choices, recover_repeat_region
 from megabake.v3.frontend.normalize import normalize_fx
 from megabake.v3.frontend.semantic import index_program
+from megabake.v3.semantics.indexed import IndexedTensorProgram
 from megabake.v3.semantics.verify import verify_algorithm_choice_cover
 from tests.test_v3.cpu.test_repeat import _two_layer_step
 
@@ -22,6 +24,31 @@ def _indexed(module, args):
     exported = torch.export.export(module, args)
     program = normalize_fx(exported, input_spec={})
     return program, index_program(program)
+
+
+def test_choice_enumeration_hashes_the_full_program_once_and_keeps_snapshot_hashes():
+    class RepeatedPointwise(torch.nn.Module):
+        def forward(self, x):
+            for _ in range(12):
+                x = torch.ops.aten.add.Tensor(x, x)
+            return x
+
+    _, indexed = _indexed(RepeatedPointwise(), (torch.ones((4,)),))
+    original_hash = IndexedTensorProgram.structural_hash.fget
+    expected_hash = original_hash(indexed)
+    count = 0
+
+    def counted_hash(program):
+        nonlocal count
+        count += 1
+        return original_hash(program)
+
+    with patch.object(IndexedTensorProgram, "structural_hash", property(counted_hash)):
+        choices = enumerate_algorithm_choices(indexed)
+
+    assert count == 1
+    assert len(choices) >= 12
+    assert all(item.guards["indexed_program_hash"] == expected_hash for item in choices)
 
 
 def test_projection_choices_keep_indexed_reference_and_require_numerical_permission():

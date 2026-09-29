@@ -118,6 +118,7 @@ def attention_abi(inputs, *, declare_rotary_bounds=True):
             "strides": {name: list(value.stride()) for name, value in zip(names, inputs)},
             "dtypes": {name: str(value.dtype).removeprefix("torch.") for name, value in zip(names, inputs)},
             "capacity": {"cache_k": capacity, "cache_v": capacity},
+            "position": {"source": "position", "specialized": int(inputs[5].item())},
             "features": ["aten.index_copy", "aten.scaled_dot_product_attention"],
             "numerical_policy_hash": attention_policy(inputs[0].dtype).contract_hash,
             **({"index_bounds": {"rope_index": [0, 8]}}

@@ -123,6 +123,37 @@ def _output_leaves(value: Any, path: tuple[Any, ...] = ()) -> list[tuple[tuple[A
     return [(path, value)]
 
 
+def canonical_output_leaves(program: NormalizedProgram, value: Any) -> list[tuple[tuple[Any, ...], Any]]:
+    """Pair flattened FX output leaves with their original user-tree paths."""
+    leaves = _output_leaves(value)
+    spec = program.output_tree_spec
+    if spec is None or not hasattr(spec, "num_leaves") or spec.num_leaves != len(leaves):
+        return leaves
+    try:
+        import torch.utils._pytree as pytree
+
+        template = pytree.tree_unflatten([None] * len(leaves), spec)
+        paths, _ = pytree.tree_flatten_with_path(template)
+        if len(paths) != len(leaves):
+            return leaves
+        normalized_paths = []
+        for key_path, _ in paths:
+            path = []
+            for key in key_path:
+                if hasattr(key, "key"):
+                    path.append(str(key.key))
+                elif hasattr(key, "idx"):
+                    path.append(key.idx)
+                elif hasattr(key, "name"):
+                    path.append(key.name)
+                else:
+                    return leaves
+            normalized_paths.append(tuple(path))
+        return [(path, leaf) for path, (_, leaf) in zip(normalized_paths, leaves)]
+    except (ImportError, TypeError, ValueError):
+        return leaves
+
+
 def seed_origins(program: NormalizedProgram, source_graph_module: Any | None = None) -> NormalizedProgram:
     """Attach stable capture IDs before any rewrite and retain output paths."""
     graph_module = program.graph_module
@@ -147,7 +178,7 @@ def seed_origins(program: NormalizedProgram, source_graph_module: Any | None = N
     output_node = next((node for node in reversed(source_nodes) if node.op == "output"), None)
     output_origins = {}
     if output_node is not None and output_node.args:
-        for path, _ in _output_leaves(output_node.args[0]):
+        for path, _ in canonical_output_leaves(program, output_node.args[0]):
             path_key = json.dumps(path, separators=(",", ":"), default=str)
             output_origins[path_key] = f"fx:{capture_id}:output:{path_key}"
     return replace(
@@ -158,6 +189,139 @@ def seed_origins(program: NormalizedProgram, source_graph_module: Any | None = N
         origin_history={origin_id: (name,) for name, origin_id in source_ids.items()},
         output_origins=output_origins,
     )
+
+
+def inline_grad_disabled_regions(program: NormalizedProgram) -> NormalizedProgram:
+    """Inline inference-only FX wrappers while keeping source origins executable."""
+    abi = program.step_abi
+    features = abi.guard_set.get("features", ()) if abi is not None else ()
+    if "inference_only" not in features:
+        return program
+    source = program.graph_module
+    wrappers = [node for node in source.graph.nodes
+                if node.op == "call_function" and
+                "wrap_with_set_grad_enabled" in str(node.target)]
+    if not wrappers:
+        return program
+
+    import torch
+    from torch.fx.node import map_arg
+
+    plans = {}
+    consumed_submodules = set()
+    for wrapper in wrappers:
+        if len(wrapper.args) < 3 or wrapper.args[0] is not False:
+            return program
+        submodule_arg = wrapper.args[1]
+        if getattr(submodule_arg, "op", None) == "get_attr":
+            if any(user is not wrapper for user in submodule_arg.users):
+                return program
+            try:
+                subgraph = program.graph_module.get_submodule(str(submodule_arg.target))
+            except (AttributeError, KeyError):
+                return program
+            consumed_submodules.add(submodule_arg)
+        else:
+            subgraph = submodule_arg
+        if not hasattr(subgraph, "graph"):
+            return program
+        child_nodes = tuple(subgraph.graph.nodes)
+        placeholders = tuple(node for node in child_nodes if node.op == "placeholder")
+        outputs = tuple(node for node in child_nodes if node.op == "output")
+        if (len(outputs) != 1 or len(placeholders) != len(wrapper.args[2:]) or
+                any(node.op not in {"placeholder", "output", "call_function", "call_method"}
+                    for node in child_nodes)):
+            return program
+        for node in child_nodes:
+            schema = getattr(node.target, "_schema", None)
+            if schema is not None and any(
+                    getattr(getattr(argument, "alias_info", None), "is_write", False)
+                    for argument in schema.arguments):
+                return program
+        child_output = outputs[0].args[0]
+        users = tuple(wrapper.users)
+        if not users or any(
+                user.op != "call_function" or getattr(user.target, "__name__", "") != "getitem" or
+                len(user.args) != 2 or user.args[0] is not wrapper or
+                not isinstance(user.args[1], int) or not isinstance(child_output, (tuple, list)) or
+                not 0 <= user.args[1] < len(child_output) or
+                not hasattr(child_output[user.args[1]], "op")
+                for user in users):
+            return program
+        plans[wrapper] = (subgraph, submodule_arg, placeholders, child_nodes, child_output, users)
+
+    graph = torch.fx.Graph()
+    env: dict[Any, Any] = {}
+    wrapper_values: dict[Any, Any] = {}
+    origin_map: dict[str, tuple[str, ...]] = {}
+    origin_history = dict(program.origin_history)
+    origin_lineage = dict(program.origin_lineage)
+    for node in source.graph.nodes:
+        if node in plans:
+            subgraph, submodule_arg, placeholders, child_nodes, child_output, users = plans[node]
+            child_env = {
+                placeholder: map_arg(argument, lambda item: env[item])
+                for placeholder, argument in zip(placeholders, node.args[2:])
+            }
+            wrapper_origins = tuple(program.origin_map.get(node.name, ()))
+            submodule_origins = tuple(program.origin_map.get(
+                getattr(submodule_arg, "name", ""), ()
+            ))
+            region_origins = wrapper_origins + submodule_origins
+            child_names = []
+            for child_index, child in enumerate(child_nodes):
+                if child.op in {"placeholder", "output"}:
+                    continue
+                args = map_arg(child.args, lambda item: child_env[item])
+                kwargs = map_arg(child.kwargs, lambda item: child_env[item])
+                clone = graph.create_node(
+                    child.op, child.target, args, kwargs,
+                    name=f"{node.name}__{child.name}", type_expr=child.type,
+                )
+                clone.meta = dict(child.meta)
+                child_env[child] = clone
+                child_names.append(clone.name)
+                origin_id = "fx-region:" + hashlib.sha256(json.dumps(
+                    [wrapper_origins, child_index, child.op, _stable_target(child.target)],
+                    sort_keys=True, separators=(",", ":"), default=str,
+                ).encode()).hexdigest()
+                origin_map[clone.name] = (origin_id,)
+                origin_lineage[origin_id] = region_origins
+            wrapper_values[node] = map_arg(child_output, lambda item: child_env[item])
+            for origin_id in region_origins:
+                origin_history[origin_id] = tuple(child_names)
+            for user in users:
+                selected = wrapper_values[node][user.args[1]]
+                env[user] = selected
+                for origin_id in program.origin_map.get(user.name, ()):
+                    origin_history[origin_id] = (selected.name,)
+                    origin_map[selected.name] = tuple(dict.fromkeys(
+                        origin_map.get(selected.name, ()) + (origin_id,)
+                    ))
+                    origin_lineage[origin_id] = region_origins
+            continue
+        if (node.op == "call_function" and getattr(node.target, "__name__", "") == "getitem" and
+                node.args and node.args[0] in wrapper_values):
+            continue
+        if node in consumed_submodules:
+            continue
+        clone = graph.node_copy(node, lambda item: env[item])
+        clone.meta = dict(node.meta)
+        env[node] = clone
+        origins = tuple(program.origin_map.get(node.name, ()))
+        if origins:
+            origin_map[clone.name] = origins
+
+    module = torch.fx.GraphModule(source, graph)
+    module.graph.lint()
+    module.recompile()
+    program.graph_module = module
+    program.value_ids = _value_ids(module)
+    program.origin_map = origin_map
+    program.origin_history = origin_history
+    program.origin_lineage = origin_lineage
+    program.normalization_path += "+inline_grad_disabled"
+    return program
 
 
 def _fx_value(value: Any) -> Any:

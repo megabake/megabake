@@ -14,7 +14,7 @@ _DTYPE_BYTES = {
     "float8_e4m3fn": 1, "float8_e5m2": 1, "int8": 1, "uint8": 1,
     "int16": 2, "int32": 4, "int64": 8, "bool": 1,
 }
-_ALIAS_VIEWS = {"view", "as_strided", "transpose", "permute", "t", "slice", "select", "squeeze", "unsqueeze", "expand", "detach", "alias"}
+_ALIAS_VIEWS = {"view", "as_strided", "transpose", "permute", "t", "slice", "select", "squeeze", "unsqueeze", "expand", "detach", "detach_", "alias"}
 
 
 class FactError(FrontendError):
@@ -180,8 +180,7 @@ def collect_facts(program: NormalizedProgram) -> FactTable:
                            else _reshape_strides(source_fact.shape, source_fact.strides, new_shape) if source_fact else None)
             if new_strides is not None:
                 alias, alias_kind = aliases.get(source.name, (None, "unknown"))[0], "view"
-            elif (source_fact is not None and source_fact.non_overlapping is True
-                  and _concrete_shape(source_fact.shape) and _concrete_shape(new_shape)
+            elif (source_fact is not None and _concrete_shape(source_fact.shape) and _concrete_shape(new_shape)
                   and _numel(source_fact.shape) and _numel(new_shape)):
                 alias, alias_kind = f"storage:{value_id}", "copy"
             else:
@@ -273,8 +272,6 @@ def _reshape_strides(old_shape: tuple[Any, ...], old_strides: tuple[int, ...],
             stride *= dim
         return tuple(reversed(result))
     if old_numel == 0:
-        return None
-    if any(stride == 0 for stride in old_strides):
         return None
     chunks: list[tuple[int, int]] = []
     index = len(old_shape) - 1
