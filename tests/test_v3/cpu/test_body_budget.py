@@ -150,13 +150,120 @@ def test_v3r009_provider_comparison_includes_fastest_same_shape_compile_control(
         "standalone": {"median_gpu_event_us": 0.9, "raw_gpu_event_us": [0.8, 1.0]},
         "owner_entry": {"median_gpu_event_us": 1.0, "raw_gpu_event_us": [0.9, 1.1]},
         "owner_rejection": None,
+        "cutlass_4_5_2_cuda13": {
+            "status": "correct_standalone_and_owner",
+            "active_store_canaries_intact": True,
+            "standalone": {"median_gpu_event_us": 0.8,
+                           "raw_gpu_event_us": [0.7, 0.9]},
+            "owner_entry": {"median_gpu_event_us": 0.9,
+                            "raw_gpu_event_us": [0.8, 1.0]},
+        },
+        "cutlass_cute_collective_4_5_2_cuda13": {
+            "status": "correct_standalone_and_owner",
+            "active_store_canaries_intact": True,
+            "standalone": {"median_gpu_event_us": 0.85,
+                           "raw_gpu_event_us": [0.8, 0.9]},
+            "owner_entry": {"median_gpu_event_us": 0.95,
+                            "raw_gpu_event_us": [0.9, 1.0]},
+        },
         "torch_addmm_control": {"median_gpu_event_us": 2.0, "raw_gpu_event_us": [1.9, 2.1]},
+        "cublaslt_baseline": {
+            "shape": [1, 17, 33], "dtype": "float16", "algorithm_id": 66,
+            "measurement": {
+                "median_gpu_event_us": 0.75, "raw_gpu_event_us": [0.7, 0.8],
+            },
+        },
+        "cublasdx": {
+            "status": "rejected_candidate", "status_code": 9,
+            "reason": "M=1 is not divisible by tile_m=16",
+        },
     }]}
     report = build_budget(baseline, inventory, simt, mma, provider_report=provider)
     row = report["provider_body_comparisons"][0]
     assert row["fastest_direct_torch_compile_control"]["mode"] == "default"
     assert row["fastest_direct_torch_compile_control"]["raw_gpu_event_us"] == [1.4, 1.6]
     assert row["owner_to_fastest_direct_torch_compile_gpu_event_ratio"] == pytest.approx(2 / 3)
+    assert row["owner_to_cublaslt_gpu_event_ratio"] == pytest.approx(4 / 3)
+    assert row["cutlass_4_5_2_owner_to_cublaslt_gpu_event_ratio"] == pytest.approx(1.2)
+    assert row["cutlass_cute_collective_owner_to_cublaslt_gpu_event_ratio"] == pytest.approx(0.95 / 0.75)
+    assert row["cublasdx_hot_shape"]["status_code"] == 9
+    cutlass_decision = next(
+        item for item in report["candidate_assessment"]
+        if item["candidate"] == "V3R-008 CUTLASS 3.8 callable body"
+    )
+    assert cutlass_decision["status"] == "no_consistent_body_win_over_direct_cublasLt"
+    cutlass452_decision = next(
+        item for item in report["candidate_assessment"]
+        if item["candidate"] == "V3R-008 CUTLASS 4.5.2 callable body under CUDA 13"
+    )
+    assert cutlass452_decision["status"] == "no_consistent_body_win_over_direct_cublasLt"
+    cute_decision = next(
+        item for item in report["candidate_assessment"]
+        if item["candidate"] == "V3R-008 CUTLASS 4.5.2 CuTe collective under CUDA 13"
+    )
+    assert cute_decision["status"] == "no_consistent_body_win_over_direct_cublasLt"
+
+
+def test_v3r009_rejects_bad_cuda13_cutlass_samples():
+    baseline, inventory, simt, mma = evidence()
+    provider = {"cases": [{
+        "shape": [1, 17, 33], "owner_entry": None,
+        "cutlass_4_5_2_cuda13": {
+            "active_store_canaries_intact": True,
+            "standalone": {"median_gpu_event_us": 1.0,
+                           "raw_gpu_event_us": []},
+            "owner_entry": None,
+        },
+    }]}
+    with pytest.raises(ValueError, match="raw samples"):
+        build_budget(baseline, inventory, simt, mma, provider_report=provider)
+
+
+def test_v3r009_rejects_bad_cuda13_cute_collective_samples():
+    baseline, inventory, simt, mma = evidence()
+    provider = {"cases": [{
+        "shape": [1, 17, 33], "owner_entry": None,
+        "cutlass_cute_collective_4_5_2_cuda13": {
+            "active_store_canaries_intact": True,
+            "standalone": {"median_gpu_event_us": 1.0,
+                           "raw_gpu_event_us": []},
+            "owner_entry": None,
+        },
+    }]}
+    with pytest.raises(ValueError, match="raw samples"):
+        build_budget(baseline, inventory, simt, mma, provider_report=provider)
+
+
+def test_v3r009_records_cublasdx_smoke_without_promoting_it_to_a_hot_shape():
+    baseline, inventory, simt, mma = evidence()
+    provider = {"cases": [], "cublasdx": {"positive_synthetic_case": {
+        "shape": [16, 64, 64], "status": "compatible_synthetic_tile_only",
+        "resources": {"registers_per_thread": 68, "local_bytes": 0},
+        "grid_ctas": 1,
+        "standalone": {"median_gpu_event_us": 8.0, "raw_gpu_event_us": [7.9, 8.1]},
+        "owner_entry": {"median_gpu_event_us": 8.1, "raw_gpu_event_us": [8.0, 8.2]},
+        "cublaslt_external_control": {
+            "median_gpu_event_us": 10.0, "raw_gpu_event_us": [9.9, 10.1],
+        },
+        "qualification": "Synthetic case only.",
+    }}}
+    report = build_budget(baseline, inventory, simt, mma, provider_report=provider)
+    assert report["provider_smoke_comparisons"][0]["shape"] == [16, 64, 64]
+    assert report["provider_smoke_comparisons"][0]["owner_to_cublaslt_gpu_event_ratio"] == pytest.approx(0.81)
+    assert report["provider_body_comparisons"] == []
+
+
+def test_v3r009_rejects_bad_direct_cublaslt_samples():
+    baseline, inventory, simt, mma = evidence()
+    provider = {"cases": [{
+        "shape": [1, 17, 33], "owner_entry": None,
+        "cublaslt_baseline": {
+            "shape": [1, 17, 33], "dtype": "float16",
+            "measurement": {"median_gpu_event_us": 1.0, "raw_gpu_event_us": []},
+        },
+    }]}
+    with pytest.raises(ValueError, match="raw samples"):
+        build_budget(baseline, inventory, simt, mma, provider_report=provider)
 
 
 def test_v3r009_rejects_trace_without_device_activity(tmp_path):

@@ -432,10 +432,56 @@ def build_budget(
                 compile_rows, key=lambda point: point["median_gpu_event_us"]
             ) if compile_rows else None)
             cutlass_owner = case.get("owner_entry")
+            cutlass452_case = case.get("cutlass_4_5_2_cuda13")
+            cutlass452_owner = (
+                cutlass452_case.get("owner_entry") if cutlass452_case else None
+            )
+            cute_case = case.get("cutlass_cute_collective_4_5_2_cuda13")
+            cute_owner = cute_case.get("owner_entry") if cute_case else None
+            cublaslt_case = case.get("cublaslt_baseline")
+            cublaslt = cublaslt_case.get("measurement") if cublaslt_case else None
+            cublaslt_median = None
+            if cublaslt_case:
+                if tuple(int(value) for value in cublaslt_case["shape"]) != provider_shape:
+                    raise ValueError("cuBLASLt and provider case shapes differ")
+                if cublaslt_case.get("dtype") != "float16":
+                    raise ValueError("cuBLASLt provider control must use FP16")
+                cublaslt_median, _ = _median(
+                    cublaslt, "raw_gpu_event_us", "cuBLASLt external baseline"
+                )
+            cutlass452_owner_median = None
+            if cutlass452_case:
+                if cutlass452_case.get("active_store_canaries_intact") is not True:
+                    raise ValueError("CUDA 13 CUTLASS 4.5.2 canary check did not pass")
+                _median(
+                    cutlass452_case["standalone"], "raw_gpu_event_us",
+                    "CUDA 13 CUTLASS 4.5.2 standalone body",
+                )
+                if cutlass452_owner:
+                    cutlass452_owner_median, _ = _median(
+                        cutlass452_owner, "raw_gpu_event_us",
+                        "CUDA 13 CUTLASS 4.5.2 owner body",
+                    )
+            cute_owner_median = None
+            if cute_case:
+                if cute_case.get("active_store_canaries_intact") is not True:
+                    raise ValueError("CUDA 13 CUTLASS CuTe collective canary check did not pass")
+                _median(
+                    cute_case["standalone"], "raw_gpu_event_us",
+                    "CUDA 13 CUTLASS CuTe collective standalone body",
+                )
+                if cute_owner:
+                    cute_owner_median, _ = _median(
+                        cute_owner, "raw_gpu_event_us",
+                        "CUDA 13 CUTLASS CuTe collective owner body",
+                    )
+            dx_case = case.get("cublasdx", {})
             provider_comparisons.append({
                 "shape": case.get("shape"),
                 "resources": case.get("resources"),
                 "torch_addmm_control": control,
+                "cublaslt_external_baseline": cublaslt_case,
+                "cublasdx_hot_shape": dx_case or None,
                 "standalone": case.get("standalone"),
                 "owner_entry": case.get("owner_entry"),
                 "owner_rejection": case.get("owner_rejection"),
@@ -447,6 +493,20 @@ def build_budget(
                     case["owner_entry"]["median_gpu_event_us"] /
                     control["median_gpu_event_us"]
                     if case.get("owner_entry") and control else None
+                ),
+                "owner_to_cublaslt_gpu_event_ratio": (
+                    cutlass_owner["median_gpu_event_us"] / cublaslt_median
+                    if cutlass_owner and cublaslt_median else None
+                ),
+                "cutlass_4_5_2_cuda13": cutlass452_case,
+                "cutlass_4_5_2_owner_to_cublaslt_gpu_event_ratio": (
+                    cutlass452_owner_median / cublaslt_median
+                    if cutlass452_owner_median and cublaslt_median else None
+                ),
+                "cutlass_cute_collective_4_5_2_cuda13": cute_case,
+                "cutlass_cute_collective_owner_to_cublaslt_gpu_event_ratio": (
+                    cute_owner_median / cublaslt_median
+                    if cute_owner_median and cublaslt_median else None
                 ),
                 "fastest_direct_torch_compile_control": (
                     {
@@ -468,9 +528,63 @@ def build_budget(
                     if cutlass_owner and fastest_compile else None
                 ),
                 "torch_compile_comparison_qualification": "Same-shape one-operation control; torch.compile returns a fresh output while the CUTLASS entry writes caller-provided output, so this is diagnostic and not ownership-equivalent.",
+                "cublaslt_comparison_qualification": "Direct FP16 cuBLASLt operation with reused host descriptors, matching input/output layout and preallocated output; heuristic setup is recorded separately. External operation comparison only.",
                 "measurement_scope": "direct same-buffer operation calls; not complete-step or cross-provider entry composition",
             })
     provider_owner_rows = [row for row in provider_comparisons if row["owner_entry"]]
+    cublasdx_positive = (
+        provider_report.get("cublasdx", {}).get("positive_synthetic_case")
+        if provider_report else None
+    )
+    provider_smoke_comparisons = []
+    if cublasdx_positive:
+        lt_control = cublasdx_positive["cublaslt_external_control"]
+        lt_median, _ = _median(
+            lt_control, "raw_gpu_event_us", "cuBLASLt synthetic-shape control"
+        )
+        provider_smoke_comparisons.append({
+            "candidate": "V3R-008 cuBLASDx divisible synthetic tile",
+            "shape": cublasdx_positive["shape"],
+            "status": cublasdx_positive["status"],
+            "resources": cublasdx_positive["resources"],
+            "grid_ctas": cublasdx_positive["grid_ctas"],
+            "standalone": cublasdx_positive["standalone"],
+            "owner_entry": cublasdx_positive["owner_entry"],
+            "cublaslt_external_control": lt_control,
+            "owner_to_cublaslt_gpu_event_ratio": (
+                cublasdx_positive["owner_entry"]["median_gpu_event_us"] / lt_median
+            ),
+            "qualification": cublasdx_positive["qualification"],
+        })
+    cutlass_direct_lt_rows = [
+        row for row in provider_owner_rows
+        if row.get("owner_to_cublaslt_gpu_event_ratio") is not None
+    ]
+    cutlass_direct_lt_losses = sum(
+        row["owner_to_cublaslt_gpu_event_ratio"] >= 1.0
+        for row in cutlass_direct_lt_rows
+    )
+    cutlass452_direct_lt_rows = [
+        row for row in provider_comparisons
+        if row.get("cutlass_4_5_2_owner_to_cublaslt_gpu_event_ratio") is not None
+    ]
+    cutlass452_direct_lt_losses = sum(
+        row["cutlass_4_5_2_owner_to_cublaslt_gpu_event_ratio"] >= 1.0
+        for row in cutlass452_direct_lt_rows
+    )
+    cute_direct_lt_rows = [
+        row for row in provider_comparisons
+        if row.get("cutlass_cute_collective_owner_to_cublaslt_gpu_event_ratio") is not None
+    ]
+    cute_direct_lt_losses = sum(
+        row["cutlass_cute_collective_owner_to_cublaslt_gpu_event_ratio"] >= 1.0
+        for row in cute_direct_lt_rows
+    )
+    dx_hot_rows = [row["cublasdx_hot_shape"] for row in provider_comparisons
+                   if row.get("cublasdx_hot_shape")]
+    dx_hot_rejected = bool(dx_hot_rows) and all(
+        row.get("status") == "rejected_candidate" for row in dx_hot_rows
+    )
     candidate_assessment = [
         {
             "candidate": "V3R-006 K-parallel SIMT owner",
@@ -484,8 +598,62 @@ def build_budget(
         },
         {
             "candidate": "V3R-008 CUTLASS 3.8 callable body",
-            "status": "retain_for_resident_shape_subset",
-            "evidence": f"{len(provider_owner_rows)} shapes have a correct cooperative entry whose whole tile grid fits measured residency; larger N is rejected by actual entry residency. Direct call is not a complete entry.",
+            "status": (
+                "no_consistent_body_win_over_direct_cublasLt"
+                if cutlass_direct_lt_rows else "retain_for_resident_shape_subset"
+            ),
+            "evidence": (
+                f"{len(provider_owner_rows)} shapes have correct resident cooperative entries; "
+                f"CUTLASS median GPU event is no faster than direct cuBLASLt on "
+                f"{cutlass_direct_lt_losses}/{len(cutlass_direct_lt_rows)} comparable shapes. "
+                "Keep only where fused surrounding work can pay its body cost; N=49152 is rejected by actual entry residency."
+                if cutlass_direct_lt_rows else
+                f"{len(provider_owner_rows)} shapes have a correct cooperative entry whose whole tile grid fits measured residency; larger N is rejected by actual entry residency. Direct call is not a complete entry."
+            ),
+        },
+        {
+            "candidate": "V3R-008 CUTLASS 4.5.2 callable body under CUDA 13",
+            "status": (
+                "no_consistent_body_win_over_direct_cublasLt"
+                if cutlass452_direct_lt_rows else "not_measured"
+            ),
+            "evidence": (
+                f"The selected CUDA 13/CUTLASS 4.5.2 build is numerically correct on all five standalone shapes; "
+                f"four resident cooperative-owner shapes are slower by median GPU event than direct cuBLASLt on "
+                f"{cutlass452_direct_lt_losses}/{len(cutlass452_direct_lt_rows)} comparisons. "
+                "The N=49152 owner grid exceeds measured residency. This version check used the adapted CUTLASS device::Gemm body, not a CuTe CollectiveBuilder/tile search."
+                if cutlass452_direct_lt_rows else
+                "The selected CUDA 13/CUTLASS 4.5.2 body has not been measured against direct cuBLASLt."
+            ),
+        },
+        {
+            "candidate": "V3R-008 CUTLASS 4.5.2 CuTe collective under CUDA 13",
+            "status": (
+                "no_consistent_body_win_over_direct_cublasLt"
+                if cute_direct_lt_rows else "not_measured"
+            ),
+            "evidence": (
+                f"The CuTe CollectiveBuilder body is numerically correct on all five standalone shapes; "
+                f"four resident cooperative-owner shapes are slower by median GPU event than direct cuBLASLt on "
+                f"{cute_direct_lt_losses}/{len(cute_direct_lt_rows)} comparisons. "
+                "The 768-CTA largest grid exceeds the 60-CTA measured resident limit."
+                if cute_direct_lt_rows else
+                "The selected CUDA 13 CuTe collective has not been measured against direct cuBLASLt."
+            ),
+        },
+        {
+            "candidate": "V3R-008 cuBLASDx pipelined global GEMM",
+            "status": (
+                "rejected_for_current_batch_one_hot_shapes"
+                if dx_hot_rejected else "not_measured_for_all_hot_shapes"
+            ),
+            "evidence": (
+                "The installed CUDA 13 MathDx lane compiled and ran a correct FP16 pipeline/owner on a divisible synthetic tile. "
+                f"{len(dx_hot_rows)} inventoried hot cases were explicitly rejected because M=1 is not divisible by tile_m=16; "
+                "the synthetic result is not hot-shape evidence."
+                if dx_hot_rejected else
+                "No full cuBLASDx hot-shape set is present in the provider report."
+            ),
         },
         {
             "candidate": "paid fusion or handoff reduction",
@@ -511,6 +679,7 @@ def build_budget(
         "complete_call_cells": cells,
         "hot_shape_comparisons": comparisons,
         "provider_body_comparisons": provider_comparisons,
+        "provider_smoke_comparisons": provider_smoke_comparisons,
         "candidate_assessment": candidate_assessment,
         "launch_floor": floor,
         "screening_model": {
@@ -526,11 +695,43 @@ def build_budget(
                 "no_go_for_more_tile_search" if mma_loses else "retain_for_next_entry_trial"
             ),
             "simt_for_measured_hot_shapes": "retain_as_first_strict_body_candidate" if simt_wins else "revise_body",
+            "cutlass_vs_direct_cublaslt": (
+                f"CUTLASS owner median was no faster on {cutlass_direct_lt_losses}/{len(cutlass_direct_lt_rows)} comparable resident hot shapes"
+                if cutlass_direct_lt_rows else "not_measured"
+            ),
+            "cutlass_4_5_2_cuda13_vs_direct_cublaslt": (
+                f"CUDA 13 CUTLASS 4.5.2 owner median was no faster on {cutlass452_direct_lt_losses}/{len(cutlass452_direct_lt_rows)} comparable resident hot shapes"
+                if cutlass452_direct_lt_rows else "not_measured"
+            ),
+            "cutlass_cute_collective_4_5_2_cuda13_vs_direct_cublaslt": (
+                f"CUDA 13 CUTLASS CuTe collective owner median was no faster on {cute_direct_lt_losses}/{len(cute_direct_lt_rows)} comparable resident hot shapes"
+                if cute_direct_lt_rows else "not_measured"
+            ),
+            "cublasdx_for_batch_one_hot_shapes": (
+                "rejected_by_tile_divisibility" if dx_hot_rejected else "not_measured"
+            ),
             "strict_complete_step": "not_measured",
             "reason": (
                 "Every measured WMMA owner point loses to the same-buffer local Torch graph control; "
                 "the batch-one output-major path performs at least 16x padded MAC work. "
-                "SIMT remains the measured body candidate, and CUTLASS 3.8 is retained only for shapes whose full tile grid fits the measured owner residency. Full-step savings and composition remain unmeasured."
+                "SIMT remains the measured body candidate. "
+                + (
+                    f"Direct cuBLASLt was at least as fast as the CUTLASS owner median on {cutlass_direct_lt_losses}/{len(cutlass_direct_lt_rows)} comparable hot shapes; retain CUTLASS only if fused surrounding work pays its measured body cost. "
+                    if cutlass_direct_lt_rows else ""
+                )
+                + (
+                    f"CUDA 13 CUTLASS 4.5.2 was no faster than direct cuBLASLt on {cutlass452_direct_lt_losses}/{len(cutlass452_direct_lt_rows)} comparable resident hot shapes. "
+                    if cutlass452_direct_lt_rows else ""
+                )
+                + (
+                    f"CUDA 13 CUTLASS CuTe collective was no faster than direct cuBLASLt on {cute_direct_lt_losses}/{len(cute_direct_lt_rows)} comparable resident hot shapes. "
+                    if cute_direct_lt_rows else ""
+                )
+                + (
+                    f"cuBLASDx rejects all {len(dx_hot_rows)} tested batch-one hot shapes on tile divisibility. "
+                    if dx_hot_rejected else ""
+                )
+                + "Full-step savings and composition remain unmeasured."
                 if mma_loses and simt_wins else
                 "The body measurements do not justify a strict full-step conclusion."
             ),
@@ -540,6 +741,7 @@ def build_budget(
             "mma": "ART/tasks/V3R-007/body_report.json",
             "simt": "ART/tasks/V3R-006/body_report.json",
             "cutlass_provider": "ART/tasks/V3R-008/provider_report.json",
+            "cublaslt_baseline": "ART/tasks/V3R-005/cublaslt_report.json",
             "launch_floor": "ART/tasks/V3R-009/launch_floor.json",
             "selected_traces": {
                 "L128": "ART/tasks/V3R-003/baselines/smollm2-135m-fp16-b1-L128/max_autotune_trace.json",
