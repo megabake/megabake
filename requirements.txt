@@ -1,12 +1,13 @@
-# Reproducible benchmark/test environment (Python 3.13, CUDA 12.4).
+# Reproducible V3 development/test environment (Python 3.13, PyTorch CUDA 13.0).
 # The PyTorch CUDA wheels are hosted on PyTorch's official package index.
---extra-index-url https://download.pytorch.org/whl/cu124
+# The PyTorch runtime does not install nvcc; select and record that toolchain separately.
+--extra-index-url https://download.pytorch.org/whl/cu130
 
 # Install the checkout itself in editable mode.
 -e .
 
 # Runtime dependencies.
-torch==2.6.0+cu124
+torch==2.14.0+cu130
 # Provides the CUTLASS/CuTe C++ headers used by MegaBake's nvcc compilation.
 nvidia-cutlass==3.8.0.0
 safetensors==0.8.0

@@ -59,11 +59,12 @@ Speedup is `torch.compile` latency divided by MegaBake latency; kernel counts
 are MegaBake / `torch.compile`.
 
 The max-difference column compares MegaBake output with eager PyTorch.
-These are median CUDA-event latencies for built-in workloads, with 10 warmups
-and 100 measured iterations, on an NVIDIA H200 MIG 2g.35gb (32 SMs), CUDA 12.4,
-and PyTorch 2.6.0+cu124. Seven of the eight workloads are faster in this
-snapshot; `linear_512x1024` is slightly slower. These results are not full-model
-Hugging Face decode benchmarks.
+This historical snapshot reports median CUDA-event latencies for built-in
+workloads, with 10 warmups and 100 measured iterations, on an NVIDIA H200 MIG
+2g.35gb (32 SMs), CUDA 12.4, and PyTorch 2.6.0+cu124. The current requirements
+pin PyTorch 2.14.0+cu130 and will not reproduce these numbers. Seven of the
+eight workloads were faster in the recorded snapshot; `linear_512x1024` was
+slightly slower. These results are not full-model Hugging Face decode benchmarks.
 
 Run a Hugging Face model benchmark with:
 
@@ -148,7 +149,9 @@ python -m pip install -r requirements.txt
 ```
 
 Requires Python 3.10+, an NVIDIA GPU, and CUDA Toolkit with `nvcc`.
-`requirements.txt` pins PyTorch 2.6.0+cu124 and installs CUTLASS/CuTe headers.
+`requirements.txt` pins PyTorch 2.14.0+cu130 and installs CUTLASS/CuTe headers.
+The PyTorch CUDA runtime and host `nvcc` toolkit are separate; use a compiler
+compatible with the selected build and target.
 To use a separate CUTLASS checkout, set `CUTLASS_PATH` before starting Python:
 
 ```bash
