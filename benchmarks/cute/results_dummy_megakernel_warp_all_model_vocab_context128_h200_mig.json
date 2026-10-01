@@ -1,0 +1,43 @@
+{
+  "date_utc": "2026-09-30",
+  "cutlass_dsl": "4.8.0",
+  "torch": "2.14.0+cu130",
+  "gpu": "NVIDIA H200 MIG 3g.71gb",
+  "shape": {
+    "layers": 2,
+    "hidden": 960,
+    "intermediate": 2560,
+    "heads": 30,
+    "vocab": 49152,
+    "prefix": 128,
+    "grid_ctas": 480
+  },
+  "dtype": "float32",
+  "attention_math": "warp_online_softmax",
+  "projection_math": "prepacked_warp_reduction",
+  "barriers_per_step": 10,
+  "cute_kernel_launches_per_step": 1,
+  "two_advancing_steps_correct": true,
+  "errors": [
+    {
+      "step": 0,
+      "state_max_abs": 0.00017547607421875,
+      "logits_max_abs": 1.4185905456542969e-05,
+      "k_max_abs": 1.33514404296875e-05,
+      "v_max_abs": 1.1444091796875e-05
+    },
+    {
+      "step": 1,
+      "state_max_abs": 0.000232696533203125,
+      "logits_max_abs": 1.6689300537109375e-05,
+      "k_max_abs": 1.33514404296875e-05,
+      "v_max_abs": 1.1444091796875e-05
+    }
+  ],
+  "cute_cudagraph_fixed_state_us": 283.35998952388763,
+  "torch_cudagraph_fixed_state_us": 299.9359965324402,
+  "profiled_cuda_kernels_per_replay": [
+    "kernel_cutlass_decode_step_kernel_tensorptrf32gmemo29609601_tensorptrf32gmemo29609601_tensorptrf32gmemo29609601_tensorptrf32gmemo29609609216009601_tensorptrf32gmemo29609609216009601_tenso_0"
+  ],
+  "profiled_torch_cuda_kernel_count_per_replay": 69
+}

@@ -1,5 +1,6 @@
 /agent_space
 .venv/
+.venv-cute/
 __pycache__/
 *.pyc
 *.egg-info/

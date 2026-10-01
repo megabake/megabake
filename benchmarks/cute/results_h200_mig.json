@@ -1,0 +1,85 @@
+{
+  "date_utc": "2026-09-30",
+  "cutlass_dsl": "4.8.0",
+  "torch": "2.14.0+cu130",
+  "gpu": "NVIDIA H200 MIG 3g.71gb",
+  "sms": 60,
+  "dtype": "float32",
+  "timing": "median CUDA event elapsed time; 7x50 for simple calls, 30 single calls for cooperative grids",
+  "cross_cta": {
+    "blocks": 8,
+    "width": 128,
+    "barriers": 2,
+    "correct": true,
+    "kernel_us": 23.264000192284584,
+    "with_reset_us": 37.039998918771744,
+    "cudagraph_single_kernel_us": 3.6351999640464783,
+    "epoch_repeated_correct": true,
+    "epoch_kernel_us": 23.39200023561716
+  },
+  "mlp": [
+    {
+      "shape": [
+        1,
+        128,
+        256
+      ],
+      "max_abs": 2.86102294921875e-06,
+      "cute_us": 16.61120057106018,
+      "cute_cudagraph_us": 14.700160026550293,
+      "torch_eager_us": 76.54848098754883,
+      "torch_cudagraph_us": 15.849599838256836
+    },
+    {
+      "shape": [
+        8,
+        128,
+        256
+      ],
+      "max_abs": 3.814697265625e-06,
+      "cute_us": 29.458560943603516,
+      "cute_cudagraph_us": 15.129599571228027,
+      "torch_eager_us": 152.2054386138916,
+      "torch_cudagraph_us": 24.43392038345337
+    },
+    {
+      "shape": [
+        1,
+        960,
+        2560
+      ],
+      "max_abs": 0.00029754638671875,
+      "cute_us": 924.7526550292969,
+      "cute_cudagraph_us": 925.1251220703125,
+      "torch_eager_us": 79.50208187103271,
+      "torch_cudagraph_us": 30.38912057876587,
+      "parallel_grid": 16,
+      "parallel_max_abs": 0.00029754638671875,
+      "parallel_kernel_us": 290.5600070953369,
+      "parallel_with_reset_us": 295.74398696422577,
+      "parallel_cudagraph_with_reset_us": 271.98015213012695
+    },
+    {
+      "shape": [
+        1,
+        960,
+        2560
+      ],
+      "max_abs": 0.00029754638671875,
+      "cute_us": 924.4499206542969,
+      "cute_cudagraph_us": 924.4710540771484,
+      "torch_eager_us": 81.43936157226562,
+      "torch_cudagraph_us": 30.473599433898926,
+      "torch_compile_max_autotune_us": 81.01823806762695,
+      "parallel_grid": 60,
+      "parallel_max_abs": 0.00029754638671875,
+      "parallel_kernel_us": 142.06399768590927,
+      "parallel_with_reset_us": 147.536002099514,
+      "parallel_cudagraph_with_reset_us": 123.9628791809082,
+      "warp_max_abs": 6.866455078125e-05,
+      "warp_kernel_us": 91.63199737668037,
+      "warp_with_reset_us": 96.44799679517746,
+      "warp_cudagraph_with_reset_us": 70.47616004943848
+    }
+  ]
+}

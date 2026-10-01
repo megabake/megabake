@@ -1,0 +1,19 @@
+{
+  "date_utc": "2026-09-30",
+  "cutlass_dsl": "4.8.0",
+  "torch": "2.14.0+cu130",
+  "gpu": "NVIDIA H200 MIG 3g.71gb",
+  "shape": {
+    "input": 960,
+    "output": 960,
+    "grid_ctas": 240
+  },
+  "dtype": "bfloat16",
+  "weight_layout": "contiguous [output, input]",
+  "max_abs_vs_cublas": 0.0,
+  "cute_cudagraph_us": 3.3926400542259216,
+  "torch_mv_cudagraph_us": 7.408000230789185,
+  "torch_cuda_kernel_names": [
+    "nvjet_sm90_tst_16x64_64x16_2x1_v_bz_TNN"
+  ]
+}

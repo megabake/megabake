@@ -19,6 +19,9 @@ dev = [
     "pytest>=7.0",
     "transformers>=4.40",
 ]
+cute = [
+    "nvidia-cutlass-dsl[cu13]==4.8.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
