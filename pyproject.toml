@@ -5,32 +5,23 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "megabake"
 version = "0.1.0"
-description = "torch.export to megakernel: compile once, distribute everywhere"
+description = "PyTorch FX to CuTe CUDA megakernels"
 license = {text = "MIT"}
-requires-python = ">=3.10"
+requires-python = ">=3.12,<3.15"
 dependencies = [
     "torch>=2.14",
-    "safetensors>=0.4",
-    "huggingface_hub>=0.20",
+    "nvidia-cutlass-dsl[cu13]==4.8.0",
+    "nvidia-cutlass>=4.2.0.0",
+    "safetensors>=0.8.0",
+    "huggingface-hub>=1.33.0,<2.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0",
-    "transformers>=4.40",
-]
-cute = [
-    "nvidia-cutlass-dsl[cu13]==4.8.0",
+    "pytest>=9.1.1",
+    "transformers>=5.18.0",
+    "numpy>=2.5.3",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-v --tb=short"
-markers = [
-    "v3_gpu: requires a selected CUDA device and defers device checks until test setup",
-    "v3_toolchain: requires the selected CUDA toolchain, normally nvcc",
-    "v3_slow: an intentionally slow V3 correctness or evidence test",
-]

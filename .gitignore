@@ -1,13 +1,8 @@
-/agent_space
 .venv/
 .venv-cute/
 __pycache__/
-*.pyc
 *.egg-info/
-.agents/
+*.py[cod]
 .pytest_cache/
-skills-lock.json
-benchmarks/baselines/
-
-# Local V3 task handoffs and benchmark evidence
-ART/
+build/
+dist/
