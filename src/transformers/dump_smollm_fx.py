@@ -46,12 +46,22 @@ parser.add_argument(
     default="HuggingFaceTB/SmolLM-135M",
     help="Hugging Face model ID or local model path",
 )
+parser.add_argument(
+    "--device",
+    choices=("cpu", "cuda"),
+    default="cuda",
+    help="Device for the model and example inputs",
+)
 args = parser.parse_args()
 model_name = args.model_name
+device = torch.device(args.device)
+if device.type == "cuda" and not torch.cuda.is_available():
+    parser.error("CUDA was requested, but no CUDA device is available")
 model_output_dir = (
     Path(__file__).resolve().parents[2]
     / "fx_traces"
     / model_name.replace("/", "__")
+    / device.type
 )
 model_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -61,14 +71,16 @@ def dump_graph(phase, gm, details=""):
     graph = gm.print_readable(
         print_output=False, include_stride=True, include_device=True
     )
-    path.write_text(f"# {phase}\n{details}\n\n{graph}\n", encoding="utf-8")
+    path.write_text(
+        f"# {phase}\ndevice={device}\n{details}\n\n{graph}\n", encoding="utf-8"
+    )
     print(f"Wrote {phase} FX graph to {path}")
 
 
 model = AutoModelForCausalLM.from_pretrained(
     model_name, attn_implementation="eager"
-).eval()
-input_ids = torch.tensor([[1, 2, 3, 4]])
+).to(device).eval()
+input_ids = torch.tensor([[1, 2, 3, 4]], device=device)
 attention_mask = torch.ones_like(input_ids)
 exported = torch.export.export(
     model,
