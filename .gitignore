@@ -6,4 +6,7 @@ __pycache__/
 .pytest_cache/
 build/
 dist/
-agent_space/
+/agent_space/*
+!/agent_space/.gitkeep
+/fx_traces/*
+!/fx_traces/.gitkeep

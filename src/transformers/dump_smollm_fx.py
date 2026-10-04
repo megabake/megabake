@@ -1,3 +1,4 @@
+import argparse
 from functools import partial
 from pathlib import Path
 
@@ -28,17 +29,34 @@ from transformers import AutoModelForCausalLM
 
 
 OUTPUTS = {
-    "normalized": "smollm_135m_fx_phase_1_normalized.txt",
-    "pre_grad": "smollm_135m_fx_phase_2_pre_grad.txt",
-    "aot": "smollm_135m_fx_phase_3_aot_inference.txt",
-    "prepared": "smollm_135m_fx_phase_4_prepared.txt",
-    "cache": "smollm_135m_fx_phase_5_cache_check.txt",
-    "post_grad": "smollm_135m_fx_phase_6_post_grad.txt",
+    "normalized": "phase_1_normalized.txt",
+    "pre_grad": "phase_2_pre_grad.txt",
+    "aot": "phase_3_aot_inference.txt",
+    "prepared": "phase_4_prepared.txt",
+    "cache": "phase_5_cache_check.txt",
+    "post_grad": "phase_6_post_grad.txt",
 }
+
+parser = argparse.ArgumentParser(
+    description="Dump FX traces for a causal language model."
+)
+parser.add_argument(
+    "--model-name",
+    default="HuggingFaceTB/SmolLM-135M",
+    help="Hugging Face model ID or local model path",
+)
+args = parser.parse_args()
+model_name = args.model_name
+model_output_dir = (
+    Path(__file__).resolve().parents[2]
+    / "fx_traces"
+    / model_name.replace("/", "__")
+)
+model_output_dir.mkdir(parents=True, exist_ok=True)
 
 
 def dump_graph(phase, gm, details=""):
-    path = Path(__file__).with_name(OUTPUTS[phase])
+    path = model_output_dir / OUTPUTS[phase]
     graph = gm.print_readable(
         print_output=False, include_stride=True, include_device=True
     )
@@ -47,7 +65,7 @@ def dump_graph(phase, gm, details=""):
 
 
 model = AutoModelForCausalLM.from_pretrained(
-    "HuggingFaceTB/SmolLM-135M", attn_implementation="eager"
+    model_name, attn_implementation="eager"
 ).eval()
 input_ids = torch.tensor([[1, 2, 3, 4]])
 attention_mask = torch.ones_like(input_ids)
