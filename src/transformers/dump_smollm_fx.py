@@ -29,6 +29,7 @@ from transformers import AutoModelForCausalLM
 
 
 OUTPUTS = {
+    "export": "phase_0_torch_export.txt",
     "normalized": "phase_1_normalized.txt",
     "pre_grad": "phase_2_pre_grad.txt",
     "aot": "phase_3_aot_inference.txt",
@@ -74,6 +75,7 @@ exported = torch.export.export(
     (input_ids,),
     kwargs={"attention_mask": attention_mask, "use_cache": False, "return_dict": False},
 )
+dump_graph("export", exported.graph_module, "Raw torch.export FX graph.")
 user_inputs = {
     "input_ids": input_ids,
     "attention_mask": attention_mask,
