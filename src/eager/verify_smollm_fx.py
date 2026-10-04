@@ -107,7 +107,7 @@ def main():
 
     root = Path(__file__).resolve().parents[2]
     trace_dir = root / "fx_traces" / args.model_name.replace("/", "__") / "cuda"
-    output_dir = trace_dir / "eager_verify"
+    output_dir = trace_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
