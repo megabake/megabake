@@ -1,5 +1,7 @@
 # MegaBake North Star
 
+For current implementation boundaries and milestone order, use [ARCHITECTURE.md](ARCHITECTURE.md). This brief records earlier design reasoning and includes steps that have since been completed.
+
 MegaBake turns a captured PyTorch inference graph into a planned, composable CUDA megakernel. PyTorch and Hugging Face remain the model, parameter, and runtime interface; MegaBake owns graph-region fusion, device-body selection, scheduling, and execution planning.
 
 ## Compilation path

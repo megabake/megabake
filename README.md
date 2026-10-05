@@ -4,21 +4,21 @@
 
 # MegaBake
 
-MegaBake's north star is to turn a captured PyTorch inference graph into a planned, composable CUDA megakernel. PyTorch and Hugging Face stay the model, parameter, and runtime interface; MegaBake owns FX-region fusion, device-body selection, scheduling, and execution planning.
+MegaBake's north star is to turn a captured PyTorch inference graph into planned, composable CUDA execution. PyTorch and Hugging Face stay the model, parameter, and runtime interface; MegaBake owns semantic recovery, fusion decisions, device-body selection, and execution planning.
 
 ## Architecture
 
 1. TorchDynamo captures a model invocation as an FX graph and provides its specialization guards.
 2. TorchInductor runs its post-grad FX transformations, including normalization and functionalization.
 3. MegaBake takes the still-FX graph and its shape, layout, and guard metadata at a version-pinned handoff before Inductor lowering and scheduling. This integration uses Inductor internals, which are not a stable public API.
-4. MegaBake pattern-matches and fuses FX regions, recording inputs, outputs, dependencies, state effects, layouts, and numerical requirements.
-5. Supported regions map to device-callable CuTe DSL bodies. MegaBake plans tiling, CTA work assignment, storage lifetimes, synchronization, and stage order, then composes compatible bodies into one persistent CUDA kernel where legal.
+4. MegaBake imports generic tensor operations, canonicalizes equivalent forms, and recognizes parameterized computations such as RMSNorm, RoPE, attention, and MLP branches while retaining their source subgraphs.
+5. MegaBake proposes fusions from explicit index maps and device-body capabilities, then checks legality, implementation feasibility, and profitability. Its first scheduler handles CTA-local fusion. The downstream execution plan specifies CuTe bodies or fallback, launches, tiling, storage lifetimes, and synchronization; persistence is a later option where it improves measured workloads.
 
-An FX region is a description of tensor work, not a GPU kernel. It can join a megakernel only if its implementation exposes device-side work that can run inside the enclosing kernel and satisfies that kernel's ownership, synchronization, and resource constraints. A separately launched wrapper is not composable just because it was generated with CuTe DSL.
+A recognized composite describes computation; a fusion candidate proposes grouping; a kernel plan specifies one GPU launch. The initial planner combines work only when one CTA can own each producer-consumer tile and a composable CuTe device body fits the resource budget. A separately launched wrapper is not composable just because it was generated with CuTe DSL.
 
 The captured graph remains the semantic reference. Correctness includes graph guards, outputs, mutations, state updates, aliasing, and numerical behavior. Performance is measured end to end against an equivalent `torch.compile` baseline using the same model, inputs, precision, and GPU. Claims apply only to measured workloads and GPU targets.
 
-See [north-star.md](north-star.md) for the fuller brief.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the current architecture and build order. [north-star.md](north-star.md) records the earlier brief.
 
 ## Environment setup
 
