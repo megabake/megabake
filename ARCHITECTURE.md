@@ -1,12 +1,12 @@
 # MegaBake architecture and IR contract
 
-**Status:** current design, 2026-10-05. This is the implementation guide. [ir-analysis.md](ir-analysis.md) supplies the import → analyze → optimize → schedule → lower structure; [north-star.md](north-star.md) records the broader goal.
+**Status:** proposed implementation approach, 2026-10-05. This document describes the intended contracts and build order; it does not imply that the compiler stages exist. [north-star.md](north-star.md) records the broader goal and earlier reasoning.
 
 ## Core decision
 
 MegaBake targets **generic tensor computations on NVIDIA GPUs**. SmolLM is the first real graph and benchmark fixture, not an IR dialect or a list of hard-coded operator kinds. GEMM is the main implementation and performance anchor: build a competitive GEMM path and use it to judge fusion. RMSNorm, attention, RoPE and MLP are parameterized patterns that can be recognized in many graphs.
 
-PyTorch's post-grad FX graph is the source of primitive operations, values, metadata and guards. MegaBake owns a smaller **Compute IR** because it adds stable normalized operations, first-class index maps and numerical contracts, effect boundaries, and source mapping needed for fusion. Import only what the compiler can reason about; keep the rest as source-backed opaque regions for fallback. This IR has a purpose beyond wrapping FX nodes in new classes.
+PyTorch's post-grad FX graph is the source of primitive operations, values and tensor metadata. Its surrounding frontend/runtime owns specialization checks and argument/output bindings; a bare `GraphModule` is not the complete runtime contract. MegaBake owns a smaller **Compute IR** because it adds stable normalized operations, first-class index maps and numerical contracts, effect boundaries, and source mapping needed for fusion. Import only what the compiler can reason about; keep the rest as source-backed opaque regions for fallback. This IR has a purpose beyond wrapping FX nodes in new classes.
 
 ```mermaid
 flowchart TD
@@ -40,7 +40,7 @@ Keep dumps after import, canonicalization, composite recognition, candidate sele
 
 ## Compute IR: the generic layer
 
-A first implementable schema is:
+The target schema below should be introduced incrementally. The first GEMM-plus-epilogue experiment needs only the values, ops, input maps, region boundaries and numerical contracts used by that kernel. General reductions, composite matchers and broad graph analyses should follow working kernels rather than block the first experiment.
 
 ```text
 Graph:
@@ -194,18 +194,50 @@ The first cost rule can be simple: compare a strong separate implementation with
 
 GEMM is the highest priority code-generation component. The saved SmolLM MLP has `M=4` projection GEMMs, which may behave differently from larger prefill GEMMs. Establish both shape regimes and compare against Inductor and CUTLASS/cuBLAS on the same GPU before claiming a fusion win. A fused kernel that makes its GEMMs slow is a failed plan even if it removes launches.
 
+### Proposed frontend repair
+
+Use a small, version-pinned adapter around PyTorch's existing compiler entry point, with a MegaBake callback at the post-grad boundary. Prefer reusing PyTorch's preparation and runtime wrappers over manually rebuilding lifted arguments from an export and calling the raw post-grad graph.
+
+- **One graph phase:** remove the Inductor executable-cache lookup from the live capture path. Ensure that neither an AOT executable cache nor an Inductor executable cache bypasses the required handoff on a backend invocation. Run the selected post-grad passes consistently and verify the graph before handing it off. Normal Dynamo reuse of an already compiled, guarded callable remains valid.
+- **Explicit runtime ownership:** under `torch.compile`, Dynamo owns guards and output-tree reconstruction; AOTAutograd owns its argument adaptation and mutation/alias handling. Return the wrapped callable. Do not equate equal placeholder counts with correct argument bindings. Initially require inference under `torch.no_grad()` and reject unsupported training paths.
+- **A narrow compiler callback:** pass the live post-grad graph and its matching example inputs to the lowering callback. Its returned callable must obey that graph's argument/output contract. Example inputs describe compilation; they must not become captured runtime tensor bindings. An FX executor can establish this contract before CuTe lowering exists.
+- **Metadata validation:** preserve source/output metadata and refresh tensor metadata after post-grad rewrites where needed. Do not assume every pass preserves valid strides. If export is used, retain its graph signature, call specification and constraints; a text dump is only an inspection artifact.
+- **Version checks:** enforce the tested PyTorch release before importing private APIs, and align package constraints with it. Record the imported wheel's Git revision; an independent PyTorch checkout may describe a different implementation.
+
+### Proposed workload and measurement contract
+
+Start with BF16 projections on one stated GPU target. The initial matrix should include the observed `M=4, K=576, N=1536` shape and a larger prefill case such as `M=256` with the same K/N. These are projection experiments, not evidence about KV-cache decode. Whole-model validation should make batch size, sequence length, dtype, attention implementation, seed and model revision explicit.
+
+Measure standalone GEMM, cast-correct GEMM plus SiLU, and subsequently the gate/up branch. Keep the BF16 GEMM result rounding before FP32 activation and the required cast back to BF16. Compare each fused candidate against the best supported separate implementation, including a library GEMM path, Inductor, and CUDA Graph variants. Record whether requested autotuning actually applies on the target; a `max-autotune` label alone is insufficient, especially on MIG configurations.
+
+Separate compilation/first-call time from warmed execution. Report repeated latency samples, GPU timing and synchronized host-call timing with their measurement method. Check outputs before timing, retain failed candidates as failures, and avoid concurrent GPU tests during measurements. GEMM-plus-epilogue establishes integration; gate/up composition is the next experiment for evaluating value beyond common epilogue fusion. Add an optimized attention baseline when moving to whole-model comparisons.
+
+Record Python, PyTorch and its Git revision, CuTe/compiler package versions, GPU capability and MIG resources, selected compiler paths, workload settings, source hashes and numerical tolerances. Use separate artifact directories for separate runs. Test the actual CuTe compilation path with a small kernel; the version of `nvcc` on PATH alone does not establish whether DSL compilation works. Align the CUDA toolkit if the chosen implementation uses its compiler or headers.
+
+### Proposed regression gates
+
+Keep a focused, runnable suite alongside the adapter and grow it with supported lowering:
+
+- Cache settings cannot change whether post-grad preparation runs; check the phase and operator graph as well as numerical outputs.
+- Changed shapes/strides trigger valid specialization behavior, while repeated calls use current inputs and parameter values.
+- Output structures, live secondary outputs, aliases, input mutations and buffer updates survive the runtime handoff.
+- Transposed GEMM operands, row/column broadcasts and BF16 cast boundaries match the reference at explicit tolerances.
+- A tiny locally constructed transformer exercises capture without downloaded weights; a CuTe smoke test checks compilation, tail handling and current-stream execution.
+
+Passing these gates validates the frontend and toolchain. Generated kernel correctness and measured performance remain separate exit conditions.
+
 | Milestone | Deliverable | Exit condition |
 | --- | --- | --- |
-| **M0 — source handoff** | Fix cache-hit phase ambiguity in the live post-grad adapter; preserve graph/signature/guards and align CUDA toolkit. | Fresh CUDA run proves the phase and matches reference for its guarded workload. |
-| **M1 — generic IR** | Implement `Graph`, `Value`, first-class `IndexMap`, lightweight `Region`, and the initial generic ops; add canonicalization, analyses and graph/region verifiers. A small PyTorch-backed evaluator checks supported rewrites against FX. Use small graphs plus a live SmolLM block. | Dumps show normalized operations, explicit input maps and complete FX coverage; evaluated supported subgraphs match FX outputs and preserve effect boundaries. |
-| **M2 — GEMM anchor** | Bring up a competitive standalone CuTe GEMM body for at least the observed small-M shape and one larger prefill shape; keep library/Inductor baselines. | Correct BF16 results and measured throughput/latency, with a clear supported shape/layout contract. |
-| **M3 — semantic recognition** | Parameterized RMSNorm and Attention matchers plus RoPE and GatedMLP region annotations over generic IR. Canonicalize before matching and retain bodies. | One real block has exact named regions and source mapping; each match reproduces its generic body at stated tolerances. |
-| **M4 — fusion planner** | Form `Gemm` epilogue and gate/up branch candidates; apply legality → implementation feasibility → profitability; schedule only CTA-local regions into CuTe plans and verify each plan. | A measurable legal win on stated shapes, or a measured rejection with the failing gate recorded and the next candidate selected. |
+| **M0 — reliable source handoff** | Implement the pinned adapter and runtime ownership above; remove cache-dependent phase ambiguity and add the focused regression checks. | Fresh CPU/CUDA checks prove the phase, bindings, guards, effects and output behavior for supported inference. |
+| **M1 — measured GEMM baseline** | Establish library/Inductor baselines for small-M and larger prefill projections, including CUDA Graph variants; validate the actual CuTe toolchain. | Reproducible correctness and latency records identify the strongest available baseline and target limitations. |
+| **M2 — minimal IR and first fusion** | Introduce only the generic IR/maps and graph/region/plan verification needed for a competitive CuTe GEMM and a cast-correct pointwise epilogue. Reuse a suitable existing GEMM implementation where possible. | FX reaches a verified CuTe kernel; standalone and fused variants are correct and measured against M1. Accept a fusion only when it wins. No attention or norm matcher is required. |
+| **M3 — gate/up composition** | Extend the proven path to paired GEMM branches and their shared pointwise consumer, applying legality → feasibility → profitability with CTA-local ownership. | A reproducible win on stated shapes, or a measured rejection identifying resource or throughput limits. |
+| **M4 — broader semantic recognition** | Add reductions and parameterized RMSNorm/Attention matchers, then RoPE and GatedMLP annotations as needed by subsequent kernels. Canonicalize before matching and retain generic bodies. | One real block has verified named regions and source mapping; supported rewrites and matches reproduce their generic bodies at stated tolerances. |
 | **M5 — full inference path** | Add strong attention and norm bodies or verified fallbacks, graph partitioning, ordered host execution and output reconstruction. | SmolLM no-cache inference matches reference and reports whole-step latency versus Inductor. |
 | **M6 — larger schedules** | Try norm→projection and attention-adjacent candidates only where CTA-local ownership is proved; otherwise retain launch boundaries. Add a measured choice rule. Capture prefill/decode with KV state as separate workloads. | Retain only fusions with correct, reproducible end-to-end gains. |
 | **M7 — persistence if justified** | Add cross-CTA dependency and SM/CTA task-graph support with an in-kernel scheduler only if measured scheduling/launch overhead warrants it. | Multi-stage execution is correct with explicit visibility and synchronization and improves its target workload. |
 
-**Immediate work: M0 then M1.** M1 is the strong reusable IR contract. M2 protects the central GEMM performance question. SmolLM drives concrete cases and validation; new models should reuse the same generic operations and parameterized composites.
+**Proposed next order: M0 → M1 → M2 → M3, then expand recognition.** Keep the computation/planning/backend boundaries, but let measured kernels determine the amount of IR and analysis to implement. SmolLM supplies concrete cases; its layer numbers and dimensions must not become operation definitions. This is a plan, not a record of completed milestones.
 
 ## Current repository facts and references
 
