@@ -4,21 +4,29 @@
 
 # MegaBake
 
-MegaBake's north star is to turn a captured PyTorch inference graph into planned, composable CUDA execution. PyTorch and Hugging Face stay the model, parameter, and runtime interface; MegaBake owns semantic recovery, fusion decisions, device-body selection, and execution planning.
+MegaBake turns a captured PyTorch inference workload into a planned, composable CUDA megakernel. PyTorch and Hugging Face keep the model and runtime interface. MegaBake owns region fusion, CuTe DSL device bodies, scheduling, and execution planning.
 
-## Architecture
+## Design
 
-1. TorchDynamo captures a model invocation as an FX graph and provides its specialization guards.
-2. TorchInductor runs its post-grad FX transformations, including normalization and functionalization.
-3. MegaBake takes the still-FX graph and its shape, layout, and guard metadata at a version-pinned handoff before Inductor lowering and scheduling. This integration uses Inductor internals, which are not a stable public API.
-4. MegaBake imports generic tensor operations, canonicalizes equivalent forms, and recognizes parameterized computations such as RMSNorm, RoPE, attention, and MLP branches while retaining their source subgraphs.
-5. MegaBake proposes fusions from explicit index maps and device-body capabilities, then checks legality, implementation feasibility, and profitability. Its first scheduler handles CTA-local fusion. The downstream execution plan specifies CuTe bodies or fallback, launches, tiling, storage lifetimes, and synchronization; persistence is a later option where it improves measured workloads.
+[north-star.md](north-star.md) defines the scope. [ARCHITECTURE.md](ARCHITECTURE.md) defines the proposed compiler. [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) gives the build gates. [RESEARCH.md](RESEARCH.md) records the source review and GPU experiments behind the design.
 
-A recognized composite describes computation; a fusion candidate proposes grouping; a kernel plan specifies one GPU launch. The initial planner combines work only when one CTA can own each producer-consumer tile and a composable CuTe device body fits the resource budget. A separately launched wrapper is not composable just because it was generated with CuTe DSL.
+[MIRAGE_REUSE.md](MIRAGE_REUSE.md) covers operation variants, generic lowering, explicit fallback, and reusable Mirage components with source references.
 
-The captured graph remains the semantic reference. Correctness includes graph guards, outputs, mutations, state updates, aliasing, and numerical behavior. Performance is measured end to end against an equivalent `torch.compile` baseline using the same model, inputs, precision, and GPU. Claims apply only to measured workloads and GPU targets.
+Mirage is the main reference architecture for lowering, tile/layout planning, storage, and persistent scheduling. Start from its compatible algorithms and tests. Adapt them for the FX contract, CuTe DSL, and measured target requirements.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the current architecture and build order. [north-star.md](north-star.md) records the earlier brief.
+The compilation path is:
+
+1. Capture the invocation with Dynamo and preserve the PyTorch runtime contract.
+2. Receive live FX after the pinned AOT/Inductor preparation and post-grad passes, before lowering and scheduling.
+3. Recover tensor semantics and source-backed regions with explicit layouts, dependencies, effects, and numerical requirements.
+4. Generate baseline CuTe bodies from supported tensor primitives and add valid tuned candidates. Plan their execution in one persistent kernel where legal.
+5. Check the complete invocation and measure it against an equivalent `torch.compile` baseline.
+
+The design preserves the tuned pipeline inside each body. It starts with ordered phases and refines tile readiness where measurements justify it. Prefill and stateful decode share the compiler, with distinct scheduling policies and workload checks. The proposed `--mode prefill|decode` option is not implemented yet.
+
+A complete-model request includes all requested outputs and state updates. Named region matchers enable optimizations. Unfamiliar combinations of supported primitives use generic lowering. Unknown operator semantics or an illegal composition produce an explicit failure. The proposed `fallback=inductor` option can delegate the whole invocation and report that result as external fallback. Strict megakernel compilation defaults to `fallback=error`. These paths are not implemented yet.
+
+The compiler remains to be built. The current checkout contains a capture/reference path and research probes. Begin with a small kernel that combines different bodies. Check correctness, synchronization, and resource use. Then require a measured performance benefit before broader compiler work.
 
 ## Environment setup
 

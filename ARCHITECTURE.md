@@ -1,371 +1,415 @@
 # MegaBake architecture
 
-**Status: proposed design, revised 2026-10-05.** The compiler described here is still to be built. [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) gives the work order and acceptance checks. [north-star.md](north-star.md) contains the earlier project reasoning; this document defines the current implementation contract.
+**Revised: 2026-10-09. Status: proposed compiler, with limited experiments.**
 
-## 1. The goal and the rule that never changes
+[north-star.md](north-star.md) defines the scope. [RESEARCH.md](RESEARCH.md) records the source review, measurements, and limits of the evidence. [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) defines the build gates.
 
-**MegaBake compiles an entire supported PyTorch inference workload into one optimized CUDA megakernel.** Its optimization objective is the lowest measured end-to-end latency subject to correctness and that one-kernel requirement.
+[MIRAGE_REUSE.md](MIRAGE_REUSE.md) records the deeper implementation review, reusable components, and checks. This revision makes generic operation coverage and fallback behavior explicit.
 
-For a full-model request, the workload is the complete captured model invocation: its tensor computations, requested outputs and state updates. The compiler cannot silently reduce that request to one block or a convenient subgraph. SmolLM is our first model fixture. Its dimensions and layer numbers are specialization data, not definitions of compiler operations.
+**Build a compiler that preserves fast device pipelines when it composes them. Prove the cost of that composition before building the full compiler.**
 
-A successful compiled invocation must satisfy all of these conditions:
+The previous design had useful rules for computation and synchronization. A slow body could still pass each correctness stage and reach a full model. This design keeps those rules. It changes the body interface, the amount of work scheduled at once, and the build order.
 
-1. Every required source computation and observable effect is covered.
-2. Outputs, aliases, mutations, numerical behavior and stream ordering satisfy the declared contract.
-3. Exactly one GPU workload kernel executes. Required reset, conversion, copy-back and state-update work cannot be hidden in helper kernels.
-4. Every dependency has a valid visibility protocol and a forward-progress argument: work that is needed can actually run.
-5. The callable uses current runtime inputs and parameters under valid specialization guards.
+### Design basis: Mirage
 
-Separate kernels, eager execution, CUDA Graphs and library launchers are useful reference implementations and performance baselines. They cannot replace the emitted megakernel. If an operation or execution scheme is unsupported, compilation reports the source location and reason. If a correct megakernel is slow, we improve its bodies or schedule and report the performance gap.
+**Use Mirage as the main reference architecture for lowering, planning, and persistent execution.** Start each subsystem from the matching Mirage implementation, assumptions, and tests. Preserve compatible algorithms and contracts when adapting the code. Explain each departure with a specific correctness, frontend, backend, resource, or measured performance reason. Reuse existing solutions to keep the system simple.
 
-Compilation, autotuning and genuinely reusable setup are reported separately from execution. Allocating an uninitialized workspace can be host setup; resetting readiness counters required for each invocation is workload work. A recurring GPU operation cannot be moved into a wrapper and omitted from the launch count.
+Use both parts of Mirage. Its graph transpiler provides ideas for generating tensor programs and local schedules. MPK provides ideas for task formation, dependencies, and persistent execution. Connect these ideas to the FX contract and CuTe DSL output. The detailed source map is in [MIRAGE_REUSE.md](MIRAGE_REUSE.md).
 
-The initial development target is single-GPU BF16 inference, concrete guarded shapes, and the available H200 MIG / SM90 configuration. Full-model persistent execution is required. Small GEMM and MLP fixtures are steps toward it. Prefill and stateful decode become separate supported regimes; a short no-cache forward does not establish decode support.
+| Design responsibility | Starting point |
+| --- | --- |
+| Tensor and tile mapping | Mirage's distinction between logical tensors, block tiles, index maps, and physical layouts |
+| Body generation | Its reusable device primitives, fusion chains, local schedules, and epilogues |
+| Layout and storage | Its compatibility constraints, padding rules, live intervals, and allocation algorithms |
+| Candidate generation | Its map/dimension enumeration and pruning, constrained by the selected body family |
+| Cross-body execution | MPK's task descriptors, dependency analysis, event grouping, and worker execution |
+| Validation | Upstream regression cases, plus differential checks for each adapted contract |
 
-## 2. Understand the design through three questions
+The initial phase runtime is an executable reference for correctness and composition cost. Compare it with an MPK-derived event plan when measurements show useful overlap. Final scheduling choices must follow the workload evidence. A simpler implementation that loses required throughput does not pass the performance gate.
 
-| Question | Representation | Example |
-| --- | --- | --- |
-| **What must be computed?** | Compute IR, with optional semantic composites | GEMM, a cast, RMSNorm or attention with exact attributes |
-| **Which pieces of work depend on which?** | Tile task graph and readiness events | A multiply tile waits for its gate and up tiles |
-| **How will one GPU kernel execute it?** | Kernel plan and composable CuTe device bodies | Worker assignment, layouts, workspace, barriers and one launch |
+## 1. Scope and success
 
-An **IR** is a compiler's structured description of a program. A **tile** is a portion of a tensor. A **CTA** is a CUDA thread block. A **worker** is a persistent CTA that executes a sequence of tasks. An **SM** is a GPU processor on which CTAs run. A task is a piece of device work; a task boundary does not launch another kernel.
+MegaBake receives a captured PyTorch invocation and produces a CUDA megakernel for its supported regions. PyTorch and Hugging Face keep the model and runtime interface. MegaBake owns region formation, CuTe DSL device bodies, tiling, storage, synchronization, and execution planning.
+
+A full-model request includes the complete captured invocation, its requested outputs, and its state updates. The compiler must not replace that request with a block benchmark. It can reject an unsupported request with a source-linked reason. The scope does not require every operation, shape, or model to fit one kernel.
+
+A successful megakernel has these properties:
+
+1. It covers the declared workload and all observable effects.
+2. It preserves guards, bindings, aliases, mutations, and the numerical contract.
+3. Its recurring GPU work executes in one workload kernel. This includes required reset, conversion, and state-update work.
+4. Every dependency has a visibility rule and a forward-progress argument.
+5. It reports complete-call correctness and latency against an equivalent `torch.compile` baseline.
+
+A correct kernel and a faster kernel are separate results. A correct generic megakernel establishes support for its declared workload even if it is slow. It does not pass a performance gate. An eager call, library launch, or CUDA Graph is a useful reference, but does not count as an emitted megakernel.
+
+Start with single-GPU BF16 inference on SM90. Record the actual device partition for each run. The H200 MIG device measured on 2026-10-08 had 60 SMs; a full H200 is a different target. Support prefill and stateful decode as distinct workload regimes in the same compiler.
+
+## 2. Start with the latency budget
+
+Fusion can remove launches, intermediate memory traffic, and some waits. It can also reduce compute throughput, increase resource use, and introduce new waits. Count both sides.
+
+For a dense GEMM, let `A` have shape `[M,K]` and the stored weight have shape `[N,K]`. Ignoring tails and repeated loads:
+
+```text
+work             = 2 M N K FLOPs
+BF16 tensor bytes = 2 (M K + N K + M N)
+weight-dominated arithmetic intensity ≈ M FLOPs/byte
+```
+
+The byte estimate is an ideal access count, not measured HBM traffic. Caches, tile overlap, padding, and partial reductions change the real traffic. A useful lower-bound estimate is `max(work / compute_rate, bytes / bandwidth)`. Measure the relevant rates on the actual GPU partition.
+
+At small `M`, reading weights and creating enough parallel work are often the main concerns. At large `M`, tensor-core throughput and data reuse matter more. Context length also changes attention cost. These facts explain the need for different schedules; the name of the mode alone does not choose one.
+
+For a candidate composition, use this accounting model:
+
+```text
+potential savings = launches removed + traffic avoided + useful overlap
+new costs         = body slowdown + dispatch + synchronization
+                  + layout conversion + spills + lost parallelism
+```
+
+Accept the performance claim only after measuring the complete workload. These terms interact, so adding isolated timings is a diagnostic, not a proof.
+
+For a simple serial estimate, suppose GEMMs take 90% of baseline time. A 20% GEMM slowdown raises their cost to 108% of baseline time. The workload then loses even if all other work disappears. Removing launches cannot recover that loss.
+
+The local experiments support measuring this budget. A small tile search left large gaps. Adding a larger tile brought a tested large GEMM to approximate library parity, while gaps remained at other shapes. The cost of restarting a body also changed with its configuration. These results select the next experiments; they do not establish a model speedup. See [the measurements](RESEARCH.md#gpu-experiments).
+
+## 3. Use two program representations
+
+A tile is part of a tensor. A CTA is a CUDA thread block. An SM is a GPU processor. An IR is a structured description of a program.
+
+A **lowering** converts an operation into a form that the next compiler stage can use. A **device body** is GPU code that runs inside the megakernel. A **body provider** selects or generates that code. A **contract** states the behavior that an interface must preserve.
+
+Keep a description of the computation and a description of its execution. A catalog of body generators connects them. Temporary fusion candidates and expanded tile graphs do not need separate permanent IRs.
 
 ```mermaid
 flowchart TD
-    FX[Live post-grad FX and runtime contract] --> IR[Import and normalize generic Compute IR]
-    IR --> SEM[Recognize semantic operations and retain their bodies]
-    SEM --> TASK[Choose device bodies and split work into tiles]
-    TASK --> EVENT[Derive dependencies and simplify events]
-    EVENT --> PLAN[Plan workers, layouts, memory and synchronization]
-    PLAN --> CODE[Compile one megakernel]
-    CODE --> CHECK[Verify correctness and measure full-workload latency]
-    CHECK -- try another valid configuration --> TASK
-    CHECK --> RUN[Cache the selected plan and return its callable]
+    FX[Live post-grad FX and runtime contract] --> G[Compute graph: source ops and tensor programs]
+    G --> C[Generate baseline bodies and optional tuned candidates]
+    C --> P[Kernel plan: phases, tiles, storage, dependencies]
+    P --> K[Compile one complete kernel]
+    K --> V[Check correctness, resources, and latency]
+    V -- refine a bounded candidate set --> C
+    V --> R[Cache the measured plan and bind live inputs]
 ```
 
-Verification happens at each boundary. An unsupported source operation blocks compilation. Failed correctness or progress checks reject a candidate. Performance selection chooses among correct one-kernel candidates.
+### Compute graph
 
-Mirage's multi-level graphs connect tensor computations to thread-block and thread execution, including explicit input, output and loop mappings. MegaBake adopts that separation while keeping a single enclosing launch. Our generic index maps and CuTe layouts provide the mappings needed by actual supported bodies; a new universal graph language at every level is unnecessary. [Mirage graph representation](https://mirage-project.readthedocs.io/en/latest/mugraph.html)
-
-MPK adds the directly relevant execution idea: represent small device tasks and their readiness events, then execute them inside a persistent kernel. Its compiler simplifies events and task metadata; its runtime supports static and dynamic dispatch and cross-task pipelining. The sections below specify MegaBake's adaptation and build order. [MPK compiler and runtime](https://arxiv.org/html/2512.22219v2)
-
-## 3. Obtain a trustworthy source graph
-
-PyTorch remains responsible for the model interface. MegaBake receives a live post-grad FX graph through a small, version-pinned adapter before Inductor lowering and scheduling. A text dump is an inspection artifact, not compiler input.
-
-The handoff consists of more than a graph:
-
-| Owner | Responsibility |
-| --- | --- |
-| Dynamo | Capture, specialization guards and the supported Python-facing call contract |
-| AOT/PyTorch wrappers | Lifted arguments, output adaptation and supported alias/mutation handling |
-| MegaBake frontend adapter | Consistent graph phase, matching example inputs, metadata and source provenance |
-| MegaBake compiled callable | Runtime bindings, one kernel and the graph's required outputs/effects |
-
-Reuse the pinned PyTorch wrappers. Do not guess runtime argument order from an export's placeholder count or replace the wrapped callable with a bare `GraphModule.forward`. Example tensors describe compilation; their addresses or contents do not become permanent runtime bindings. [PyTorch custom backend contract](https://docs.pytorch.org/docs/main/user_guide/torch_compiler/torch.compiler_custom_backends.html)
-
-The current capture path needs a repair: an executable-cache hit must not bypass the passes and handoff while the artifact is still labeled post-grad. The adapter must enforce a consistent phase, preserve/refresh tensor metadata after rewrites, and check its PyTorch version before importing private APIs. Normal reuse of an already compiled callable under valid guards remains allowed.
-
-Start with inference under `torch.no_grad()`, `fullgraph=True`, and concrete guarded shapes. Unsupported training or graph breaks fail explicitly. A reference FX executor may validate the frontend before CUDA lowering exists, but is labeled reference-only.
-
-Wrapper preservation does not automatically establish the one-launch rule. AOT copy-back or materialization work must later be included in the megakernel or the affected workload rejected. Audit the complete callable, not only its generated kernel.
-
-## 4. Compute IR: preserve what the program means
-
-Use small data structures and only introduce fields required by supported operations:
+Keep the live FX graph as source evidence. Import a small tensor description that the planner can use:
 
 ```text
-Graph       = inputs, outputs, ordered operations, values, source IDs, guard context
-Value       = logical shape/dtype/device, boundary strides, producer, alias relation
-Op          = kind, operands, outputs, typed attributes, index maps, effects, numerics
-Operand     = value reference or typed scalar literal
-IndexMap    = output coordinates + reduction coordinates -> input coordinates
-Region      = references to operations, external inputs, all live outputs
-Composite   = a Region with a verified semantic name and attributes
+Value  = shape, dtype, device, boundary strides, alias relation
+Op     = operands, results, attributes, tensor program if known, effects, numerics, FX IDs
+Region = source operations, external inputs, every live output, semantic facts
+Graph  = values, operations, inputs, outputs, guard and runtime context
 ```
 
-Users can be derived from operations. A region references its existing body rather than copying it. Concrete shapes are sufficient initially. Any later symbolic dimension must be tied to an actual guard. Physical workspace offsets, shared-memory layouts and worker assignments belong to the kernel plan.
+A region refers to its source operations. It does not copy them into a second graph. Derived uses and costs are analysis results. Physical addresses, worker IDs, and shared-memory swizzles belong in the kernel plan.
 
-### The small generic operation set
+The graph must retain every source operation, including operations without a lowering. Import rules translate known semantics into the following families. Model names and recognized fused regions do not define support.
 
-| Operation | What it must specify | Data needed for an output tile |
+| Family | Required meaning |
+| --- | --- |
+| Contraction, including GEMM | Output and reduction domains, indexed operands, predicates, accumulation and result types |
+| Elementwise and cast | Scalar expression, broadcasts, typed constants, explicit rounding points |
+| Reduction | Reduction domain, combiner, accumulation type, output shape and cast |
+| View and copy | Coordinate map, strides, alias behavior, whether data movement is required |
+| Gather and index | Index source, supported index range, read domain and invalid-index behavior |
+| State access | Storage identity, read/write domain and required ordering |
+| Tuple and selection | All results and which result each use selects |
+| Opaque source operation | Retained FX target/body, all boundaries and known effects; unresolved facts block device lowering |
+
+Do not build a universal symbolic algebra system first. Concrete, guarded maps for these families are enough. For GEMM, `(m,n,k)` reads `A[m,k]` and `W[n,k]`. A view composes that map with a stride map. A data-dependent gather needs a supported access rule or a conservative dependency domain; an affine map alone cannot describe it.
+
+Within an operation, a **tensor program** describes output coordinates, reduction coordinates, indexed loads, predicates, typed scalar expressions, and stores. It is a field of the compute graph, not a third graph IR. Scalar expressions retain casts and evaluation order. An opaque FX call is retained as opaque until an importer or a valid decomposition supplies this meaning.
+
+For example, a convolution importer can express an output as a sum over input channels and filter coordinates. The input address includes stride, dilation, padding, and groups. This can use a generic indexed contraction without first allocating an `im2col` tensor. Pooling uses indexed reductions. These rules require implementation and tests; accepting an FX node alone does not provide them.
+
+MLIR Linalg provides useful precedent for explicit indexing and reduction structure. MegaBake uses that idea without adding MLIR as a new compiler dependency. [Linalg design](https://mlir.llvm.org/docs/Dialects/Linalg/)
+
+### Semantic regions
+
+Recognize RMSNorm, RoPE, attention, and gated MLP from normalized source operations to enable faster candidates. Retain their source bodies and secondary outputs. A semantic name states what is computed; it does not fix the task boundary. A failed matcher must leave the underlying graph available for generic lowering.
+
+Each definition needs an exact matcher, parameters, and a reference expansion or evaluator. Check its numerical behavior and effects. Include epsilon placement, rotation convention, masks, grouped heads, probability casts, and KV effects where applicable.
+
+This separation follows the useful part of the MLC design: graph transformations and tensor schedules solve different problems. A fused graph function still needs a good device schedule. [MLC graph optimization](https://book.mlc.ai/chapter_graph_optimization/index.html)
+
+### Coverage and fallback
+
+Use this order for each region:
+
+1. Import its tensor meaning. Apply a selected PyTorch decomposition when it supplies supported primitives and preserves the workload contract. Keep source links through expansion. Do not erase useful contraction or attention structure as a prerequisite for matching.
+2. Keep a correct baseline lowering for those primitives. Generate it when needed as an execution candidate or a correctness reference. A new combination of supported primitives needs no new model matcher.
+3. Add legal fused or tuned candidates. Keep the baseline available when matching, resource admission, or tuning fails.
+4. If no device plan covers the complete invocation, follow the explicit fallback policy before execution.
+
+Baseline generation uses a few reusable schedules: indexed elementwise work, reductions, and indexed contractions. Use masked loads, explicit output ownership, bounded loops, global intermediates, and ordered phases. Large reductions can loop within one CTA, or use partial results and a later merge phase when numerically allowed. They need not fit entirely in shared memory. This path favors coverage and correctness; it can be much slower and use more workspace than a tuned body.
+
+| Situation | Required behavior |
+| --- | --- |
+| Unrecognized RMSNorm variant built from supported primitives | Generate its reduction and elementwise expressions; no named RMSNorm body is required |
+| New vision block built from supported contractions, indexing, reductions, and maps | Compile its graph through the same planner, without a model-specific registration |
+| Known semantics but no tuned configuration for this shape or stride | Use a legal baseline body and report that choice |
+| FX call with no importer and no usable decomposition | Preserve it and report its target, FX source, and missing lowering |
+| Unknown mutation, RNG contract, custom device operation, or unsupported data-dependent allocation | Require a semantic/effect rule and a legal implementation before admitting it |
+| Supported semantics but no legal one-kernel resource or synchronization plan | Report composition failure; scalar fallback does not waive launch legality |
+
+Provide the proposed option `fallback=error|inductor`, independent of `mode`. Default to `error` for megakernel compilation and evaluation. If MegaBake has no valid complete plan, `inductor` permits delegation of the **whole captured invocation** to the pinned Inductor path. That path must support the invocation. Report the delegation reason and actual launch count. This establishes compatibility, but does not count as a megakernel result or a performance-gate pass. The option is not implemented yet.
+
+The version adapter must delegate without recursively entering MegaBake and must keep the same PyTorch wrappers. Make the choice before device execution. Do not catch a failed, partly executed stateful kernel and rerun the invocation. Initial fallback is for the whole invocation; partitioned execution needs a separate alias, effect, and boundary analysis.
+
+Record three independent facts: semantic coverage, execution kind (`megakernel` or `inductor_fallback`), and measured performance. For megakernels, also identify regions that used generic bodies. A missed optimization must not be presented as an unsupported model. An unknown operator must not be presented as supported merely because Dynamo captured it.
+
+## 4. Preserve the PyTorch contract
+
+Use a small adapter for a pinned PyTorch build. Obtain the live FX graph after the selected AOT/Inductor preparation and post-grad passes, before Inductor lowering and scheduling. Functionalization and runtime adaptation can occur in the AOT path; do not assume that one post-grad pass supplies the whole contract.
+
+Preserve the PyTorch wrappers for lifted arguments, output structure, guards, and mutation handling. Refresh tensor metadata after rewrites. Return the compiled callable through the expected wrapper and boxing convention. Bind current runtime inputs and parameters on every call.
+
+The existing capture script has a cache path that can bypass the intended handoff. Repair it before using its result as compiler input. A text trace is an inventory, not an executable frontend contract. Verify the installed wheel's internal API; an adjacent PyTorch checkout can differ.
+
+Start with inference under `no_grad`, concrete guarded shapes, and `fullgraph=True`. Reject unsupported graph breaks or training. Audit wrapper copy-back and materialization when checking the one-kernel requirement.
+
+Numerical policy is part of the workload. Preserve explicit source casts, including casts that no longer require a memory store:
+
+```text
+FP32 GEMM accumulation -> BF16 result -> FP32 activation -> BF16 result
+```
+
+A fused body must keep those rounding points unless a declared policy permits a change. Split reductions, online softmax, approximate activation functions, and algebraic motion across GEMM need their own checks. Set tolerances before testing. Do not increase them to accept a failing candidate.
+
+## 5. Choose body families before choosing arbitrary tiles
+
+**Maintain a small number of parameterized generators, with optional specialized implementations.** The catalog is not one handwritten kernel per operation variant.
+
+Every provider accepts the region's tensor program, its semantic parameters, and target constraints. It returns a device body or an explicit reason it cannot implement that program. Generated baseline and tuned bodies share the interface in section 6 and all resource, numerical, and synchronization checks.
+
+### Variants without a kernel for each variant
+
+For a norm, separate the row/reduction schedule from the scalar expressions that surround it. A common RMSNorm expansion is:
+
+```text
+u[r,c] = cast_fp32(x[r,c])
+v[r]   = sum_c(u[r,c] * u[r,c]) / width
+y[r,c] = source_cast(u[r,c] * rsqrt(v[r] + epsilon) * weight[c])
+```
+
+Generate the exact source program. Epsilon placement, intermediate casts, residual inputs, affine terms, axes, and extra outputs remain explicit. Some variants fit one reduction body with generated expressions before and after the reduction. Others need more phases. A specialized RMSNorm implementation is eligible only when its full semantics match. In particular, a body fixed to `epsilon=1e-6` cannot implement every RMSNorm captured from FX.
+
+For attention, keep a tuned tiled pipeline and compile supported score and mask expressions into it:
+
+```text
+score = score_expr(dot(q, k), batch, head, query_index, key_index, bindings)
+valid = mask_expr(batch, head, query_index, key_index, bindings)
+```
+
+These are typed expressions compiled into device code, not runtime Python callbacks. A score bias, soft cap, causal rule, or window rule can fit this interface without a separate handwritten pipeline. The expressions must satisfy the provider's access and numerical rules. A score transform that depends on a whole score row may require another reduction and does not automatically fit a local score hook.
+
+The attention family also owns head mapping, KV access, softmax state, probability casts, and all requested outputs. Selecting online softmax requires a valid numerical policy. Block skipping requires proof from the mask; it cannot be inferred from arbitrary score data. Dynamic mask metadata has a recurring cost that must stay in the execution plan. PyTorch FlexAttention is a useful example of compiling score and mask variations into a tuned template. Its separately launched implementation is not itself a composable CuTe body. [FlexAttention design](https://pytorch.org/blog/flexattention/)
+
+If an attention variant falls outside this interface, lower its supported source operations through the baseline generators. Account for materialized score tensors and workspace limits. Changes such as a different normalization algorithm can require a new algorithm family; a template is not a universal attention implementation.
+
+### Coupled configurations
+
+A good GEMM is a coupled choice of instructions, tile shape, layouts, warp roles, pipeline depth, and work order. Do not let the outer scheduler choose these fields independently and then ask a generic GEMM to cope.
+
+A body provider returns a small set of legal configurations:
+
+```text
+BodyConfig:
+    supported operation and numerical policy
+    accepted expression hooks and access/effect restrictions
+    shape, stride, alignment and tail requirements
+    MMA family, CTA tile, cluster shape, work partition
+    participating threads, warp roles and register requirements
+    shared-memory layouts, stages, barriers and async operations
+    accepted input layouts and produced output layouts
+    measured performance and resource evidence for this target
+```
+
+Begin with these families:
+
+| Work | Candidate family | Main selection criteria |
 | --- | --- | --- |
-| `Gemm` | Batch/contracted axes, orientation, strides, operand/result dtypes and accumulation policy | Matching input tiles across the full contracted dimension |
-| `Pointwise` | Scalar expression, typed constants, broadcast maps and cast points | Corresponding input elements |
-| `Reduce` | Axes, combiner, keepdims, accumulation dtype and result cast | The complete stated reduction domain |
-| `View` / `Broadcast` | Coordinate map, boundary strides and alias/copy behavior | The mapped source elements |
-| `Cast` | Source/destination types and rounding point | The same logical elements |
-| `OpaqueFX` | Source-backed unsupported region with its boundaries and effects | Unknown until a verified lowering is supplied |
+| Small-M projection | Vector/SIMT GEMV, warp MMA, small-M WGMMA | Weight access, enough tiles, padding, reduction cost |
+| Larger projection | Hopper TMA/WGMMA pipeline | Reuse, tensor-core utilization, stage count, wave balance |
+| Norm, activation, residual, RoPE | Vector or reduction body | Memory traffic, exact casts, local ownership |
+| Prefill attention | Fused tiled attention | Q/K/V layout, causal mask, softmax policy, query parallelism |
+| Decode attention | KV streaming; split context when useful | Batch/head parallelism, KV length, state layout, partial merge cost |
 
-For GEMM, output `(m,n)` reads `A[m,k]` and `B[k,n]` over `k`. A bias broadcast reads `bias[n]`. These are index maps. Composing them tells the planner which source tiles a consumer needs. Start with concrete mappings for the supported operation families rather than a general symbolic solver. [MLIR structured indexing](https://mlir.llvm.org/docs/Dialects/Linalg/)
+The families overlap. A large decode batch may use the same GEMM family as prefill. A short prefill can need a small-M body. No constant `M` threshold is universal.
 
-Normalize equivalent FX forms before semantic matching: transpose/view plus `mm` can become a GEMM with explicit operand maps; broadcasts become explicit maps; redundant pure views may disappear when their alias behavior is preserved. A reshape that needs a copy remains work. Unknown effects or mappings cannot be assumed pure.
+Use the official CuTe Hopper kernels as the first source for GEMM mechanics. Use DeepGEMM and FBGEMM GenAI as targeted references for gaps. Their host APIs do not satisfy the device-body contract. Test any extraction against the original implementation. [CuTe Hopper source](https://github.com/NVIDIA/cutlass/tree/0b55a2f691d69981583568fd9eb69687b1f0de8a/examples/python/CuTeDSL/cute/hopper/kernel/dense_gemm)
 
-Retain numerical boundaries. For example:
+Start with one-CTA clusters on SM90 to bound the first experiment. Record the performance cost of that restriction. The plan contains participant scope, so a later cluster body can be added without pretending that it is a single-CTA task. Add it when the measured gap requires it.
 
-```text
-GEMM accumulation -> BF16 result -> FP32 SiLU -> BF16 output
-```
+## 6. A device body must retain its pipeline
 
-A fused body can keep these values on-chip, but it must still perform the required BF16 rounding before widening to FP32. Eliminating an HBM store does not authorize eliminating a cast.
+**The unit of dependency need not be the unit of pipeline initialization.**
 
-The graph verifier checks definitions/uses, shapes, dtypes, maps, source coverage, outputs and effects. The region verifier checks every external input and live output, including values used outside a match. Refresh derived facts after rewrites. Tuple-valued primitives and their selected outputs must be imported explicitly when the captured workload contains them.
+A dependency can become ready for one output tile. A GEMM worker may process a range of such tiles while retaining its TMA/MMA pipeline. Reinitializing barriers and draining every stage at each tile can destroy the source kernel's advantage.
 
-## 5. Semantic operations: reusable definitions of common LLM work
-
-A semantic operation gives a useful name to a proved computation. It does not prescribe a tile size or force the whole operation into one device task. Generic fusion also remains available when no named pattern matches.
-
-Maintain a small definition table. Each entry has:
-
-- A generic reference body or a way to expand to existing generic operations.
-- Typed parameters and a verifier for the exact supported variant.
-- A matcher for normalized source regions, retaining all source IDs and live outputs.
-- Candidate device-body families with their capability checks.
-
-Start with ordinary functions and a table. Add definitions as real fixtures need them. MPK's implementation similarly exposes named operations and registers their mapped task implementations; this is useful precedent for a concrete implementation catalog. [MPK operation definitions](https://github.com/mirage-project/mirage/blob/mpk/python/mirage/mpk/persistent_kernel.py)
-
-| Definition | Parameters that determine its meaning |
-| --- | --- |
-| `RMSNorm` | Axes, epsilon value/location, accumulation dtype, weight order and exact casts |
-| `RoPE` | Rotation convention/dimension, positions, cos/sin inputs, layout and arithmetic order |
-| `Attention` | Q/K/V layouts, head/group mapping, scale, masks, softmax axis/dtype, probability casts, dropout and state effects |
-| `GatedMLP` | Gate/up/down projections, activation expression, multiply and all rounding boundaries |
-
-For example, this is a complete conceptual transformer block, with each name retaining its precise underlying computation:
+Use this conceptual device interface:
 
 ```text
-n1       = RMSNorm(x, norm1_weight)
-q, k, v  = Gemm(n1, Wq), Gemm(n1, Wk), Gemm(n1, Wv)
-qr, kr   = RoPE(q, k, positions, cos, sin)
-context  = Attention(qr, kr, v, mask)
-h        = Add(x, Gemm(context, Wo))
-n2       = RMSNorm(h, norm2_weight)
-gate, up = Gemm(n2, Wgate), Gemm(n2, Wup)
-mix      = Multiply(SiLU(gate), up)
-out      = Add(h, Gemm(mix, Wdown))
+run(work_iterator, tensor_bindings, scratch, epilogue)
+    establish the declared warp roles and pipeline state
+    process the assigned ready tiles
+    publish outputs at the declared completion points
+    drain asynchronous work before releasing scratch or changing roles
 ```
 
-Shapes, masks and casts are omitted here only for readability; they remain explicit in the actual IR. A Q/K/V combined implementation or an RMSNorm-plus-linear implementation is a planner candidate over these computations. Matching a name never hides secondary outputs, aliases or numerical requirements.
+`work_iterator` supplies tile coordinates and, if supported, reduction ranges. It must not force a whole-GEMM library scheduler or an extra launch. It can be a static arithmetic iterator; no virtual call or general queue is required.
 
-### Algebraic changes require a separate decision
+A provider may also expose a tile entry for fine-grained composition. That entry is admitted only after its cost is measured. A basic tile entry that drains all work is useful for correctness, but is not the required performance path for every GEMM.
 
-Mirage demonstrates moving RMSNorm division after a matrix multiplication to improve data reuse. That motivates a candidate optimization, but the source graph's intermediate rounding can prevent its use in MegaBake. [RMSNorm/linear example](https://mirage-project.readthedocs.io/en/latest/tutorials/rms-norm-linear.html)
+Every entry must state:
 
-The default policy preserves explicit casts and source semantics with declared numerical tolerances for the supported backend. Any relaxed reassociation or approximate arithmetic requires an explicit numerical policy and end-to-end validation; it cannot be enabled by silently widening tolerances after a failure. Algebraic equivalence alone does not prove floating-point equivalence. Mirage's own verifier supplements algebraic checks with floating-point tests. [Mirage numerical verification, §5.2](https://www.usenix.org/system/files/osdi25-wu-mengdi.pdf)
+- Which threads participate in each collective and which threads may wait.
+- Which scratch, barriers, and descriptors it owns, including alignment and initial state.
+- Which outputs are ready on return and whether readiness can be published sooner.
+- When all async reads/writes are done and the next body may reuse scratch.
+- Which register fragments can feed an epilogue without conversion.
+- How it leaves register allocation and warp roles for the next body.
 
-## 6. Tasks and events: describe exactly what can run
+Allocate reusable scratch in the enclosing worker. Remap barrier IDs when needed. Do not assume that calling a function twice resets its barrier phases. A TMA descriptor contains layout and address information; create or bind it for the current call. Cached descriptors must not retain example-tensor addresses.
 
-The planner selects a body family, output tiling and reduction strategy, then creates **task instances**. A task instance binds a reusable body to particular tensor tiles. Initially one worker CTA executes a task; an SM is the hardware execution location, not a permanently named tensor owner.
+A phase boundary can drain a pipeline. Inside a phase, keep its normal steady-state loop. Cross-region prefetch is a later optimization with explicit buffer lifetimes. It must not consume an unpublished activation or hold storage needed to finish the current task.
 
-```text
-DeviceTaskPlan:
-    task ID, source region/coverage, body variant and tile parameters
-    input/output regions and bindings, full reduction requirements
-    participant/layout/resource requirements, memory accesses and effects
-    prerequisite events, completion events, completion/release conditions
+CuTe's experimental task-scheduling API may help check the schedule inside a body. Its warp tasks are distinct from MegaBake's cross-CTA tile dependencies. Evaluate it locally; do not build a second general scheduler around it. [CuTe task scheduling](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/ts_general/ts_introduction.html)
 
-EventPlan:
-    event ID, distinct producer task IDs, consumer task IDs
-    expected completion count, invocation-local state, visibility protocol
+## 7. One compiler, two workload modes
 
-TaskGraph:
-    tasks, events, source/effect coverage, intermediate uses
-```
+The intended option is `--mode prefill|decode`, with an equivalent backend configuration. This interface is proposed; it is not implemented in the current checkout.
 
-A task is ready when all its prerequisite events are ready. An event becomes ready after all its producer tasks have published their completed work. Each producer contributes once to each event. External inputs are already available under the invocation's stream dependencies; they need no fictitious producer task.
+The mode chooses policy defaults and validates the captured workload. The graph still determines the computation. Changing the flag cannot create a KV cache, remove outputs, or turn a no-cache forward into stateful decode.
 
-### A running MLP example
-
-Suppose gate and up each produce two output tiles. Choose separate tasks first so dependencies are visible:
-
-```mermaid
-flowchart LR
-    G0[Gate tile 0] --> E0[Event 0: both inputs ready]
-    U0[Up tile 0] --> E0
-    E0 --> M0[SiLU and multiply tile 0]
-    G1[Gate tile 1] --> E1[Event 1: both inputs ready]
-    U1[Up tile 1] --> E1
-    E1 --> M1[SiLU and multiply tile 1]
-    M0 --> ED[Event D: required reduction input ready]
-    M1 --> ED
-    ED --> D[Down-projection output tile]
-```
-
-`Event 0` counts two producers. The first multiply tile can run without waiting for gate/up tile 1. In this example the down-projection tile reduces over both mix tiles, so it waits for both. A split reduction would need explicit partial-result and combining tasks with a verified numerical policy.
-
-Alternatively, one body may calculate gate tile 0, up tile 0 and their multiply locally. Its internal edges then use local ordering/barriers rather than device events. The compiler chooses this only if fragment layouts and resources fit. Both arrangements implement the same complete MLP inside one enclosing kernel.
-
-### Derive dependencies from actual accesses
-
-For each task, use the index maps to compute required input regions and produced output regions. Connect a consumer to every producer whose writes supply its reads. Include write/write and read/write ordering required by aliases or state effects. Reduction inputs must be complete; matching only an output shape is insufficient.
-
-Start with exact pairwise overlap checks for small concrete fixtures. Their quadratic cost is acceptable initially; add interval/tile indexing when graph-construction measurements require it. Resolve views to their underlying storage regions. A conservative dependency is safe when proved sufficient, but its lost parallelism must be visible in the plan.
-
-### Simplify events without losing dependencies
-
-Use explicit producer/consumer sets as the first understandable representation:
-
-1. Merge events with identical consumer sets by taking the union of their producer sets.
-2. Merge events with identical producer sets by taking the union of their consumer sets.
-3. Deduplicate sets and rebuild counts and task/event links after each transformation.
-4. Check that required dependency reachability is preserved and the result remains acyclic.
-
-These rules follow MPK's event fusion. Merge only equivalent readiness conditions; grouping merely adjacent tasks can introduce unnecessary waits. [MPK event fusion, §4.1](https://arxiv.org/html/2512.22219v2#S4.SS1)
-
-Keep multiple event IDs per task initially. Use flat arrays and offset/count pairs for device metadata. If descriptor traffic becomes expensive, consider normalized single-prerequisite/single-completion descriptors and contiguous successor ranges. MPK's runtime headers illustrate compact task/event records. Such compression is an optimization: auxiliary relay tasks, unique completion counts and preserved dependencies need verification. Arbitrary successor sets cannot be encoded as one range unless their ordering actually makes them contiguous. [MPK descriptor definitions](https://github.com/mirage-project/mirage/blob/mpk/include/mirage/persistent_kernel/runtime_header.h)
-
-## 7. Device bodies: fast computation that can compose
-
-A **device body** is callable inside the megakernel. It must not invoke a host launcher. GEMM is the first performance anchor; norm and attention bodies follow. Reuse compatible CuTe implementations where their device-side work is accessible.
-
-Every body declares a capability contract:
-
-| Contract item | Why the planner needs it |
-| --- | --- |
-| Supported shapes, dtypes, strides and tails | Reject unsupported bindings before code generation |
-| Participating threads/warps and collective scope | Keep MMA, barriers and other collectives valid |
-| Logical tile maps and fragment layouts | Determine ownership and conversion requirements |
-| Shared-memory size/alignment, barriers and async resources | Compose bodies without overlapping live storage or barrier state |
-| Numerical policy and side effects | Preserve the source computation and state behavior |
-| Completion and release conditions | Know when outputs are visible and scratch storage is reusable |
-
-Begin with a run-to-completion body interface. Every task finishes its asynchronous work before publishing completion. In a local composition, a GEMM may pass its register fragment directly to a compatible epilogue. Otherwise plan an explicit conversion or shared-memory exchange. Even matching logical shapes can have incompatible thread ownership.
-
-Choose local fusion, layouts and memory placement together. Mirage's transpiler provides concrete examples of epilogue reuse, layout constraints, swizzling and the tradeoff between barrier count and live shared memory. MegaBake starts with supported CuTe layout variants and measured enumeration; a global ILP solver is not an initial dependency. [Mirage CUDA transpiler](https://mirage-project.readthedocs.io/en/latest/cuda-transpiler.html)
-
-## 8. The persistent runtime inside the one kernel
-
-### First runtime: fixed workers and static task lists
-
-Use a finite worker set, explicit task/event arrays and one compiler-assigned task list per worker. Every list respects a common topological order. No separate scheduler CTA is required for this first schedule.
-
-The conceptual kernel does the following:
-
-```text
-initialize this invocation's counters and required workspace state
-establish initialization visibility for every worker
-for each worker, following its assigned task list:
-    wait until the task's prerequisite events are ready
-    execute the body with the required participating threads
-    finish required asynchronous operations and publish outputs
-    notify each completion event exactly once
-finish the workload after every required task and output is complete
-```
-
-This is an execution description, not valid CUDA synchronization code by itself. The implementation must supply the following three proofs.
-
-**Initialization and residency.** The first cross-CTA prototype should use a supported cooperative launch with a grid within the compiled kernel's co-residency limit. Initialize state inside the kernel and use its legal grid synchronization before reading it. Query actual device support and resources, including MIG. If the selected CuTe launch route cannot provide this, implement a supported launch adapter or prove an alternative before accepting that schedule. Occupancy arithmetic alone does not make an ordinary-grid global spin barrier legal. [CUDA cooperative-launch requirements](https://docs.nvidia.com/cuda/cuda-runtime-api/cuda_runtime_api/group__CUDART__EXECUTION.html)
-
-**Publication and observation.** Producer writes, including required asynchronous completion, precede device-scope publication. A consumer observes readiness with the matching acquire semantics before reading data. A many-producer counter protocol must carry visibility from every producer, not just the final writer; use a proved atomic/fence sequence with the necessary memory and proxy scopes. Collective producer completion must include all participating threads. A relaxed atomic increment or a volatile flag alone is insufficient. [CUDA memory model](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html)
-
-For the first ordinary global-memory handoff, validate this concrete protocol: finish producer writes, synchronize its participating CTA threads, then have one elected thread perform a device-scope acquire-release counter increment. Each consumer's elected thread polls the counter with acquire loads until the expected count is reached, then synchronizes its CTA before consumption. The read-modify-write chain must carry all producer publications to the consumer. Use counters large enough for the verified producer count and reset them during the in-kernel initialization phase. Bodies using TMA or other asynchronous/proxy accesses require their additional completion/fence rules before this publication step.
-
-**Forward progress.** For the static schedule, include both data dependencies and per-worker task order in the wait graph. All edges must respect a global topological order. With resident workers, finite bodies and no additional resource-acquisition cycle, an unfinished task with minimal order can complete; repeating this argument establishes progress. Recheck the argument when adding queues, pipelining or shared resource allocation. Workers with no remaining tasks must still participate in any required collective completion phase.
-
-Start with invocation-private workspace and a single active invocation per workspace. Same-stream reuse is valid after the preceding invocation's completion. Concurrent invocations require independent state or explicit synchronization. Never depend on freshly allocated memory being zero. Counter initialization, reuse and eventual generation wrap must be defined if generation-based protocols are later introduced.
-
-The MPK source inspected during this design has a separate preparation launch and an optional split worker/scheduler launch path. MegaBake borrows the task scheduling ideas while integrating required per-invocation initialization and scheduler work into its single kernel. [MPK launch implementation](https://github.com/mirage-project/mirage/blob/mpk/include/mirage/persistent_kernel/persistent_kernel.cuh#L1851)
-
-### Later runtime: measured hybrid dispatch
-
-Retain static assignment for predictable work. When measured duration variation leaves workers idle, add ready-task dispatch for the affected work. Ready dynamic tasks should take priority over an unready static head; polling must not prevent useful producers from running. MPK's hybrid AOT/JIT task dispatch is the reference for this tradeoff. Here AOT/JIT describe device-task dispatch timing, not frontend compilation. [MPK hybrid dispatch, §5.2](https://arxiv.org/html/2512.22219v2#S5.SS2)
-
-The dynamic design must define unique task claiming, queue publication, capacity/backpressure, fairness, progress and termination with work still in flight. A task appears exactly once, and an empty queue alone cannot mean the workload is done. Reserve scheduler warps or CTAs only when measurements justify their lost compute capacity; tune the allocation for actual available resources.
-
-## 9. Memory placement and complete-kernel resources
-
-One megakernel may still use global workspace. The aim is to reduce total latency while keeping placement legal:
-
-| Placement | Appropriate use | Required check |
+| Property | Prefill policy | Decode policy |
 | --- | --- | --- |
-| Registers | Compatible operations inside a body/local composition | Fragment ownership and whole-kernel register pressure |
-| CTA shared memory | Cooperating threads in the same resident worker | Layout, barriers, live storage and alignment |
-| Global workspace | Data exchanged across workers or retained beyond local storage | Publication, lifetime and traffic cost |
-| Recompute pure work | Cheap computation whose stored result would cost more | Numerical equivalence, effects and measured total cost |
+| Workload facts | Batch, query length, existing KV prefix, mask | Batch, query/draft count, valid KV lengths, capacity, state writes |
+| GEMM priority | Reuse and throughput when M is large | Weight bandwidth and parallelism when M is small |
+| Initial work schedule | Long ranges within each phase | Static ranges; finer readiness only where it removes real idle time |
+| Attention | Tiled query/key work with valid causal offsets | Stream KV; split context only if merge cost is repaid |
+| Fusion priority | Epilogues and expensive intermediate traffic | Launch cost, vector chains, weight reuse, state-update locality |
+| Correctness evidence | Complete prompt outputs and any requested cache | Multiple advancing steps, updated state and capacity boundaries |
 
-Shared-memory data does not follow a task that runs on another CTA. Cross-task local reuse requires a verified same-worker assignment and a storage contract. Cross-CTA communication initially uses global workspace.
+The plan key includes actual dimensions and state format as well as mode. Start decode with a bounded contiguous cache. Add paged or ragged layouts through explicit access contracts when a workload requires them. Runtime valid lengths must stay within guarded capacities. Do not specialize on their values without valid guards.
 
-Allocate distinct intermediate slices first. Reuse storage only when all readers, including asynchronous reads, have completed before the next writer begins. Task-list position on one worker does not prove that a reader on another worker has finished. Use dependency-based happens-before proofs or explicit release events. Never overwrite returned outputs or live aliases.
+The TPU reference supports this separation through distinct prefill and fused decode paths. Its TPU layouts and DMA schedule do not transfer directly to CUDA. [Inspected TPU implementation](https://github.com/Inferact/tpu-megakernels/blob/4048f0820aa4ff8787f707ca9d99b2bada9751aa/qwen/decode_megakernel.py)
 
-Memory layout includes padding and swizzling where required by the body. Tail handling must keep collective instructions valid and prevent out-of-bounds reads, including MMA loads. Fewer barriers can lengthen lifetimes and reduce occupancy; evaluate the combined effect.
+## 8. Start with phases; refine only the useful dependencies
 
-Compile the **complete megakernel** before final feasibility/performance selection. Record registers per thread, static/dynamic shared memory, spills, launch limits and achievable residency, including runtime overhead. Sequential tasks can reuse scratch storage, but compilation can still impose a high register requirement across all task types. Per-body estimates do not prove the resources of the combined kernel. [CUTLASS GEMM resource considerations](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/efficient_gemm.html)
+A **phase** is an ordered part of the one kernel. It contains one body family or a compatible local composition. Persistent CTAs process ranges of tiles. A phase boundary uses a valid grid barrier. Workers with no tiles still join the barrier. It does not launch a new kernel.
 
-### Later: cross-task prefetching
-
-After a correct full-model path exists, consider separating a body into preload and compute phases. Preload only inputs whose producers have published them. Independent weights may become available earlier than activations. Overlap needs distinct live storage, valid async/barrier state and enough resources for both phases.
-
-Begin with a bounded double buffer on one worker. Consider paged shared-memory management only when mixed body footprints make it worthwhile. MPK uses page acquisition/release to support cross-task pipelining; this is an advanced optimization rather than a prerequisite for the first runtime. [MPK pipelining, §5.3](https://arxiv.org/html/2512.22219v2#S5.SS3)
-
-Prefetch must be optional when space is unavailable. It cannot hold resources needed by the current task to finish or read an unpublished activation. Buffer release waits for async operations as well as logical consumers.
-
-## 10. Select and cache the fastest valid plan we have measured
-
-Keep the initial search small: a few device-body variants, tile sizes, pipeline depths, worker counts and compatible layout/placement choices. Candidate regions are temporary planner data, not another mandatory IR hierarchy. Recognition does not permanently fix task boundaries.
-
-For each candidate:
-
-1. Check source coverage, semantics and numerical policy.
-2. Build its tasks/events and reject invalid dependency, ownership or lifetime plans.
-3. Compile the complete kernel and reject unsupported resource/residency configurations.
-4. Verify outputs, effects, repeated execution and the one-launch contract.
-5. Benchmark the entire declared workload and keep the fastest valid candidate.
-
-Use inexpensive FLOP/byte/resource estimates to prune; use end-to-end measurements to select. Record the search budget, candidate rejection reasons and performance gaps. A globally optimal kernel is not promised by a bounded search. Exhausting the search without a valid candidate reports unsupported compilation.
-
-Cache keys include source/graph and body identity, numerical policy, guarded shapes/strides/dtypes, semantic constants, GPU architecture and resource configuration, compiler/toolchain versions, and relevant scheduling assumptions. Ordinary runtime parameter values remain runtime data. Folded or prepacked values require an explicit validity/invalidation contract. Rebind runtime addresses on each call; cached pointers to example inputs are invalid.
-
-The final plan is small enough to inspect:
+For a first MLP plan:
 
 ```text
-KernelPlan:
-    exact declared workload and source coverage
-    task/event graph, body specializations and local compositions
-    worker schedule, tile/fragment layouts and intermediate placements
-    visibility, initialization, lifetime, progress and termination protocols
-    one launch configuration, bindings and specialization requirements
-    compiled resource report and chosen-candidate measurements
-
-ExecutionPlan:
-    one KernelPlan plus the frontend's input/output/runtime bindings
+phase 0: gate/up projection candidates, with SiLU/multiply where legal
+barrier: all values needed by the down projection are ready
+phase 1: down projection and any supported residual epilogue
 ```
 
-These are contracts; separate Python classes are only needed if they simplify the actual implementation.
+Compare separate gate/up ranges, a combined projection, and paired local computation. Packing weights has a validity and setup cost. Do not concatenate weights every call outside the measured kernel. A paired body may lose through extra accumulators even when it avoids a store.
 
-## 11. Verification and performance evidence
+The down projection reduces across the MLP intermediate dimension. Giving it a matching output tile does not make its input complete. It needs all required producer tiles, or an explicit split reduction with a final combination.
 
-Keep source-linked dumps after import, normalization, recognition and planning. A failed check should identify the FX region, task, event or body capability involved.
+Phase ordering gives a small first runtime and a clear progress proof. It can lose overlap. Keep the dependencies in the plan so that measured bottlenecks can be refined into tile events without changing the semantic graph.
 
-| Check | What passing establishes |
-| --- | --- |
-| Frontend | Stable graph phase and correct runtime bindings/guards |
-| Graph/region | Preserved computation, numerics, effects and all live boundaries |
-| Task/event | Complete dependencies, valid reductions, unique completion and acyclic ordering |
-| Kernel plan | Compatible bodies, legal storage, visibility, progress and launch resources |
-| Executable | Full output/state correctness, repeated-call behavior and exactly one workload kernel |
-| Measurement | Reproducible latency against equivalent effective baselines |
+### Tile readiness when needed
 
-Stress delayed producers, fan-in/fan-out, uneven tails, changed inputs, repeated workspace use, applicable masks and multi-step state updates. Include deliberately invalid plans so the verifiers themselves are exercised. Compare intermediate values in diagnostic runs to locate failures, then validate the complete workload.
+For a candidate body configuration, derive the input and output regions from its tile maps. Add dependencies for overlapping producer writes and consumer reads, plus alias and state ordering. Include every part of a reduction. A same-CTA assignment alone does not prove that register fragments have compatible ownership.
 
-Initial GEMM measurements cover the observed `M=4, K=576, N=1536` projection and a larger case such as `M=256`, with actual transposed-weight layouts. Compare library/eager, CUDA Graph and suitable Inductor configurations on the same target. Record whether autotuning actually activated on the available MIG resources. Add a strong attention baseline for block/model comparisons.
+Represent an event as a set of distinct producers and consumers. Its count is the number of contributing producers, not a guessed tensor extent. Begin with exact overlap checks on concrete fixtures. Use regular tile ranges to avoid quadratic expansion on a full model.
 
-Separate compile/first-call cost from warmed GPU and synchronized host-call latency. Keep raw samples, numerical errors, workspace sizes, compiler resource reports and launch traces. Record model revision, seeds, output scope, dtype, guards, GPU/MIG resources and exact toolchain revisions. Performance traces and instrumented task timelines are separate from uninstrumented timing runs.
+Identical prerequisite sets can share an event. Consumers with identical prerequisites can share the completion condition. Remove edges only when equivalent dependency reachability is proved. Recheck unique contributions, cycles, and all required source dependencies after event changes.
 
-## 12. Build order and current state
+Keep arbitrary prerequisite sets in the kernel plan. MPK's single wait/completion event slots are a compact runtime encoding with graph restrictions. They must not constrain the compute graph. If an event optimization cannot encode a graph, retain more events or use the correct phase plan. Operation-level reachability alone does not prove that a residual tile dependency is redundant.
 
-| Stage | Result to build | New design emphasis |
+Use static assignment first. Include data edges and per-worker order in the wait graph. All edges must respect a common topological order. With resident workers, finite bodies, and no hidden resource wait cycle, the earliest unfinished work can run. Dynamic claiming is justified only by measured imbalance; it then needs unique claims, bounded queues, fairness, and termination with work in flight.
+
+MPK supplies valuable examples of mapped tasks, events, and compact ranges. Its inspected runtime also uses a preparation kernel and can split workers and schedulers into separate launches. Adapt the useful algorithms to MegaBake's launch contract. [Inspected MPK runtime](https://github.com/mirage-project/mirage/blob/f9eb70c254acefc9f3667b2a973d0dcf25471fce/include/mirage/persistent_kernel/persistent_kernel.cuh)
+
+## 9. Make synchronization and resources admission checks
+
+### Launch and progress
+
+The first runtime uses a cooperative launch on a supported device, with the grid bounded by the **compiled complete kernel's** active-block limit. Verify the actual MIG configuration. An ordinary grid with an occupancy estimate is not a proof that a global spin barrier is safe. [CUDA cooperative groups](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cooperative-groups.html)
+
+The installed DSL exposes a cooperative launch option. A tested grid-barrier implementation is still required. Proving that integration is gate G0, before the full frontend or scheduler. The `grid_sync` operation in a plan is a requirement, not a claim that this checkout has a working DSL primitive for it.
+
+Initialize per-call event state inside the kernel, then establish grid-wide visibility before any worker reads it. Use invocation-private workspace. Reuse it only after the previous invocation has completed. Independent concurrent calls need separate state.
+
+### Publication
+
+A producer must finish relevant writes and async operations before it publishes readiness. Use device-scope release/acquire semantics, with CTA synchronization so that all participating threads are covered. For a many-producer counter, the atomic chain must carry every producer's writes to the consumer. A volatile flag or a relaxed increment alone is insufficient.
+
+For ordinary global stores, test this candidate protocol:
+
+1. Each producer CTA finishes its writes.
+2. All participating threads in that CTA synchronize.
+3. One thread in each producer CTA increments the completion counter with acquire-release semantics.
+4. One thread in the consumer CTA polls with acquire loads until all producers have reported completion.
+5. The consumer CTA synchronizes before its threads read the produced data.
+
+Verify the exact generated protocol. TMA and other proxy accesses need their additional fences and completion rules. [CUDA memory model](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cuda-cpp-memory-model.html)
+
+Generation counters, queue termination, and cross-task prefetch each need additional correctness proofs. The first phase runtime does not require them.
+
+### Resources
+
+A launch has a fixed block size and resource envelope. Different phases can use different subsets of threads, but they must preserve collective participation. Compile the complete mixture of body types and measure registers, shared memory, local memory, occupancy, and code size.
+
+Sequential bodies can reuse shared scratch. That does not automatically reduce the compiled register requirement or the launch's shared-memory reservation. Warp register redistribution has hardware rules; it does not create a new block configuration at a function boundary. Paged scratch management does not remove the enclosing launch's resource limit.
+
+Reject a plan that spills excessively, exceeds launch limits, or cannot sustain its required workers. Keep the reason in the candidate report. A good standalone body is only the first admission test.
+
+## 10. Plan memory with ownership and lifetime
+
+| Location | Use | Proof required |
 | --- | --- | --- |
-| M0 | Reliable live frontend | Consistent post-grad phase and wrapped runtime contract |
-| M1 | Baselines and working CuTe toolchain | Small/large projection regimes on the actual GPU |
-| M2 | GEMM plus epilogue through the compiler | Generic maps, composable body contract and one launch |
-| M3 | Cross-CTA handoff and gate/up composition | Early visibility/progress proof and local-layout compatibility |
-| M4 | Persistent complete-MLP execution | Task/event construction, event fusion, static scheduling, memory and bounded tuning |
-| M5 | Complete transformer block | Parameterized semantic definitions and norm/RoPE/attention bodies |
-| M6 | Complete SmolLM invocation | Model-wide coverage, runtime effects, resource/code size and one-launch audit |
-| M7 | Stateful workloads and further optimization | KV state, measured hybrid dispatch, metadata compression and cross-task prefetching |
+| Registers | Body-local accumulators and epilogues | Same thread/fragment ownership; bounded live registers |
+| Shared memory | Work within a CTA or declared cluster | Compatible layout, participants, barriers and live ranges |
+| Global workspace | Cross-CTA handoff and long-lived values | Publication, sufficient extent, lifetime and alias safety |
+| Recompute | Cheap pure work | Numerical validity, no hidden effects, lower measured cost |
 
-M0–M6 are the path to the first complete model megakernel. M7 extends its supported regimes and reduces measured bottlenecks. Every added regime retains the same one-kernel contract. Distributed execution is a future scope decision; MPK's multi-GPU communication machinery is not a dependency of the initial single-GPU compiler.
+One kernel can use global workspace. Eliminating launches does not mean every intermediate stays on chip.
 
-Currently the repository has a capture/reference script, its CLI wrapper, an empty `src/megabake/__init__.py`, and saved trace artifacts. The saved SmolLM trace is a useful workload inventory, not an implemented compiler. Neither this architecture nor its implementation plan marks the proposed stages complete.
+Use distinct slices first. Reuse a slice only after all consumers, including async readers, finish. With phase barriers, phase lifetimes can prove reuse cheaply. With tile events, use dependency reachability or explicit release events. List order on one worker does not prove that another worker has finished reading.
+
+Keep logical access maps, task tile maps, and physical layouts separate. Mirage's `get_dtensor_tile_layout` constructs a layout from an already chosen tile shape and global strides. It is useful adapter code, not a tile optimizer. Use CuTe's layout operations as the backend representation. See [the source review](RESEARCH.md#what-to-reuse).
+
+Reuse Mirage's allocation core only with lifetimes established by MegaBake. Its shared-memory allocation algorithm is separable from its threadblock lifetime analysis. Its search range propagation can return a subset of accessed tiles in some cases; that analysis cannot be used unchanged to prove dependency coverage. See [the reuse decisions](MIRAGE_REUSE.md).
+
+Tail predicates must protect memory and satisfy collective instruction rules. Cover partial tiles, noncontiguous boundary tensors, and degenerate dimensions such as `M=1`.
+
+## 11. Search a small legal space, then measure
+
+Use staged selection:
+
+1. Recover workload facts and retain exact semantics.
+2. Obtain legal configurations from body providers.
+3. Prune impossible layouts, resource use, insufficient parallelism, and clearly excessive traffic.
+4. Compare standalone bodies with strong per-operation baselines.
+5. Compare the same bodies in resident ranges and in a representative mixed-body kernel.
+6. Build a few complete plans and check the whole invocation.
+7. Keep the fastest correct measured plan. Report gaps against the strongest equivalent baseline.
+
+Start with a few useful tile choices, a small set of pipeline configurations, and a few worker counts. Add a candidate only to address a measured gap. Search body configuration and outer plan together when one changes the other's resources or layout.
+
+Record why each candidate was rejected. Keep the search budget and raw samples. The MLC book's schedule search is a useful model: define a legal space, measure candidates, and keep the evidence. A learned cost model is unnecessary at this stage. [MLC automatic optimization](https://book.mlc.ai/chapter_auto_program_optimization/index.html)
+
+Cache by graph identity, guards, shapes, strides, types, semantic constants, mode/state layout, numerical policy, body revision, toolchain, and actual GPU resources. Parameters remain runtime data. Any packed or folded parameter needs an explicit invalidation rule for replacement and mutation.
+
+Avoid expanding identical transformer layers into duplicated device code. Specialize body variants by actual configuration, and bind layer-specific tensors through data. Measure code size and instruction-cache effects before adding more dispatch variants.
+
+## 12. Evidence required before expansion
+
+A body must pass four contexts: its original launch, a resident range, a mixture with the next required body, and the complete region. Then test a block and a complete model. Keep stateful decode in the early fixture set.
+
+The local research covers only the first two contexts for selected GEMMs and an Inductor MLP baseline. It does not prove heterogeneous composition, grid synchronization, attention, KV mutation, or full-model performance.
+
+First, test a small set of CuTe bodies under a legal persistent launch. Measure whether their complete region beats the equivalent compiled baseline. If a workload regime fails, fix the bodies or resource plan before adding more IR, matchers, or scheduler features.
+
+Follow [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md). Its gates make an architectural failure visible while the implementation is still small.
