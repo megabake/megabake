@@ -4,11 +4,13 @@
 
 [north-star.md](north-star.md) defines the scope. [ARCHITECTURE.md](ARCHITECTURE.md) defines the design. [RESEARCH.md](RESEARCH.md) records the work completed for this revision.
 
-[MIRAGE_REUSE.md](MIRAGE_REUSE.md) identifies source components to port and the checks each port needs. Generic operation coverage and specialized performance have separate acceptance records.
+[TASKS.md](TASKS.md) gives the ordered build checklist, concrete deliverables, and existing starting points. Use the gates below to decide when to advance.
+
+[SCHEDULER_REUSE.md](SCHEDULER_REUSE.md) identifies source components to port and the checks each port needs. Generic operation coverage and specialized performance have separate acceptance records.
 
 Build one small working path at a time. First, prove that fast CuTe bodies can share a persistent kernel. Then expand the compiler around that working path.
 
-Use Mirage as the main implementation reference at each gate. Trace the matching Mirage code path and tests before writing a new algorithm. Preserve compatible behavior. Explain each adaptation and check its effect. Start with the component map in [MIRAGE_REUSE.md](MIRAGE_REUSE.md).
+Use Mirage as the main implementation reference at each gate. Trace the matching Mirage code path and tests before writing a new algorithm. Preserve compatible behavior. Explain each adaptation and check its effect. Start with the component map in [SCHEDULER_REUSE.md](SCHEDULER_REUSE.md).
 
 ## Gate map
 

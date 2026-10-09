@@ -4,7 +4,7 @@
 
 The result of this work is a revised [architecture](ARCHITECTURE.md) and [implementation plan](IMPLEMENTATION_PLAN.md). The scope in [north-star.md](north-star.md) is unchanged.
 
-**Follow-up, 2026-10-09:** [MIRAGE_REUSE.md](MIRAGE_REUSE.md) extends the source review across Mirage's compiler and runtime paths. It defines reuse boundaries, generic operation coverage, generated variants, and explicit external fallback. It also records a passing host allocation check and an attempted GPU check that could not run because no CUDA device was available that day. The GPU results below remain the measurements from 2026-10-08.
+**Follow-up, 2026-10-09:** [SCHEDULER_REUSE.md](SCHEDULER_REUSE.md) extends the source review across Mirage's compiler and runtime paths. It defines reuse boundaries, generic operation coverage, generated variants, and explicit external fallback. It also records a passing host allocation check and an attempted GPU check that could not run because no CUDA device was available that day. The GPU results below remain the measurements from 2026-10-08.
 
 The central decision is to preserve tuned device pipelines through composition. Use a small catalog of measured body configurations, a simple phase schedule first, and finer tile dependencies only when they repay their cost. Prove a mixed-body kernel before implementing the full compiler.
 

@@ -10,7 +10,9 @@ MegaBake turns a captured PyTorch inference workload into a planned, composable 
 
 [north-star.md](north-star.md) defines the scope. [ARCHITECTURE.md](ARCHITECTURE.md) defines the proposed compiler. [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) gives the build gates. [RESEARCH.md](RESEARCH.md) records the source review and GPU experiments behind the design.
 
-[MIRAGE_REUSE.md](MIRAGE_REUSE.md) covers operation variants, generic lowering, explicit fallback, and reusable Mirage components with source references.
+[TASKS.md](TASKS.md) gives a practical build checklist from the first body experiment through complete-model validation.
+
+[SCHEDULER_REUSE.md](SCHEDULER_REUSE.md) covers operation variants, generic lowering, explicit fallback, and reusable Mirage components with source references.
 
 Mirage is the main reference architecture for lowering, tile/layout planning, storage, and persistent scheduling. Start from its compatible algorithms and tests. Adapt them for the FX contract, CuTe DSL, and measured target requirements.
 

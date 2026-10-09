@@ -4,7 +4,7 @@
 
 [north-star.md](north-star.md) defines the scope. [RESEARCH.md](RESEARCH.md) records the source review, measurements, and limits of the evidence. [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) defines the build gates.
 
-[MIRAGE_REUSE.md](MIRAGE_REUSE.md) records the deeper implementation review, reusable components, and checks. This revision makes generic operation coverage and fallback behavior explicit.
+[SCHEDULER_REUSE.md](SCHEDULER_REUSE.md) records the deeper implementation review, reusable components, and checks. This revision makes generic operation coverage and fallback behavior explicit.
 
 **Build a compiler that preserves fast device pipelines when it composes them. Prove the cost of that composition before building the full compiler.**
 
@@ -14,7 +14,7 @@ The previous design had useful rules for computation and synchronization. A slow
 
 **Use Mirage as the main reference architecture for lowering, planning, and persistent execution.** Start each subsystem from the matching Mirage implementation, assumptions, and tests. Preserve compatible algorithms and contracts when adapting the code. Explain each departure with a specific correctness, frontend, backend, resource, or measured performance reason. Reuse existing solutions to keep the system simple.
 
-Use both parts of Mirage. Its graph transpiler provides ideas for generating tensor programs and local schedules. MPK provides ideas for task formation, dependencies, and persistent execution. Connect these ideas to the FX contract and CuTe DSL output. The detailed source map is in [MIRAGE_REUSE.md](MIRAGE_REUSE.md).
+Use both parts of Mirage. Its graph transpiler provides ideas for generating tensor programs and local schedules. MPK provides ideas for task formation, dependencies, and persistent execution. Connect these ideas to the FX contract and CuTe DSL output. The detailed source map is in [SCHEDULER_REUSE.md](SCHEDULER_REUSE.md).
 
 | Design responsibility | Starting point |
 | --- | --- |
@@ -380,7 +380,7 @@ Use distinct slices first. Reuse a slice only after all consumers, including asy
 
 Keep logical access maps, task tile maps, and physical layouts separate. Mirage's `get_dtensor_tile_layout` constructs a layout from an already chosen tile shape and global strides. It is useful adapter code, not a tile optimizer. Use CuTe's layout operations as the backend representation. See [the source review](RESEARCH.md#what-to-reuse).
 
-Reuse Mirage's allocation core only with lifetimes established by MegaBake. Its shared-memory allocation algorithm is separable from its threadblock lifetime analysis. Its search range propagation can return a subset of accessed tiles in some cases; that analysis cannot be used unchanged to prove dependency coverage. See [the reuse decisions](MIRAGE_REUSE.md).
+Reuse Mirage's allocation core only with lifetimes established by MegaBake. Its shared-memory allocation algorithm is separable from its threadblock lifetime analysis. Its search range propagation can return a subset of accessed tiles in some cases; that analysis cannot be used unchanged to prove dependency coverage. See [the reuse decisions](SCHEDULER_REUSE.md).
 
 Tail predicates must protect memory and satisfy collective instruction rules. Cover partial tiles, noncontiguous boundary tensors, and degenerate dimensions such as `M=1`.
 
