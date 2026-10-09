@@ -61,6 +61,18 @@ def samples(fn, launches, count=11, output=None):
     return {'median_us': statistics.median(result), 'batch_mean_us': result}
 
 
+def host_samples(fn, count=11):
+    """Measure a complete synchronized Python call, retaining every sample."""
+    import torch
+    result = []
+    for _ in range(count):
+        start = time.perf_counter()
+        fn()
+        torch.cuda.synchronize()
+        result.append((time.perf_counter() - start) * 1e6)
+    return {'median_us': statistics.median(result), 'samples_us': result}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', type=Path, required=True)
@@ -71,6 +83,7 @@ def main():
     parser.add_argument('--resources', action='store_true')
     parser.add_argument('--large-tiles', action='store_true')
     parser.add_argument('--validate-only', action='store_true')
+    parser.add_argument('--shape', help='one M,N,K projection shape, for example 4,576,1536')
     args = parser.parse_args()
     import torch
     import cutlass
@@ -98,7 +111,11 @@ def main():
               'records': []}
     shapes = [(1, 1536, 576), (4, 1536, 576), (256, 1536, 576), (1024, 1536, 576),
               (1, 11008, 4096), (256, 11008, 4096), (1024, 11008, 4096)]
-    if args.quick:
+    if args.shape:
+        shapes = [tuple(int(value) for value in args.shape.split(','))]
+        if len(shapes[0]) != 3 or min(shapes[0]) <= 0:
+            parser.error('--shape must contain positive M,N,K values')
+    elif args.quick:
         shapes = [(args.single_m or 4, 11008, 4096)] if args.large_shape else [(args.single_m or 4, 1536, 576)]
     torch.cuda.set_stream(torch.cuda.Stream())
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -121,7 +138,7 @@ def main():
                              ('restart', tile, restart.HopperWgmmaGemmKernel)])
         for name, tile, cls in variants:
             row = {'m': m, 'n': n, 'k': k, 'provider': name, 'tile': tile,
-                   'weight_buffers': pool}
+                   'weight_buffers': pool, 'launch_count': 1}
             start = time.perf_counter()
             try:
                 if cls is None:
@@ -132,6 +149,7 @@ def main():
                         op.workers = properties.multi_processor_count
                     jit_args = (ca, cb[0], cc, max_clusters, stream) if name == 'persistent' else (ca, cb[0], cc, stream)
                     compiled = cute.compile(op, *jit_args)
+                    row['launch_count'] = len(compiled.kernel_info)
                     functions = [lambda b=b: compiled(ca, b, cc, stream) for b in cb]
                     row.update(threads=op.threads_per_cta, stages=op.ab_stage)
                     if args.resources:
@@ -155,8 +173,15 @@ def main():
                             row['kernels'].append(values)
                 row['setup_seconds'] = time.perf_counter() - start
                 c.fill_(float("nan"))
+                first_gpu_start = torch.cuda.Event(enable_timing=True)
+                first_gpu_end = torch.cuda.Event(enable_timing=True)
+                first_host_start = time.perf_counter()
+                first_gpu_start.record()
                 functions[0]()
-                torch.cuda.synchronize()
+                first_gpu_end.record()
+                first_gpu_end.synchronize()
+                row['first_call_event_span_us'] = first_gpu_start.elapsed_time(first_gpu_end) * 1000
+                row['first_call_host_us'] = (time.perf_counter() - first_host_start) * 1e6
                 error = (c.float() - ref.float()).abs()
                 row['max_abs_error'] = error.max().item()
                 row['relative_l2_error'] = (error.norm() / ref.float().norm()).item()
@@ -180,7 +205,8 @@ def main():
                     assert torch.isfinite(c).all().item()
                     timing['median_us'] /= pool
                     timing['batch_mean_us'] = [v / pool for v in timing['batch_mean_us']]
-                    row.update(timing)
+                    row['warm_gpu_per_weight'] = timing
+                    row['complete_host_call'] = host_samples(batch)
                 row['status'] = 'passed_diagnostic'
             except Exception as exc:
                 row.update(status='error', error=str(exc))

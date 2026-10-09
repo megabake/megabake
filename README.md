@@ -10,7 +10,7 @@ MegaBake turns a captured PyTorch inference workload into a planned, composable 
 
 [north-star.md](north-star.md) defines the scope. [ARCHITECTURE.md](ARCHITECTURE.md) defines the proposed compiler. [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) gives the build gates. [RESEARCH.md](RESEARCH.md) records the source review and GPU experiments behind the design.
 
-[TASKS.md](TASKS.md) gives a practical build checklist from the first body experiment through complete-model validation.
+[TASKS.md](TASKS.md) gives the step-by-step execution plan: get live FX, build the Compute Graph, plan execution, and generate complete CuTe megakernels. Each step names its implementation, inputs, outputs, and checks.
 
 [SCHEDULER_REUSE.md](SCHEDULER_REUSE.md) covers operation variants, generic lowering, explicit fallback, and reusable Mirage components with source references.
 
@@ -28,7 +28,7 @@ The design preserves the tuned pipeline inside each body. It starts with ordered
 
 A complete-model request includes all requested outputs and state updates. Named region matchers enable optimizations. Unfamiliar combinations of supported primitives use generic lowering. Unknown operator semantics or an illegal composition produce an explicit failure. The proposed `fallback=inductor` option can delegate the whole invocation and report that result as external fallback. Strict megakernel compilation defaults to `fallback=error`. These paths are not implemented yet.
 
-The compiler remains to be built. The current checkout contains a capture/reference path and research probes. Begin with a small kernel that combines different bodies. Check correctness, synchronization, and resource use. Then require a measured performance benefit before broader compiler work.
+The production compiler remains to be built. The current checkout contains a capture/reference path and recorded G0 body/runtime probes. Follow TASKS.md to connect a thin frontend to that device work. Require a measured MLP benefit before expanding to broader model coverage.
 
 ## Environment setup
 

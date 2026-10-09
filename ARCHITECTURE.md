@@ -4,6 +4,8 @@
 
 [north-star.md](north-star.md) defines the scope. [RESEARCH.md](RESEARCH.md) records the source review, measurements, and limits of the evidence. [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) defines the build gates.
 
+[TASKS.md](TASKS.md) gives the execution order from live FX to complete generated megakernels, with concrete inputs, outputs, and implementation checks.
+
 [SCHEDULER_REUSE.md](SCHEDULER_REUSE.md) records the deeper implementation review, reusable components, and checks. This revision makes generic operation coverage and fallback behavior explicit.
 
 **Build a compiler that preserves fast device pipelines when it composes them. Prove the cost of that composition before building the full compiler.**

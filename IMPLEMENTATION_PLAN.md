@@ -1,14 +1,16 @@
 # MegaBake implementation plan
 
-**Revised 2026-10-09. All gates below remain open.**
+**Status: G0 probes are recorded as complete for their declared target. Production integration and later gates remain open.**
 
 [north-star.md](north-star.md) defines the scope. [ARCHITECTURE.md](ARCHITECTURE.md) defines the design. [RESEARCH.md](RESEARCH.md) records the work completed for this revision.
 
-[TASKS.md](TASKS.md) gives the ordered build checklist, concrete deliverables, and existing starting points. Use the gates below to decide when to advance.
+[TASKS.md](TASKS.md) gives the step-by-step execution order, functions to implement, inputs, outputs, and completion checks. Follow that sequence to build the compiler. Use the gates below to assess the resulting implementation.
 
 [SCHEDULER_REUSE.md](SCHEDULER_REUSE.md) identifies source components to port and the checks each port needs. Generic operation coverage and specialized performance have separate acceptance records.
 
-Build one small working path at a time. First, prove that fast CuTe bodies can share a persistent kernel. Then expand the compiler around that working path.
+Build one small working path at a time. Start with the thin FX frontend and Compute Graph in TASKS.md. Connect them to the recorded body and runtime probes. Keep early fixtures small, and pass G1 before expanding into broad operation and model coverage.
+
+The gate numbers identify acceptance criteria. They do not require delaying the first FX handoff until after G1. Existing probe evidence is retained in [TASKS.md](TASKS.md#previously-completed-probe-work).
 
 Use Mirage as the main implementation reference at each gate. Trace the matching Mirage code path and tests before writing a new algorithm. Preserve compatible behavior. Explain each adaptation and check its effect. Start with the component map in [SCHEDULER_REUSE.md](SCHEDULER_REUSE.md).
 
@@ -87,7 +89,7 @@ If a regime fails, identify the dominant loss: body throughput, weight traffic, 
 
 ## G2: Connect the proven region to FX
 
-Only now grow the production path around the proven bodies and plan.
+Expand the thin production path around the proven bodies and plan after G1. The initial handoff and graph import are built earlier in TASKS.md. The checks below apply to their complete integration and to broader generic coverage.
 
 - [ ] Pin and check the supported PyTorch build before importing private APIs.
 - [ ] Repair the capture/cache handoff. Test cache hit and miss behavior so both supply the intended graph phase when compilation is required.
