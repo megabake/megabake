@@ -53,15 +53,15 @@ Use Mirage as the main implementation reference. The reuse table near the end ma
 
 **Input:** a PyTorch callable, example inputs, and the pinned PyTorch build.
 
-**Implement in:** `frontend.py`, under `src/megabake`.
+**Implement in:** `frontend.py` and `fx_handler/export.py`, under `src/megabake`.
 
-- [ ] Implement `make_backend(**options)` as a Dynamo backend factory. Its returned backend accepts the Dynamo graph and example inputs.
-- [ ] Exercise that backend through `torch.compile(..., fullgraph=True)`.
-- [ ] Extract the preparation logic from [verify_smollm_fx.py](src/eager/verify_smollm_fx.py), including its AOT and post-grad callbacks.
-- [ ] Implement a handoff callback that receives the live prepared graph and calls `compile_post_grad(graph, context)`.
-- [ ] Repair the cache-hit branch that currently labels an untransformed graph as post-grad. Keep capture-cache and compiled-plan reuse distinct.
-- [ ] Retain PyTorch's argument, output, guard, alias, and mutation wrappers. Keep Dynamo's guards active in their owning layer.
-- [ ] Return a reference callable initially. Record its execution as reference execution until step 15 replaces it.
+- [x] Implement `make_backend(**options)` as a Dynamo backend factory. Its returned backend accepts the Dynamo graph and example inputs.
+- [x] Exercise that backend through `torch.compile(..., fullgraph=True)`.
+- [x] Extract the preparation logic from [verify_smollm_fx.py](src/eager/verify_smollm_fx.py) into `fx_handler/export.py`; keep Hugging Face model capture in `fx_handler/transformers.py`.
+- [x] Implement a handoff callback that receives the live prepared graph and binds its optimized FX forward without Inductor compilation.
+- [x] Repair the cache-hit branch that currently labels an untransformed graph as post-grad. Keep capture-cache and compiled-plan reuse distinct.
+- [x] Retain PyTorch's argument, output, guard, alias, and mutation wrappers. Keep Dynamo's guards active in their owning layer.
+- [x] Return a reference callable initially. Record its execution as reference execution until step 15 replaces it.
 
 **Output:** live post-grad FX plus a capture context with input order, metadata, output structure, and runtime requirements.
 
@@ -130,7 +130,7 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Input:** regions, tensor programs, and target hardware facts.
 
-**Implement in:** `bodies.py`.
+**Implement in:** `bodies/interface.py` and `bodies/catalog.py`, under `src/megabake`.
 
 - [ ] Implement `get_candidates(region, target, policy) -> configurations or rejection reasons`.
 - [ ] Define `BodyConfig` using architecture section 5. Include semantic support, layouts, tiles, participants, stages, scratch, and completion rules.

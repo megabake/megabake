@@ -23,5 +23,8 @@ dev = [
     "numpy>=2.5.3",
 ]
 
+[project.scripts]
+megabake = "megabake.main:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
