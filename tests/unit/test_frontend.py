@@ -192,6 +192,57 @@ def test_splits_become_slices_before_import():
     split_to_slices(prepared.graph)  # idempotent
 
 
+def test_unbind_becomes_select_before_import():
+    from megabake.frontend import split_to_slices
+
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            first, second, third = torch.unbind(value, dim=1)
+            return first + 1, second * 2, third - 3
+
+    value = torch.randn(2, 3, 4)
+    exported = torch.export.export(Model(), (value,))
+    prepared = prepare_fx_graph(
+        exported.graph_module, (value,), output_tree_spec=exported.call_spec.out_spec
+    )
+    targets = {node.target for node in prepared.graph.graph.nodes}
+    assert torch.ops.aten.unbind.int not in targets
+    assert torch.ops.aten.select.int in targets
+    with torch.no_grad():
+        for actual, expected in zip(
+            prepared.forward(value), Model()(value), strict=True
+        ):
+            torch.testing.assert_close(actual, expected)
+    split_to_slices(prepared.graph)
+
+
+
+def test_laya_statistics_masks_and_topk_are_decomposed():
+    class Model(torch.nn.Module):
+        def forward(self, value, mask):
+            variance, mean = torch.var_mean(
+                value, dim=-1, correction=0, keepdim=True
+            )
+            top_two = torch.topk(value, 2, dim=-1).values
+            return variance, mean, ~mask, top_two
+
+    value = torch.tensor([[3.0, 3.0, 2.0], [4.0, 2.0, 3.0]])
+    mask = torch.tensor([[True, False, True], [False, False, True]])
+    exported = torch.export.export(Model(), (value, mask))
+    prepared = prepare_fx_graph(
+        exported.graph_module,
+        (value, mask),
+        output_tree_spec=exported.call_spec.out_spec,
+    )
+    targets = {node.target for node in prepared.graph.graph.nodes}
+    assert torch.ops.aten.var_mean.correction not in targets
+    assert torch.ops.aten.bitwise_not.default not in targets
+    assert torch.ops.aten.topk.default not in targets
+    with torch.no_grad():
+        for actual, expected in zip(
+            prepared.forward(value, mask), Model()(value, mask), strict=True
+        ):
+            torch.testing.assert_close(actual, expected)
 def test_eliminate_common_subexpressions_merges_pure_duplicates_only():
     from torch.fx.experimental.proxy_tensor import make_fx
 

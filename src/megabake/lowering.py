@@ -1790,10 +1790,16 @@ def _gather_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorP
     result = _result_value(op, graph)
     if source.shape is None or index.shape is None or result.shape is None:
         raise UnsupportedLowering("gather operands need static shapes")
-    if index.shape != result.shape or source.shape != result.shape:
-        raise UnsupportedLowering("gather operands and result must have the same shape")
-    if index.id not in graph.inputs:
-        raise UnsupportedLowering("data-dependent gather requires a runtime index input")
+    if index.shape != result.shape or len(source.shape) != len(result.shape):
+        raise UnsupportedLowering("gather index and result must have the source rank")
+    if any(
+        result_extent > source_extent
+        for axis, (result_extent, source_extent) in enumerate(
+            zip(result.shape, source.shape, strict=True)
+        )
+        if axis != dimension
+    ):
+        raise UnsupportedLowering("gather result exceeds a non-indexed source dimension")
     if index.dtype not in {
         "torch.int32",
         "torch.int64",
@@ -2014,15 +2020,25 @@ def attention_tensor_program(
     )
     if mask_value is not None:
         mask = graph.values[mask_value]
-        if mask.shape is None or mask.strides is None or mask.dtype is None:
+        if (
+            mask.shape is None
+            or len(mask.shape) != 4
+            or mask.strides is None
+            or mask.dtype is None
+        ):
             return None
-        mask_head = 0 if mask.shape[1] == 1 else query_head
+        mask_axes: tuple[AxisExpression, ...] = (
+            0 if mask.shape[0] == 1 else batch_head,
+            0 if mask.shape[1] == 1 else query_head,
+            0 if mask.shape[2] == 1 else "s",
+            0 if mask.shape[3] == 1 else "k",
+        )
         loads = (
             *loads,
             IndexedLoad(
                 "attention:mask",
                 mask_value,
-                (batch_head, mask_head, "s", "k"),
+                mask_axes,
                 mask.strides,
                 mask.dtype,
                 mask.shape,

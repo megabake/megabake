@@ -182,7 +182,7 @@ class CallableTrace:
 # Above this size, per-phase kernel parameters exceed CUDA's limit, so plans
 # use the table-driven launch: tensors come from a device address table and
 # TMA GEMM descriptors are written per phase in the kernel prologue.
-_TABLE_LAUNCH_OPS = 1_000
+_TABLE_LAUNCH_OPS = 256
 
 
 # CUDA kernel parameters are limited to 32 KiB; launches passing one CuTe
@@ -254,9 +254,9 @@ class _TeacherForcedCheck:
         with torch.no_grad():
             rerun = bound(*self.snapshot.inputs)
         torch.cuda.synchronize()
-        # Same code and arithmetic order; only workspace addresses differ.
-        if not _outputs_identical(actual, rerun):
-            return "outputs change when workspace is not reused"
+        # Continue through the region check when consecutive executions are
+        # unstable so the diagnostic names the first bad materialized value.
+        unstable_outputs = not _outputs_identical(actual, rerun)
         values = bound.megabake_runtime_state.values
         originals = {id(private): original for private, original in self.snapshot.pairs}
         nodes = list(self.prepared.graph.graph.nodes)
@@ -273,8 +273,9 @@ class _TeacherForcedCheck:
                 selected, values, inputs, state, by_name, order, self.prepared.graph
             )
             if reason is not None:
-                return reason
-        return None
+                prefix = "outputs are unstable; " if unstable_outputs else ""
+                return prefix + reason
+        return "outputs change between identical runs" if unstable_outputs else None
 
 
 def _region_failure(
@@ -1510,8 +1511,12 @@ def _output_relative_l2(expected: Any, actual: Any) -> float:
             or expected_value.dtype != actual_value.dtype
         ):
             return float("inf")
-        difference = (expected_value.float() - actual_value.float()).square().sum()
-        denominator_value = expected_value.float().square().sum()
+        expected_float = expected_value.float()
+        actual_float = actual_value.float()
+        if not torch.equal(torch.isfinite(expected_float), torch.isfinite(actual_float)):
+            return float("inf")
+        difference = (expected_float - actual_float).square().sum()
+        denominator_value = expected_float.square().sum()
         numerator += float(difference.item())
         denominator += float(denominator_value.item())
     if denominator == 0:
@@ -1703,14 +1708,21 @@ def _validate_data_indices(plan: KernelPlan, inputs: Mapping[str, torch.Tensor])
                 )
                 index_tensor = inputs.get(index_load.value_id)
                 if index_tensor is None:
-                    if _gather_index_is_static(plan.graph, index_load.value_id):
+                    index_value = plan.graph.values.get(index_load.value_id)
+                    if (
+                        _gather_index_is_static(plan.graph, index_load.value_id)
+                        or index_value is not None
+                        and index_value.producer in plan.graph.ops
+                    ):
+                        # Produced indices are validated by the generated gather
+                        # body's device-side range check once their phase runs.
                         continue
                     raise CompilerError(
                         CompilerDiagnostic(
                             "runtime-binding",
-                            f"gather index {index_load.value_id} is not a runtime input",
+                            f"gather index {index_load.value_id} is not bound or produced",
                             selected.source_op_ids,
-                            requirement="runtime gather index",
+                            requirement="bound or produced gather index",
                         )
                     )
 
@@ -2091,6 +2103,7 @@ class _RuntimeState:
         device = next(iter(input_tensors.values())).device
         workspace = self.workspace
         values: dict[str, torch.Tensor] = {}
+        pending_aliases = []
         self._allocated_outputs = {}
         for binding in plan.storage.bindings:
             if binding.storage_id in workspace:
@@ -2135,14 +2148,62 @@ class _RuntimeState:
                 self._allocated_outputs[binding.value_id] = binding.layout
                 continue
             if binding.kind == "alias":
+                pending_aliases.append(binding)
+
+        while pending_aliases:
+            unresolved = []
+            for binding in pending_aliases:
+                internal_alias = _internal_alias(
+                    binding.value_id, plan.graph, values
+                )
+                if internal_alias is not None and binding.layout is not None:
+                    alias_id, alias_tensor = internal_alias
+                    values[binding.value_id] = alias_tensor.as_strided(
+                        binding.layout.shape,
+                        binding.layout.strides,
+                        _alias_storage_offset(
+                            binding.value_id, alias_id, alias_tensor, plan.graph
+                        ),
+                    )
+                    continue
+                relation = plan.graph.values[
+                    binding.value_id
+                ].storage_relation
+                if (
+                    relation.storage_id in workspace
+                    and binding.layout is not None
+                ):
+                    alias_tensor = workspace[relation.storage_id]
+                    values[binding.value_id] = alias_tensor.as_strided(
+                        binding.layout.shape,
+                        binding.layout.strides,
+                        _alias_storage_offset(
+                            binding.value_id,
+                            relation.storage_id,
+                            alias_tensor,
+                            plan.graph,
+                        ),
+                    )
+                    continue
+                alias = _boundary_alias(
+                    binding.value_id, plan.graph, input_tensors
+                )
+                if alias is not None:
+                    values[binding.value_id] = alias
+                    continue
+                unresolved.append(binding)
+            if len(unresolved) == len(pending_aliases):
+                binding = unresolved[0]
                 raise CompilerError(
                     CompilerDiagnostic(
                         "runtime-binding",
                         f"cannot resolve alias {binding.value_id}",
                         (binding.value_id,),
-                        requirement="boundary alias",
+                        requirement="boundary or allocated alias",
                     )
                 )
+            pending_aliases = unresolved
+
         # Table launches bind only one template group per GEMM variant; the
         # kernel writes every phase's descriptors from the address table.
         template_phases = set(self.generated.launch.gemm_template_phases)
@@ -3006,15 +3067,10 @@ def _g0_value_source_tensor(
 
 
 def _cute_view(tensor: torch.Tensor) -> Any:
-    if tensor.data_ptr() % 16:
-        raise CompilerError(
-            CompilerDiagnostic(
-                "runtime-binding",
-                f"tensor at {tensor.data_ptr():#x} is not 16-byte aligned",
-                requirement="16-byte tensor alignment",
-            )
-        )
-    result = from_dlpack(tensor.detach(), assumed_align=16)
+    # Generic bodies support scalar accesses and view offsets, so their runtime
+    # pointers must not claim TMA-style 16-byte alignment. GEMM bindings enforce
+    # their stronger alignment contract separately.
+    result = from_dlpack(tensor.detach(), assumed_align=1)
     leading_dimension = next(
         (index for index, stride in enumerate(tensor.stride()) if stride == 1),
         None,

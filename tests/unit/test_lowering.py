@@ -447,7 +447,7 @@ def test_canonicalize_semantics_supports_shared_targets_and_preserves_programs()
     )
 
 
-def test_canonicalize_semantics_supports_multi_result_online_softmax():
+def test_canonicalize_semantics_decomposes_multi_result_online_softmax():
     class Model(torch.nn.Module):
         def forward(self, x):
             statistics = torch.ops.prims.prepare_softmax_online(x, -1)
@@ -458,29 +458,16 @@ def test_canonicalize_semantics_supports_multi_result_online_softmax():
     model = Model().eval()
     canonical = canonicalize_semantics(_import(model, x))
 
-    statistics_operation = canonical.ops["op:prepare_softmax_online"]
-    statistics_program = statistics_operation.tensor_program
-    assert isinstance(statistics_program, CanonicalProgram)
-    assert statistics_program.family == "softmax_statistics"
-    assert statistics_program.result_roles == ("max", "sum_exp")
-    assert len(statistics_operation.results) == 2
-    for operation in canonical.ops.values():
-        if operation.attributes["target"] == str(operator.getitem):
-            assert operation.tensor_program is not None
-            assert operation.tensor_program.store.owns_storage is False
-            assert operation.effects == {
-                "unknown": False,
-                "mutates_inputs": False,
-            }
-            result_index = operation.attributes["fx_args"][1]
-            source_id = operation.operands[result_index]
-            projection = canonical.values[operation.results[0]]
-            assert projection.storage_relation.aliases == (source_id,)
-            assert projection.storage_relation.unknown is False
-
-    torch.testing.assert_close(
-        _evaluate_graph(canonical, {"x": x}), model(x)
-    )
+    targets = {operation.attributes["target"] for operation in canonical.ops.values()}
+    assert "prims.prepare_softmax_online.default" not in targets
+    assert str(operator.getitem) not in targets
+    assert {
+        "aten.amax.default",
+        "aten.sub.Tensor",
+        "aten.exp.default",
+        "aten.sum.dim_IntList",
+    } <= targets
+    torch.testing.assert_close(_evaluate_graph(canonical, {"x": x}), model(x))
 
 
 def test_canonicalize_semantics_supports_concat_semantics():
@@ -921,7 +908,7 @@ def test_task23_runtime_gather_uses_validated_conservative_read_domain():
         def forward(self, source, index):
             return torch.gather(source, 1, index)
 
-    source = torch.randn(2, 3, 4)
+    source = torch.randn(2, 5, 4)
     index = torch.randint(0, 3, (2, 3, 4))
     graph = form_regions(lower_semantics(_import(Model(), source, index)))
     operation = next(iter(graph.ops.values()))
@@ -956,7 +943,7 @@ def test_task23_runtime_gather_uses_validated_conservative_read_domain():
         for tile in access.inputs
         if tile.value_id == "value:arg0_1"
     )
-    assert source_tile.shape[1] == 3
+    assert source_tile.shape[1] == 5
 
 
 class _ScatterPadCopy(torch.nn.Module):

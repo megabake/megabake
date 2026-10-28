@@ -976,8 +976,10 @@ def _ordered_reduction_operator(expression: ScalarExpression) -> str | None:
     return expression.operator if left != right else None
 
 
-def _maximum_code(left: str, right: str) -> str:
-    return f"cute.arch.fmax({left}, {right}, nan=True)"
+def _maximum_code(left: str, right: str, dtype: str) -> str:
+    if _is_float(dtype):
+        return f"cute.arch.fmax({left}, {right}, nan=True)"
+    return f"(({left}) if ({left}) > ({right}) else ({right}))"
 
 
 def _constant_code(value: int | float | bool) -> str:
@@ -1083,7 +1085,7 @@ def _emit_expression(
         if expression.operator == "pow":
             code = f"cute.pow({left.code}, {right.code})"
         elif expression.operator == "maximum":
-            code = _maximum_code(left.code, right.code)
+            code = _maximum_code(left.code, right.code, expression.dtype)
         elif expression.operator == "minimum":
             code = f"cute.arch.fmin({left.code}, {right.code}, nan=True)"
         else:
