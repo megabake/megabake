@@ -11,8 +11,9 @@ from megabake.bodies.attention import attention_scratch_rows
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),
-    reason="task 26 requires an SM90 CUDA device",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability(0) not in {(9, 0), (10, 0), (10, 3), (12, 0), (12, 1)},
+    reason="task 26 requires an SM90 or supported Blackwell CUDA device",
 )
 
 
@@ -153,7 +154,20 @@ def test_task26_compiles_attention_with_partial_rows(tmp_path):
     )
 
 
-def test_task26_fully_masked_rows_return_zero(tmp_path):
+def test_task26_broadcasts_additive_mask_query_axis(tmp_path):
+    torch.manual_seed(26)
+    source = torch.randn(2, 5, 4, 8, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(2, 7, 2, 8, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn(2, 7, 2, 8, device="cuda", dtype=torch.bfloat16)
+    mask = torch.randn(2, 1, 1, 7, device="cuda", dtype=torch.bfloat16)
+
+    _, actual, expected = compile_and_compare(
+        Attention().eval(), tmp_path, (source, key, value, mask)
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_task26_fully_masked_rows_match_pytorch(tmp_path):
     torch.manual_seed(26)
     source = torch.randn(2, 5, 4, 8, device="cuda", dtype=torch.bfloat16)
     key = torch.randn(2, 7, 2, 8, device="cuda", dtype=torch.bfloat16)
@@ -163,10 +177,9 @@ def test_task26_fully_masked_rows_return_zero(tmp_path):
     backend, actual, expected = compile_and_compare(
         Attention().eval(), tmp_path, (source, key, value, mask)
     )
-    masked = torch.isnan(expected)
-    assert torch.equal(actual[masked], torch.zeros_like(actual[masked]))
-    torch.testing.assert_close(actual[~masked], expected[~masked], rtol=0, atol=0)
-    assert torch.isfinite(actual).all()
+    finite = torch.isfinite(expected)
+    assert torch.equal(torch.isfinite(actual), finite)
+    torch.testing.assert_close(actual[finite], expected[finite], rtol=0, atol=0)
 
 
 def test_task26_repeated_mixed_body_resident_bindings(tmp_path):
@@ -246,7 +259,7 @@ def test_task26_composes_gemm_and_attention(tmp_path):
     providers = Counter(
         phase.body.provider for phase in backend.megabake_last_compiled.plan.phases
     )
-    assert providers["g0_range"] >= 1
+    assert providers["g0_range"] + providers["blackwell_mma"] >= 1
     assert providers["attention"] == 1
 
 
@@ -270,6 +283,6 @@ def test_task26_composes_gemm_attention_and_rms_norm(tmp_path):
     providers = Counter(
         phase.body.provider for phase in backend.megabake_last_compiled.plan.phases
     )
-    assert providers["g0_range"] >= 1
+    assert providers["g0_range"] + providers["blackwell_mma"] >= 1
     assert providers["attention"] == 1
     assert providers["generic"] >= 1

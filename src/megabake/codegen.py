@@ -2328,6 +2328,22 @@ def _nested_body_source(source: str, symbol: str) -> str:
     body_source = "".join(
         source_lines[decorator_line - 1 : function.end_lineno]
     )
+    helper_source = ""
+    helper = next(
+        (
+            node
+            for node in parsed.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "exact_maximum"
+        ),
+        None,
+    )
+    if helper is not None:
+        helper_symbol = f"{symbol}_exact_maximum"
+        helper_source = "".join(
+            source_lines[helper.lineno - 1 : helper.end_lineno]
+        ).replace("def exact_maximum(", f"def {helper_symbol}(", 1)
+        body_source = body_source.replace("exact_maximum", helper_symbol)
     body_source = body_source.replace("@cute.kernel", "@cute.jit", 1)
     body_source = body_source.replace("def run(", f"def {symbol}(", 1)
     body_source = body_source.replace(
@@ -2351,7 +2367,7 @@ def _nested_body_source(source: str, symbol: str) -> str:
     )
     body_source = body_source.replace("    scratch: cute.Tensor,", "    scratch,", 1)
     body_source = body_source.replace("scratch[block,", "scratch[")
-    return textwrap.indent(body_source, "    ") + "\n"
+    return textwrap.indent(helper_source + body_source, "    ") + "\n"
 
 
 def _affine_work_iterator(body_source: str, step: int, tile_count: int) -> str:
@@ -2576,6 +2592,21 @@ def _source_map(
         selection.region_id: selection for selection in plan.selection.selections
     }
     entries: list[SourceMapEntry] = []
+    symbol_lines = _symbol_line_map(source)
+    source_lines = source.splitlines()
+    source_line_by_text = {
+        line.strip(): index for index, line in enumerate(source_lines, 1)
+    }
+    fallback_barrier_line = next(
+        (
+            index
+            for index, line in enumerate(source_lines, 1)
+            if "grid_barrier(ready, workers, epoch + phase + " in line
+            or "counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])" in line
+            or "counting_grid_arrive(ready, workers)" in line
+        ),
+        None,
+    )
     for record in phase_records:
         if record.provider == "g0_range":
             source_path = Path(inspect.getsourcefile(HopperWgmmaGemmPersistentKernel))
@@ -2597,7 +2628,7 @@ def _source_map(
                 )
             )
         else:
-            lines = _symbol_lines(source, record.body_symbol)
+            lines = symbol_lines[record.body_symbol]
             entries.append(
                 SourceMapEntry(
                     record.body_symbol,
@@ -2612,7 +2643,7 @@ def _source_map(
                 )
             )
         for symbol in record.conversion_symbols:
-            lines = _symbol_lines(source, symbol)
+            lines = symbol_lines[symbol]
             entries.append(
                 SourceMapEntry(
                     symbol,
@@ -2627,22 +2658,11 @@ def _source_map(
                 )
             )
         if record.barrier:
-            source_lines = source.splitlines()
-            line = next(
-                (
-                    index
-                    for index, line in enumerate(source_lines, 1)
-                    if "grid_barrier(ready, workers, epoch + " in line
-                    and f"epoch + {record.index})" in line
-                ),
-                None,
-            ) or next(
-                index
-                for index, line in enumerate(source_lines, 1)
-                if "grid_barrier(ready, workers, epoch + phase + " in line
-                or "counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])" in line
-                or "counting_grid_arrive(ready, workers)" in line
-            )
+            line = source_line_by_text.get(
+                f"grid_barrier(ready, workers, epoch + {record.index})"
+            ) or fallback_barrier_line
+            if line is None:
+                raise UnsupportedCodegen("generated phase barrier is missing")
             entries.append(
                 SourceMapEntry(
                     record.barrier,
@@ -2656,7 +2676,7 @@ def _source_map(
                     selected[record.region_id].source_op_ids,
                 )
             )
-    kernel_lines = _symbol_lines(source, "megabake_kernel")
+    kernel_lines = symbol_lines["megabake_kernel"]
     entries.append(
         SourceMapEntry(
             "megabake_kernel",
@@ -2669,7 +2689,7 @@ def _source_map(
             None,
         )
     )
-    launch_lines = _symbol_lines(source, "launch")
+    launch_lines = symbol_lines["launch"]
     entries.append(
         SourceMapEntry(
             "launch",
@@ -2685,13 +2705,20 @@ def _source_map(
     return tuple(entries)
 
 
+def _symbol_line_map(source: str) -> dict[str, tuple[int, int]]:
+    return {
+        node.name: (node.lineno, node.end_lineno)
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.end_lineno is not None
+    }
+
+
 def _symbol_lines(source: str, symbol: str) -> tuple[int, int]:
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(
-            node, (ast.FunctionDef, ast.AsyncFunctionDef)
-        ) and node.name == symbol:
-            return node.lineno, node.end_lineno
-    raise UnsupportedCodegen(f"generated symbol {symbol} is missing")
+    try:
+        return _symbol_line_map(source)[symbol]
+    except KeyError as error:
+        raise UnsupportedCodegen(f"generated symbol {symbol} is missing") from error
 
 
 def _json_default(value: Any) -> Any:

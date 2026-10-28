@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import operator
 import re
 from pathlib import Path
@@ -103,15 +104,192 @@ _SPLITS = frozenset(
     {torch.ops.aten.split.Tensor, torch.ops.aten.split_with_sizes.default}
 )
 
+def _var_mean_decomposition(
+    source: torch.Tensor,
+    dim: int | Sequence[int] | None = None,
+    *,
+    correction: int | float | None = None,
+    keepdim: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Express inference LayerNorm statistics with supported reductions."""
+    if dim is None:
+        dimensions = tuple(range(source.ndim))
+    elif isinstance(dim, int):
+        dimensions = (dim % source.ndim,)
+    else:
+        dimensions = tuple(value % source.ndim for value in dim)
+    mean_keepdim = torch.mean(source, dim=dimensions, keepdim=True)
+    centered = source - mean_keepdim
+    count = math.prod(source.shape[dimension] for dimension in dimensions)
+    divisor = count - (1 if correction is None else correction)
+    variance = torch.sum(centered * centered, dim=dimensions, keepdim=keepdim) / divisor
+    mean = torch.mean(source, dim=dimensions, keepdim=keepdim)
+    return variance, mean
+
+
+def _decomposition_table(internals: SimpleNamespace) -> dict[Any, Callable[..., Any]]:
+    table = dict(internals.select_decomp_table())
+    table[torch.ops.aten.var_mean.correction] = _var_mean_decomposition
+    table[torch.ops.aten.bitwise_not.default] = lambda source: torch.eq(source, False)
+    return table
+
+
+
+def boolean_count_sums_to_float(graph_module: Any) -> None:
+    """Keep boolean counts in FP32 when their only observable value is FP32."""
+    graph = graph_module.graph
+    for node in list(graph.nodes):
+        if (
+            node.op != "call_function"
+            or node.target is not torch.ops.aten.sum.dim_IntList
+            or node.kwargs.get("dtype") is not None
+        ):
+            continue
+        source = node.args[0]
+        source_value = source.meta.get("val")
+        users = list(node.users)
+        if (
+            not isinstance(source_value, torch.Tensor)
+            or source_value.dtype is not torch.bool
+            or len(users) != 1
+            or users[0].target is not torch.ops.aten.clamp_min.default
+        ):
+            continue
+        clamp = users[0]
+        clamp_users = list(clamp.users)
+        if (
+            len(clamp_users) != 1
+            or clamp_users[0].target
+            is not torch.ops.prims.convert_element_type.default
+            or clamp_users[0].args[1] is not torch.float32
+        ):
+            continue
+        node.kwargs = {**node.kwargs, "dtype": torch.float32}
+    graph.lint()
+
+
+def topk_values_to_reductions(graph_module: Any) -> None:
+    """Rewrite values-only k=1/2 topk calls as supported reductions."""
+    graph = graph_module.graph
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target is not torch.ops.aten.topk.default:
+            continue
+        source = node.args[0]
+        k = node.args[1]
+        dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", -1)
+        largest = node.args[3] if len(node.args) > 3 else node.kwargs.get("largest", True)
+        users = list(node.users)
+        if k not in {1, 2} or not largest or not users or not all(
+            user.target is operator.getitem and user.args[1] == 0 for user in users
+        ):
+            continue
+        with graph.inserting_before(node):
+            maximum = graph.call_function(torch.ops.aten.amax.default, (source, [dim], True))
+            values = maximum
+            if k == 2:
+                equals = graph.call_function(torch.ops.aten.eq.Tensor, (source, maximum))
+                equals_float = graph.call_function(
+                    torch.ops.prims.convert_element_type.default,
+                    (equals, torch.float32),
+                )
+                count = graph.call_function(
+                    torch.ops.aten.sum.dim_IntList, (equals_float, [dim], True)
+                )
+                repeated = graph.call_function(torch.ops.aten.gt.Scalar, (count, 1))
+                source_meta = source.meta["val"]
+                negative_infinity = graph.call_function(
+                    torch.ops.aten.full.default,
+                    (list(source_meta.shape), float("-inf")),
+                    {"dtype": source_meta.dtype, "device": source_meta.device},
+                )
+                masked = graph.call_function(
+                    torch.ops.aten.where.self, (equals, negative_infinity, source)
+                )
+                runner_up = graph.call_function(
+                    torch.ops.aten.amax.default, (masked, [dim], True)
+                )
+                second = graph.call_function(
+                    torch.ops.aten.where.self, (repeated, maximum, runner_up)
+                )
+                values = graph.call_function(torch.ops.aten.cat.default, ([maximum, second], dim))
+        for user in users:
+            user.replace_all_uses_with(values)
+            graph.erase_node(user)
+        graph.erase_node(node)
+    graph.lint()
+
+def online_softmax_to_reductions(graph_module: Any) -> None:
+    """Rewrite Inductor online-softmax statistics as ordinary reductions."""
+    graph = graph_module.graph
+    for node in list(graph.nodes):
+        if (
+            node.op != "call_function"
+            or str(node.target) != "prims.prepare_softmax_online.default"
+        ):
+            continue
+        source, dim = node.args[:2]
+        users = list(node.users)
+        projections = {
+            user.args[1]: user
+            for user in users
+            if user.op == "call_function"
+            and user.target is operator.getitem
+            and user.args[1] in {0, 1}
+        }
+        if len(projections) != 2 or len(users) != 2:
+            continue
+        with graph.inserting_before(node):
+            maximum = graph.call_function(
+                torch.ops.aten.amax.default, (source, [dim], True)
+            )
+            centered = graph.call_function(
+                torch.ops.aten.sub.Tensor, (source, maximum)
+            )
+            exponential = graph.call_function(
+                torch.ops.aten.exp.default, (centered,)
+            )
+            total = graph.call_function(
+                torch.ops.aten.sum.dim_IntList,
+                (exponential, [dim], True),
+            )
+        maximum.meta = dict(projections[0].meta)
+        centered.meta = dict(source.meta)
+        exponential.meta = dict(source.meta)
+        total.meta = dict(projections[1].meta)
+        projections[0].replace_all_uses_with(maximum)
+        projections[1].replace_all_uses_with(total)
+        graph.erase_node(projections[0])
+        graph.erase_node(projections[1])
+        graph.erase_node(node)
+    graph.lint()
+
 
 def split_to_slices(graph_module: Any) -> None:
-    """Rewrite ``split(x)[i]`` as ``slice(x, dim, start, end)``.
+    """Rewrite tuple-producing split and unbind views as simple views.
 
     A split returns a tuple of views, which one tensor program cannot store;
-    each projection is a plain slice view. Inductor lowers splits the same way.
+    each projection is a plain slice view. Unbind projections are selects,
+    which additionally remove the selected dimension. Inductor lowers both
+    operations the same way.
     """
     graph = graph_module.graph
     for node in list(graph.nodes):
+        if node.op == "call_function" and node.target is torch.ops.aten.unbind.int:
+            source = node.args[0]
+            dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+            users = list(node.users)
+            if not all(user.target is operator.getitem for user in users):
+                continue
+            for user in users:
+                with graph.inserting_before(user):
+                    piece = graph.call_function(
+                        torch.ops.aten.select.int, (source, dim, user.args[1])
+                    )
+                piece.meta = dict(user.meta)
+                user.replace_all_uses_with(piece)
+                graph.erase_node(user)
+            graph.erase_node(node)
+            continue
         if node.op != "call_function" or node.target not in _SPLITS:
             continue
         source, sizes = node.args[0], node.args[1]
@@ -518,6 +696,8 @@ def _prepare_fx_graph(
 
         dump_graph("prepared", prepared_graph, dump_directory)
         context.record(prepared_graph, "prepared", "miss")
+        topk_values_to_reductions(prepared_graph)
+        boolean_count_sums_to_float(prepared_graph)
         internals.view_to_reshape(prepared_graph)
         fake_mode = internals.fake_tensor_prop(prepared_graph, inputs)
         internals.record_original_output_strides(prepared_graph)
@@ -525,6 +705,7 @@ def _prepare_fx_graph(
             prepared_graph
         ):
             internals.recursive_post_grad_passes(prepared_graph, is_inference=True)
+        online_softmax_to_reductions(prepared_graph)
         split_to_slices(prepared_graph)
         eliminate_common_subexpressions(prepared_graph)
         prepared_graph.recompile()
@@ -551,7 +732,7 @@ def _prepare_fx_graph(
             bw_compiler=None,
             inference_compiler=prepare_aot_graph,
             partition_fn=internals.partition_fn,
-            decompositions=internals.select_decomp_table(),
+            decompositions=_decomposition_table(internals),
             keep_inference_input_mutations=True,
             pre_grad_passes=pre_grad_callback,
             compile_region_name="megabake",
