@@ -5,13 +5,14 @@ MegaBake's complete Dynamo/AOT capture and lowering pipeline while executing the
 captured PyTorch graph, so unsupported semantics can be inventoried before kernel
 work starts.
 
-    .venv/bin/python benchmarks/laya.py --variants eager capture
-    .venv/bin/python benchmarks/laya.py --out artifacts/laya/baseline.json
+    .venv/bin/python benchmarks/laya_benchmark.py --variants eager capture
+    .venv/bin/python benchmarks/laya_benchmark.py --compile-kernel --out artifacts/laya/baseline.json
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import statistics
 import sys
@@ -166,13 +167,20 @@ def _capture(
     prepared = backend.megabake_last_prepared
     graph = canonicalize_semantics(import_fx(prepared.graph, prepared.context))
     lowering_path = dump_lowering_graph(graph, dump_dir / "lowering_graph.txt")
-    return captured, actual, {
+    audit = {
         "coverage": semantic_coverage(graph),
         "operations": len(graph.ops),
         "lowering_graph": str(lowering_path),
         "capture_phase": prepared.context.phase,
         "graph_hash": prepared.context.graph_hash,
     }
+    if compile_kernel:
+        compiled = backend.megabake_last_compiled
+        selections = compiled.plan.selection.selections
+        audit["selected_bodies"] = dict(Counter(selection.body.name for selection in selections))
+        audit["selected_patterns"] = dict(Counter(selection.program.source_target for selection in selections))
+        audit["phases"] = len(compiled.plan.phases)
+    return captured, actual, audit
 
 
 def main() -> int:
@@ -239,6 +247,11 @@ def main() -> int:
                     _error_summary(actual_value, expected_value)
                     for actual_value, expected_value in zip(actual, expected, strict=True)
                 ]
+                valid_options = inputs[3].bool()
+                audit["valid_option_errors"] = _error_summary(actual[0][valid_options], expected[0][valid_options])
+                audit["option_argmax_agreement"] = bool((actual[0].argmax(-1) == expected[0].argmax(-1)).all())
+                audit["action_argmax_agreement"] = bool((actual[1].argmax(-1) == expected[1].argmax(-1)).all())
+                audit["actual"] = [_tensor_summary(value) for value in actual]
                 audit.update(
                     _measure(
                         lambda: _run(agent, captured, inputs),

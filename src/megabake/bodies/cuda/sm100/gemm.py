@@ -10,7 +10,7 @@ from dataclasses import replace
 
 from ....graph import Region
 from ....lowering import Accumulator, Binary, Cast, Constant, Load, TensorProgram
-from ..generic import GeneratedContractionBody
+from ..generic import GeneratedContractionBody, _emit_expression, UnsupportedMapBody
 from ...interface import (
     BodyConfig, CandidateSet, ParticipantContract, ProviderRejection, ResourceEvidence,
     SelectionPolicy, TargetFacts, TileContract, validate_body_config,
@@ -35,17 +35,20 @@ class BlackwellGemmProvider:
         if len(region.tensor_programs) != 1:
             return reject("provider requires a single tensor program")
         program = region.tensor_programs[0]
-        if (program.family != "contraction" or len(program.loads) != 2
+        fused = region.semantic_facts.get("family") == "gemm_epilogue"
+        if region.semantic_facts.get("paired"):
+            return reject("paired GEMM epilogues require two accumulators")
+        if (program.family != "contraction" or len(program.loads) < 2
                 or len(program.store.shape) != 2 or program.reduction_axes != ("r0",)):
-            return reject("provider supports unbiased 2-D GEMM only")
+            return reject("provider requires a 2-D GEMM")
         if any(domain.size < 1 for domain in program.iteration_domains):
             return reject("provider requires nonempty GEMM dimensions")
-        dtype = program.store.dtype
-        if dtype not in {"torch.float16", "torch.bfloat16"} or any(
-            load.dtype != dtype for load in program.loads
-        ):
+        dtype = program.loads[0].dtype
+        if dtype not in {"torch.float16", "torch.bfloat16"} or program.loads[1].dtype != dtype:
             return reject("provider requires matching FP16 or BF16 operands and output")
-        left, right = program.loads
+        if program.store.dtype not in {dtype, "torch.float32"}:
+            return reject("unsupported GEMM output dtype")
+        left, right = program.loads[:2]
         if left.axes != ("o0", "r0") or right.axes not in {("r0", "o1"), ("o1", "r0")}:
             return reject("provider requires plain GEMM indexing")
         if any(stride < 0 for load in program.loads for stride in load.strides):
@@ -58,14 +61,19 @@ class BlackwellGemmProvider:
         if (program.accumulator_dtype != "torch.float32"
                 or program.init != Constant(0.0, "torch.float32")
                 or program.combine != Binary("add", acc, product, "torch.float32")
-                or program.post != Cast(acc, dtype, "round_nearest_even")):
+                or (not fused and (len(program.loads) != 2 or program.post != Cast(acc, dtype, "round_nearest_even")))):
             return reject("provider requires an unscaled FP32 accumulation and result cast")
+        try:
+            _emit_expression(program.post, {load.id: index for index, load in enumerate(program.loads)},
+                             {"o0": "m", "o1": "n"}, program.loads)
+        except UnsupportedMapBody as error:
+            return reject(str(error))
         from ...catalog import _generic_config
         base = _generic_config(region, program)
         return CandidateSet((replace(
             base,
             provider=self.provider_name,
-            name="blackwell_mma_16x32x16",
+            name="blackwell_mma_16x32x16_epilogue" if fused else "blackwell_mma_16x32x16",
             tiles=TileContract(
                 cta_shape=(16, 32), cluster_shape=(1, 1),
                 work_partition="persistent range of output tiles",
@@ -96,7 +104,11 @@ def emit_blackwell_gemm(
         raise ValueError("Blackwell GEMM requires the 16x32 warp MMA body contract")
     rows, columns = program.store.shape
     reduction = next(d.size for d in program.iteration_domains if d.axis == "r0")
-    dtype = "cutlass.BFloat16" if program.store.dtype == "torch.bfloat16" else "cutlass.Float16"
+    dtype = "cutlass.BFloat16" if program.loads[0].dtype == "torch.bfloat16" else "cutlass.Float16"
+    input_ids = tuple(dict.fromkeys(load.value_id for load in program.loads))
+    indices = {load.id: input_ids.index(load.value_id) for load in program.loads}
+    post = _emit_expression(program.post, indices, {"o0": "m", "o1": "n"}, program.loads).code
+    binding_type = ", ".join("cute.Tensor" for _ in range(len(input_ids) + 1))
     right_index = "(k, n)" if program.loads[1].axes == ("r0", "o1") else "(n, k)"
     ntiles = (columns + 31) // 32
     source = f'''import cutlass
@@ -105,7 +117,7 @@ import cutlass.cute as cute
 @cute.kernel
 def run(
     work_iterator: cute.Tensor,
-    tensor_bindings: tuple[cute.Tensor, cute.Tensor, cute.Tensor],
+    tensor_bindings: tuple[{binding_type}],
     scratch,
     epilogue,
 ):
@@ -137,13 +149,14 @@ def run(
                 k = kbase + cb[i][1]
                 fb[i] = {dtype}(0.0)
                 if n < {columns} and k < {reduction}:
-                    fb[i] = tensor_bindings[1][{right_index}]
+                    fb[i] = tensor_bindings[{indices[program.loads[1].id]}][{right_index}]
             cute.gemm(mma, fc, fa, fb, fc)
         for i in cutlass.range_constexpr(cute.size(fc)):
             m = row_base + cc[i][0]
             n = col_base + cc[i][1]
             if m < {rows} and n < {columns}:
-                tensor_bindings[2][m, n] = {dtype}(fc[i])
+                accumulator = fc[i]
+                tensor_bindings[{len(input_ids)}][m, n] = {post}
 '''
     return GeneratedContractionBody(
         source=source, threads_per_cta=128, output_tile_elements=512,
