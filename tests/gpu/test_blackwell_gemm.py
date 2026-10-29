@@ -120,3 +120,27 @@ def test_blackwell_mma_broadcast_bmm(tmp_path):
         for candidate in backend.megabake_last_compiled.search.candidates
         if "blackwell_mma" in candidate.description
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_cutlass_sm120_gemm_correctness_and_rebinding(dtype):
+    from megabake.bodies.cuda.sm100.cutlass_runtime import CutlassSm120Gemm
+
+    torch.manual_seed(44)
+    source = torch.randn(141, 1024, device="cuda", dtype=dtype)
+    weight = torch.randn(5248, 1024, device="cuda", dtype=dtype)
+    output = torch.empty(141, 5248, device="cuda", dtype=dtype)
+    gemm = CutlassSm120Gemm(source, weight, output)
+    gemm(source, weight, output)
+    tolerance = 0.04 if dtype == torch.bfloat16 else 0.004
+    torch.testing.assert_close(output, source @ weight.T, atol=tolerance, rtol=0.01)
+
+    changed_source = source + 0.125
+    changed_output = torch.empty_like(output)
+    gemm(changed_source, weight, changed_output)
+    torch.testing.assert_close(
+        changed_output,
+        changed_source @ weight.T,
+        atol=tolerance,
+        rtol=0.01,
+    )
