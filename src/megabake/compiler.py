@@ -1026,7 +1026,7 @@ def bind_callable(
                 if cutlass_phases:
                     phase_begin = 0
                     for cutlass_phase in cutlass_phases:
-                        phase_index = cutlass_phase[0]
+                        phase_index = cutlass_phase.index
                         if phase_begin < phase_index or phase_begin == 0:
                             state.launch(
                                 compiled_kernel.compiled,
@@ -1948,6 +1948,16 @@ class _TableRebind:
         return addresses
 
 
+@dataclass(frozen=True)
+class _CutlassGemmPhase:
+    index: int
+    gemm: Any
+    source_id: str
+    weight_id: str
+    output_id: str
+    transpose_weight: bool
+
+
 class _RuntimeState:
     def __init__(
         self,
@@ -1989,7 +1999,7 @@ class _RuntimeState:
         self._cached_parameter_phases = self._parameter_cast_phases()
         self._cached_parameter_signature: tuple[tuple[int, int], ...] | None = None
         self._parameter_cache_pending = False
-        self._cutlass_phase_cache: tuple[tuple[int, Any, str, str, str], ...] | None = None
+        self._cutlass_phase_cache: tuple[_CutlassGemmPhase, ...] | None = None
         self._gemm_table: tuple[torch.Tensor, Any] | None = None
         self._stream_table: tuple[torch.Tensor, Any] | None = None
         # Phase scratch of table launches: FP32 elements and Int32 counters.
@@ -2080,7 +2090,7 @@ class _RuntimeState:
             table[phase, column] = 0
         self._parameter_cache_pending = False
 
-    def cutlass_gemm_phases(self) -> tuple[tuple[int, Any, str, str, str], ...]:
+    def cutlass_gemm_phases(self) -> tuple[_CutlassGemmPhase, ...]:
         if self._cutlass_phase_cache is not None:
             return self._cutlass_phase_cache
         if (
@@ -2119,7 +2129,16 @@ class _RuntimeState:
                 gemm = CutlassSm120Gemm(source, weight, output)
             except ValueError:
                 continue
-            phases.append((phase.index, gemm, source_id, weight_id, output_id))
+            phases.append(
+                _CutlassGemmPhase(
+                    index=phase.index,
+                    gemm=gemm,
+                    source_id=source_id,
+                    weight_id=weight_id,
+                    output_id=output_id,
+                    transpose_weight=program.loads[1].axes == ("r0", "o1"),
+                )
+            )
         self._cutlass_phase_cache = tuple(phases)
         if phases and self._phase_table is None:
             phase_table = torch.tensor(
@@ -2130,24 +2149,16 @@ class _RuntimeState:
             self._phase_table = (phase_table, _cute_view(phase_table))
         if phases:
             column = -2 if self.generated.launch.stream_table else -1
-            for phase_index, *_ in phases:
-                self._phase_table[0][phase_index, column] = 0
+            for phase in phases:
+                self._phase_table[0][phase.index, column] = 0
         return self._cutlass_phase_cache
 
-    def launch_cutlass_phase(
-        self, phase: tuple[int, Any, str, str, str]
-    ) -> None:
-        phase_index, gemm, source_id, weight_id, output_id = phase
-        selection = next(
-            selection
-            for selection in self.plan.selection.selections
-            if selection.region_id == self.plan.phases[phase_index].region_id
-        )
-        source = self.tensor_for_value(source_id)
-        weight = self.tensor_for_value(weight_id)
-        if selection.program.loads[1].axes == ("r0", "o1"):
+    def launch_cutlass_phase(self, phase: _CutlassGemmPhase) -> None:
+        source = self.tensor_for_value(phase.source_id)
+        weight = self.tensor_for_value(phase.weight_id)
+        if phase.transpose_weight:
             weight = weight.T
-        gemm(source, weight, self.tensor_for_value(output_id))
+        phase.gemm(source, weight, self.tensor_for_value(phase.output_id))
 
     @classmethod
     def create(
