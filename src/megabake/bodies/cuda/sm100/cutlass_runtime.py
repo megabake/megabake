@@ -59,6 +59,12 @@ def _validate_tensors(
         raise ValueError("CUTLASS SM120 GEMM requires source and weight K dimensions to match")
     if output.shape != (source.shape[0], weight.shape[0]):
         raise ValueError("CUTLASS SM120 GEMM output shape does not match source @ weight.T")
+    elements_per_16_bytes = 16 // source.element_size()
+    if (
+        source.shape[1] % elements_per_16_bytes
+        or weight.shape[0] % elements_per_16_bytes
+    ):
+        raise ValueError("CUTLASS SM120 GEMM requires 16-byte-aligned K and N dimensions")
     if source.stride(1) != 1 or weight.stride(1) != 1 or output.stride(1) != 1:
         raise ValueError("CUTLASS SM120 GEMM requires contiguous K-major operands and row-major output")
     if any(tensor.data_ptr() % 16 for tensor in (source, weight, output)):

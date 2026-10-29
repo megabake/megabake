@@ -1651,6 +1651,9 @@ def megabake_kernel(
     dynamic_slot_table: cute.Tensor,
     phase_floats: cute.Tensor,
     phase_counters: cute.Tensor,
+    barrier_epoch: cutlass.Int32,
+    phase_begin: cutlass.Int32,
+    phase_end: cutlass.Int32,
 {gemm_kernel_arguments}):
     _, _, _block = cute.arch.block_idx()
     _thread, _, _ = cute.arch.thread_idx()
@@ -1658,18 +1661,22 @@ def megabake_kernel(
     # advances it after that barrier, for the next launch on this stream.
     _call = ready[workers + {call_counter_offset()}]
     _ordinal = _call * cutlass.Int32({barrier_epochs})
+    if barrier_epoch >= 0:
+        _ordinal = barrier_epoch
 {scratch_prelude}
 {gemm_scratch}
 {"".join(body_definitions)}
-    # Publish this call's boundary addresses before any phase reads them.
-    if _block == 0:
+    # Only the first segment publishes boundary addresses and consumes the
+    # inference's initial barrier ordinal. Later segments are stream-ordered.
+    if phase_begin == 0 and _block == 0:
 {dynamic_writes}
-    counting_grid_barrier(ready, workers, _ordinal)
+    if phase_begin == 0:
+        counting_grid_barrier(ready, workers, _ordinal)
     if _block == 0:
         if _thread == 0:
             ready[workers + {call_counter_offset()}] = _call + cutlass.Int32(1)
 {gemm_prologue}{_phase_timer_stamp(len(plan.phases), "    ")}{_cta_timer_stamp("0", "    ")}
-    for phase in cutlass.range({len(plan.phases)}, unroll=1):
+    for phase in cutlass.range(phase_begin, phase_end, unroll=1):
         if _thread == 0:
             if phase + 1 < {len(plan.phases)}:
                 prefetch_l1(phase_table.iterator + (phase + 1) * {phase_table_width})
@@ -1722,6 +1729,9 @@ def launch(
     dynamic_slot_table: cute.Tensor,
     phase_floats: cute.Tensor,
     phase_counters: cute.Tensor,
+    barrier_epoch: cutlass.Int32,
+    phase_begin: cutlass.Int32,
+    phase_end: cutlass.Int32,
 {gemm_launch_arguments}    stream: cuda.CUstream,
 ):
 {gemm_prepare}    megabake_kernel(
@@ -1734,6 +1744,9 @@ def launch(
         dynamic_slot_table,
         phase_floats,
         phase_counters,
+        barrier_epoch,
+        phase_begin,
+        phase_end,
 {gemm_kernel_call}    ).launch(
         grid=[1, 1, workers],
         block=[{plan.launch.threads_per_block}, 1, 1],
@@ -1759,6 +1772,9 @@ def launch(
             "dynamic_slot_table",
             "phase_floats",
             "phase_counters",
+            "barrier_epoch",
+            "phase_begin",
+            "phase_end",
             *(
                 (
                     "gemm_table",

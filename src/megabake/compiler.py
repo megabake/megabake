@@ -1022,16 +1022,51 @@ def bind_callable(
                 launches += 1
 
             if compiled_kernel.event_schedule is None:
-                execute_phase_plan(
-                    compiled_kernel.plan,
-                    kernel,
-                    active_stream,
-                    admission=compiled_kernel.admission,
-                    ready=state.ready,
-                    epoch=next_epoch,
-                    synchronize=False,
-                    capturable=capturing,
-                )
+                cutlass_phases = state.cutlass_gemm_phases()
+                if cutlass_phases:
+                    phase_begin = 0
+                    for cutlass_phase in cutlass_phases:
+                        phase_index = cutlass_phase[0]
+                        if phase_begin < phase_index or phase_begin == 0:
+                            state.launch(
+                                compiled_kernel.compiled,
+                                next_epoch,
+                                active_stream,
+                                phase_begin=phase_begin,
+                                phase_end=phase_index,
+                            )
+                            launches += 1
+                        state.launch_cutlass_phase(cutlass_phase)
+                        launches += 1
+                        state.launch(
+                            compiled_kernel.compiled,
+                            next_epoch,
+                            active_stream,
+                            phase_begin=phase_index,
+                            phase_end=phase_index + 1,
+                        )
+                        launches += 1
+                        phase_begin = phase_index + 1
+                    if phase_begin < len(compiled_kernel.plan.phases):
+                        state.launch(
+                            compiled_kernel.compiled,
+                            next_epoch,
+                            active_stream,
+                            phase_begin=phase_begin,
+                            phase_end=len(compiled_kernel.plan.phases),
+                        )
+                        launches += 1
+                else:
+                    execute_phase_plan(
+                        compiled_kernel.plan,
+                        kernel,
+                        active_stream,
+                        admission=compiled_kernel.admission,
+                        ready=state.ready,
+                        epoch=next_epoch,
+                        synchronize=False,
+                        capturable=capturing,
+                    )
             else:
                 execute_event_plan(
                     compiled_kernel.event_schedule,
@@ -1954,6 +1989,7 @@ class _RuntimeState:
         self._cached_parameter_phases = self._parameter_cast_phases()
         self._cached_parameter_signature: tuple[tuple[int, int], ...] | None = None
         self._parameter_cache_pending = False
+        self._cutlass_phase_cache: tuple[tuple[int, Any, str, str, str], ...] | None = None
         self._gemm_table: tuple[torch.Tensor, Any] | None = None
         self._stream_table: tuple[torch.Tensor, Any] | None = None
         # Phase scratch of table launches: FP32 elements and Int32 counters.
@@ -2043,6 +2079,75 @@ class _RuntimeState:
         for phase in self._cached_parameter_phases:
             table[phase, column] = 0
         self._parameter_cache_pending = False
+
+    def cutlass_gemm_phases(self) -> tuple[tuple[int, Any, str, str, str], ...]:
+        if self._cutlass_phase_cache is not None:
+            return self._cutlass_phase_cache
+        if (
+            self.generated.launch.launch_policy != "megabake_cooperative_table"
+            or self.plan.target is None
+            or self.plan.target.architecture not in {"sm120", "sm121"}
+        ):
+            self._cutlass_phase_cache = ()
+            return ()
+        from .bodies.cuda.sm100.cutlass_runtime import CutlassSm120Gemm
+
+        selections = {
+            selection.region_id: selection for selection in self.plan.selection.selections
+        }
+        phases = []
+        for phase in self.plan.phases:
+            selection = selections[phase.region_id]
+            program = selection.program
+            if (
+                selection.body.name != "blackwell_mma_32x32x16"
+                or len(program.store.shape) != 2
+                or len(program.loads) != 2
+                or program.loads[0].axes != ("o0", "r0")
+                or program.loads[1].axes not in {("o1", "r0"), ("r0", "o1")}
+            ):
+                continue
+            source_id = program.loads[0].value_id
+            weight_id = program.loads[1].value_id
+            output_id = program.store.value_id
+            source = self.tensor_for_value(source_id)
+            weight = self.tensor_for_value(weight_id)
+            if program.loads[1].axes == ("r0", "o1"):
+                weight = weight.T
+            output = self.tensor_for_value(output_id)
+            try:
+                gemm = CutlassSm120Gemm(source, weight, output)
+            except ValueError:
+                continue
+            phases.append((phase.index, gemm, source_id, weight_id, output_id))
+        self._cutlass_phase_cache = tuple(phases)
+        if phases and self._phase_table is None:
+            phase_table = torch.tensor(
+                self.generated.launch.phase_table,
+                dtype=torch.int32,
+                device=self.ready.device,
+            )
+            self._phase_table = (phase_table, _cute_view(phase_table))
+        if phases:
+            column = -2 if self.generated.launch.stream_table else -1
+            for phase_index, *_ in phases:
+                self._phase_table[0][phase_index, column] = 0
+        return self._cutlass_phase_cache
+
+    def launch_cutlass_phase(
+        self, phase: tuple[int, Any, str, str, str]
+    ) -> None:
+        phase_index, gemm, source_id, weight_id, output_id = phase
+        selection = next(
+            selection
+            for selection in self.plan.selection.selections
+            if selection.region_id == self.plan.phases[phase_index].region_id
+        )
+        source = self.tensor_for_value(source_id)
+        weight = self.tensor_for_value(weight_id)
+        if selection.program.loads[1].axes == ("r0", "o1"):
+            weight = weight.T
+        gemm(source, weight, self.tensor_for_value(output_id))
 
     @classmethod
     def create(
@@ -2525,6 +2630,9 @@ class _RuntimeState:
         *,
         include_constants: bool = False,
         ring: torch.Tensor | None = None,
+        barrier_epoch: int = -1,
+        phase_begin: int = 0,
+        phase_end: int | None = None,
     ) -> tuple[Any, ...]:
         """Kernel arguments of a table launch.
 
@@ -2670,7 +2778,9 @@ class _RuntimeState:
         cached = self._table_argument_cache
         handle = int(stream)
         if (
-            not include_constants
+            phase_begin == 0
+            and phase_end is None
+            and not include_constants
             and ring is None
             and cached is not None
             and cached[2] == handle
@@ -2688,6 +2798,9 @@ class _RuntimeState:
             self._dynamic_slot_table[1],
             self._phase_scratch[0][1],
             self._phase_scratch[1][1],
+            cutlass.Int32(barrier_epoch),
+            cutlass.Int32(phase_begin),
+            cutlass.Int32(len(self.plan.phases) if phase_end is None else phase_end),
         ]
         if launch.gemm_table:
             arguments.extend(
@@ -2702,12 +2815,18 @@ class _RuntimeState:
                 arguments.append(self._max_active_clusters)
         arguments.append(stream)
         result = tuple(arguments)
-        if not include_constants and ring is None:
+        if phase_begin == 0 and phase_end is None and not include_constants and ring is None:
             self._table_argument_cache = (parts, result, handle)
         return result
 
     def prepare_launch(
-        self, compiled: Any, epoch: int, stream: torch.cuda.Stream
+        self,
+        compiled: Any,
+        epoch: int,
+        stream: torch.cuda.Stream,
+        *,
+        phase_begin: int = 0,
+        phase_end: int | None = None,
     ) -> tuple[Any, ...]:
         """Bind this launch's arguments; ``run_launch`` enqueues it.
 
@@ -2729,14 +2848,27 @@ class _RuntimeState:
                 (DYNAMIC_ADDRESS_RING, len(self.generated.launch.dynamic_slots) + 1),
                 dtype=torch.int64,
             ).pin_memory()
-            arguments = self._table_arguments(cu_stream, ring=ring)
+            arguments = self._table_arguments(
+                cu_stream,
+                ring=ring,
+                barrier_epoch=(
+                    epoch if phase_begin != 0 or phase_end is not None else -1
+                ),
+                phase_begin=phase_begin,
+                phase_end=phase_end,
+            )
             ring[:, 0] = -1
             ring[:, 1:] = torch.from_numpy(self._pending_dynamic_addresses)
             self._graph_rings.append(ring)
             _graph_capture.append(self)
             return (None, arguments, *_pack_arguments(compiled, arguments))
         self._wrap_calls()
-        arguments = self._table_arguments(cu_stream)
+        arguments = self._table_arguments(
+            cu_stream,
+            barrier_epoch=(epoch if phase_begin != 0 or phase_end is not None else -1),
+            phase_begin=phase_begin,
+            phase_end=phase_end,
+        )
         call = self._calls
         host, rows, events = self._dynamic_ring
         entry = call % DYNAMIC_ADDRESS_RING
@@ -2749,10 +2881,12 @@ class _RuntimeState:
         )
         self._calls += 1
         self._prepared_calls += 1
-        packed = self._packed_arguments
+        full_range = phase_begin == 0 and phase_end is None
+        packed = self._packed_arguments if full_range else None
         if packed is None or packed[0] is not arguments:
             packed = (arguments, *_pack_arguments(compiled, arguments))
-            self._packed_arguments = packed
+            if full_range:
+                self._packed_arguments = packed
         return (call, arguments, packed[1], packed[2])
 
     def run_launch(
@@ -2772,9 +2906,27 @@ class _RuntimeState:
         event.record(stream)
         events[entry] = event
 
-    def launch(self, compiled: Any, epoch: int, stream: torch.cuda.Stream) -> None:
+    def launch(
+        self,
+        compiled: Any,
+        epoch: int,
+        stream: torch.cuda.Stream,
+        *,
+        phase_begin: int = 0,
+        phase_end: int | None = None,
+    ) -> None:
         """Enqueue one launch of ``compiled`` on ``stream`` without blocking."""
-        self.run_launch(compiled, self.prepare_launch(compiled, epoch, stream), stream)
+        self.run_launch(
+            compiled,
+            self.prepare_launch(
+                compiled,
+                epoch,
+                stream,
+                phase_begin=phase_begin,
+                phase_end=phase_end,
+            ),
+            stream,
+        )
 
     def _check_gemm_alignment(self, addresses: np.ndarray) -> None:
         """TMA descriptors need 16-byte-aligned operand base addresses."""
