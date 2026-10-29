@@ -41,6 +41,8 @@ class BlackwellGemmProvider:
         if (program.family != "contraction" or len(program.loads) < 2
                 or len(program.store.shape) != 2 or program.reduction_axes != ("r0",)):
             return reject("provider requires a 2-D GEMM")
+        if fused and program.store.shape[1] < 32:
+            return reject("Blackwell GEMM epilogues require at least one full output tile")
         if any(domain.size < 1 for domain in program.iteration_domains):
             return reject("provider requires nonempty GEMM dimensions")
         dtype = program.loads[0].dtype
@@ -70,6 +72,7 @@ class BlackwellGemmProvider:
             return reject(str(error))
         from ...catalog import _generic_config
         base = _generic_config(region, program)
+        output_shape = tuple(region.semantic_facts.get("output_shape", program.store.shape))
         return CandidateSet((replace(
             base,
             provider=self.provider_name,
@@ -89,7 +92,7 @@ class BlackwellGemmProvider:
             ),
             evidence=ResourceEvidence(
                 measured=False, source="megabake Blackwell warp MMA baseline",
-                revision="blackwell-mma-v1", resources={"threads": 128, "shared_bytes": 0},
+                revision="blackwell-mma-v1", resources={"threads": 128, "shared_bytes": 0, "output_shape": output_shape},
                 measurements={},
             ),
         ),), ())
@@ -109,6 +112,19 @@ def emit_blackwell_gemm(
     indices = {load.id: input_ids.index(load.value_id) for load in program.loads}
     post = _emit_expression(program.post, indices, {"o0": "m", "o1": "n"}, program.loads).code
     binding_type = ", ".join("cute.Tensor" for _ in range(len(input_ids) + 1))
+    output_shape = tuple(config.evidence.resources.get("output_shape", program.store.shape))
+    output_coordinates = ["n"]
+    output_coordinate_lines = ""
+    if len(output_shape) == 2:
+        output_coordinates.insert(0, "m")
+    else:
+        output_coordinate_lines = "                output_row = m\n"
+        for index, size in reversed(tuple(enumerate(output_shape[:-1]))):
+            coordinate = f"output_o{index}"
+            output_coordinate_lines += f"                {coordinate} = output_row % {size}\n"
+            output_coordinate_lines += f"                output_row = output_row // {size}\n"
+            output_coordinates.insert(0, coordinate)
+    output_index = ", ".join(output_coordinates)
     right_index = "(k, n)" if program.loads[1].axes == ("r0", "o1") else "(n, k)"
     ntiles = (columns + 31) // 32
     source = f'''import cutlass
@@ -155,8 +171,8 @@ def run(
             m = row_base + cc[i][0]
             n = col_base + cc[i][1]
             if m < {rows} and n < {columns}:
-                accumulator = fc[i]
-                tensor_bindings[{len(input_ids)}][m, n] = {post}
+{output_coordinate_lines}                accumulator = fc[i]
+                tensor_bindings[{len(input_ids)}][{output_index}] = {post}
 '''
     return GeneratedContractionBody(
         source=source, threads_per_cta=128, output_tile_elements=512,

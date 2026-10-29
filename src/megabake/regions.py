@@ -2497,6 +2497,7 @@ def _gemm_epilogue_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate |
             "fusion": "gemm_epilogue",
             "contractions": tuple(contraction.id for contraction in contractions),
             "paired": len(contractions) == 2,
+            "output_shape": store.shape,
             "source_casts": "preserved",
         },
         cost_bytes=sum(

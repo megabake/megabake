@@ -56,3 +56,42 @@ def test_blackwell_bias_residual_epilogue(tmp_path):
     candidates = backend.megabake_last_compiled.search.candidates
     assert any("blackwell_mma_16x32x16_epilogue" in candidate.description for candidate in candidates)
 
+
+@pytest.mark.skipif(torch.cuda.is_available() and torch.cuda.get_device_capability()[0] not in {10, 12},
+                    reason="Blackwell required")
+def test_blackwell_epilogue_supports_rank_three_output(tmp_path):
+    def model(source, weight, residual):
+        return residual + (source @ weight.T).view(1, 4, 32)
+
+    torch.manual_seed(314)
+    inputs = (torch.randn(4, 8, device="cuda", dtype=torch.bfloat16),
+              torch.randn(32, 8, device="cuda", dtype=torch.bfloat16),
+              torch.randn(1, 4, 32, device="cuda", dtype=torch.bfloat16))
+    backend = make_backend(compile_kernel=True, cache=False, dump_dir=tmp_path)
+    compiled = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
+    with torch.inference_mode():
+        actual = compiled(*inputs)
+        torch.testing.assert_close(actual, model(*inputs))
+    candidates = backend.megabake_last_compiled.search.candidates
+    assert any(candidate.status == "measured" and
+               "blackwell_mma_16x32x16_epilogue" in candidate.description
+               for candidate in candidates)
+
+
+@pytest.mark.skipif(torch.cuda.is_available() and torch.cuda.get_device_capability()[0] not in {10, 12},
+                    reason="Blackwell required")
+def test_blackwell_epilogue_rejects_narrow_output(tmp_path):
+    def model(source, weight, bias):
+        return torch.nn.functional.linear(source, weight, bias).float()
+
+    torch.manual_seed(316)
+    inputs = (torch.randn(9, 1024, device="cuda", dtype=torch.bfloat16),
+              torch.randn(1, 1024, device="cuda", dtype=torch.bfloat16),
+              torch.randn(1, device="cuda", dtype=torch.bfloat16))
+    backend = make_backend(compile_kernel=True, cache=False, dump_dir=tmp_path)
+    compiled = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
+    with torch.inference_mode():
+        actual = compiled(*inputs)
+        torch.testing.assert_close(actual, model(*inputs))
+    selections = backend.megabake_last_compiled.plan.selection.selections
+    assert not any(selection.body.name == "blackwell_mma_16x32x16_epilogue" for selection in selections)

@@ -1249,22 +1249,24 @@ def _make_plan_evaluator(
             with torch.no_grad():
                 actual = executable(*prepared.example_inputs)
             relative_error = _output_relative_l2(reference, actual)
-            if relative_error >= _plan_relative_l2_limit(plan):
-                failure = (
-                    teacher_check.failure(compiled, actual)
-                    if teacher_check is not None
-                    else "no teacher-forced check"
+            has_teacher = (
+                teacher_check is not None
+                and plan.graph is not None
+                and _uses_table_launch(plan.graph)
+            )
+            failure = teacher_check.failure(compiled, actual) if has_teacher else None
+            if failure is not None or (
+                not has_teacher and relative_error >= _plan_relative_l2_limit(plan)
+            ):
+                return PlanMeasurement(
+                    compiled=compiled,
+                    resources=compiled.resources,
+                    correct=False,
+                    error=(
+                        f"relative L2 error {relative_error:.6g}; "
+                        f"teacher-forced verification: {failure or 'unavailable'}"
+                    ),
                 )
-                if failure is not None:
-                    return PlanMeasurement(
-                        compiled=compiled,
-                        resources=compiled.resources,
-                        correct=False,
-                        error=(
-                            f"relative L2 error {relative_error:.6g}; "
-                            f"teacher-forced verification: {failure}"
-                        ),
-                    )
             complete_samples, device_samples = _complete_call_samples(
                 executable,
                 prepared.example_inputs,

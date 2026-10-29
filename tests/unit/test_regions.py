@@ -220,6 +220,7 @@ def test_form_regions_fuses_residual_add_into_gemm_epilogue():
     # The [1, 4, 16] residual is read at GEMM output (row, column).
     assert residual_load.value_id == "value:arg2_1"
     assert residual_load.axes == (0, "o0", "o1")
+    assert candidate.semantic_facts["output_shape"] == (1, 4, 16)
     assert program.store == TensorStore("value:add", (4, 16), "torch.bfloat16", (16, 1), True)
     assert program.post == Binary(
         "add",
