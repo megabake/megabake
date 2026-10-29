@@ -7,6 +7,7 @@ warp keeps its fragments in registers; no asynchronous pipeline survives run().
 from __future__ import annotations
 
 from dataclasses import replace
+from math import prod
 
 from ....graph import Region
 from ....lowering import Accumulator, Binary, Cast, Constant, Load, TensorProgram
@@ -39,9 +40,9 @@ class BlackwellGemmProvider:
         if region.semantic_facts.get("paired"):
             return reject("paired GEMM epilogues require two accumulators")
         if (program.family != "contraction" or len(program.loads) < 2
-                or len(program.store.shape) != 2 or program.reduction_axes != ("r0",)):
-            return reject("provider requires a 2-D GEMM")
-        if fused and program.store.shape[1] < 32:
+                or program.reduction_axes != ("r0",)):
+            return reject("provider requires a GEMM contraction")
+        if fused and program.store.shape[-1] < 32:
             return reject("Blackwell GEMM epilogues require at least one full output tile")
         if any(domain.size < 1 for domain in program.iteration_domains):
             return reject("provider requires nonempty GEMM dimensions")
@@ -51,7 +52,18 @@ class BlackwellGemmProvider:
         if program.store.dtype not in {dtype, "torch.float32"}:
             return reject("unsupported GEMM output dtype")
         left, right = program.loads[:2]
-        if left.axes != ("o0", "r0") or right.axes not in {("r0", "o1"), ("o1", "r0")}:
+        plain_gemm = (
+            len(program.store.shape) == 2
+            and left.axes == ("o0", "r0")
+            and right.axes in {("r0", "o1"), ("o1", "r0")}
+        )
+        broadcast_bmm = (
+            len(program.store.shape) == 3
+            and left.axes == ("o0", "o1", "r0")
+            and right.axes == ("o0", "r0", "o2")
+            and right.strides[0] == 0
+        )
+        if not (plain_gemm or broadcast_bmm):
             return reject("provider requires plain GEMM indexing")
         if any(stride < 0 for load in program.loads for stride in load.strides):
             return reject("negative operand strides are unsupported")
@@ -65,9 +77,14 @@ class BlackwellGemmProvider:
                 or program.combine != Binary("add", acc, product, "torch.float32")
                 or (not fused and (len(program.loads) != 2 or program.post != Cast(acc, dtype, "round_nearest_even")))):
             return reject("provider requires an unscaled FP32 accumulation and result cast")
+        axis_names = (
+            {"o0": "batch", "o1": "row", "o2": "n"}
+            if broadcast_bmm
+            else {"o0": "m", "o1": "n"}
+        )
         try:
             _emit_expression(program.post, {load.id: index for index, load in enumerate(program.loads)},
-                             {"o0": "m", "o1": "n"}, program.loads)
+                             axis_names, program.loads)
         except UnsupportedMapBody as error:
             return reject(str(error))
         from ...catalog import _generic_config
@@ -78,7 +95,8 @@ class BlackwellGemmProvider:
             provider=self.provider_name,
             name="blackwell_mma_16x32x16_epilogue" if fused else "blackwell_mma_16x32x16",
             tiles=TileContract(
-                cta_shape=(16, 32), cluster_shape=(1, 1),
+                cta_shape=(1, 16, 32) if broadcast_bmm else (16, 32),
+                cluster_shape=(1, 1, 1) if broadcast_bmm else (1, 1),
                 work_partition="persistent range of output tiles",
                 mma_family="mma.sync", reduction_tile=(16,),
             ),
@@ -92,7 +110,10 @@ class BlackwellGemmProvider:
             ),
             evidence=ResourceEvidence(
                 measured=False, source="megabake Blackwell warp MMA baseline",
-                revision="blackwell-mma-v1", resources={"threads": 128, "shared_bytes": 0, "output_shape": output_shape},
+                revision="blackwell-mma-v1", resources={
+                    "threads": 128, "shared_bytes": 0,
+                    "output_shape": output_shape, "broadcast_bmm": broadcast_bmm,
+                },
                 measurements={},
             ),
         ),), ())
@@ -103,14 +124,18 @@ def emit_blackwell_gemm(
 ) -> GeneratedContractionBody:
     """Emit a synchronous 16x32 CTA tile with predicated M/N/K tails."""
     validate_body_config(config)
-    if config.provider != "blackwell_mma" or config.tiles.cta_shape != (16, 32):
+    if (config.provider != "blackwell_mma"
+            or config.tiles.cta_shape not in {(16, 32), (1, 16, 32)}):
         raise ValueError("Blackwell GEMM requires the 16x32 warp MMA body contract")
-    rows, columns = program.store.shape
+    broadcast_bmm = bool(config.evidence.resources.get("broadcast_bmm"))
+    rows, columns = prod(program.store.shape[:-1]), program.store.shape[-1]
     reduction = next(d.size for d in program.iteration_domains if d.axis == "r0")
     dtype = "cutlass.BFloat16" if program.loads[0].dtype == "torch.bfloat16" else "cutlass.Float16"
     input_ids = tuple(dict.fromkeys(load.value_id for load in program.loads))
     indices = {load.id: input_ids.index(load.value_id) for load in program.loads}
-    post = _emit_expression(program.post, indices, {"o0": "m", "o1": "n"}, program.loads).code
+    axis_names = ({"o0": "batch", "o1": "row", "o2": "n"} if broadcast_bmm
+                  else {"o0": "m", "o1": "n"})
+    post = _emit_expression(program.post, indices, axis_names, program.loads).code
     binding_type = ", ".join("cute.Tensor" for _ in range(len(input_ids) + 1))
     output_shape = tuple(config.evidence.resources.get("output_shape", program.store.shape))
     output_coordinates = ["n"]
@@ -125,7 +150,17 @@ def emit_blackwell_gemm(
             output_coordinate_lines += f"                output_row = output_row // {size}\n"
             output_coordinates.insert(0, coordinate)
     output_index = ", ".join(output_coordinates)
-    right_index = "(k, n)" if program.loads[1].axes == ("r0", "o1") else "(n, k)"
+    if broadcast_bmm:
+        batch_rows = program.store.shape[1]
+        tile_coordinate_line = ""
+        coordinate_lines = (f"                    batch = m // {batch_rows}\n"
+                            f"                    row = m % {batch_rows}\n")
+        left_index, right_index = "batch, row, k", "0, k, n"
+    else:
+        tile_coordinate_line = ""
+        coordinate_lines = ""
+        left_index = "m, k"
+        right_index = "(k, n)" if program.loads[1].axes == ("r0", "o1") else "(n, k)"
     ntiles = (columns + 31) // 32
     source = f'''import cutlass
 import cutlass.cute as cute
@@ -152,14 +187,14 @@ def run(
         tile_id = cutlass.Int32(work_iterator[tile])
         row_base = (tile_id // {ntiles}) * 16
         col_base = (tile_id % {ntiles}) * 32
-        fc.fill(0.0)
+{tile_coordinate_line}        fc.fill(0.0)
         for kbase in cutlass.range(0, {reduction}, 16):
             for i in cutlass.range_constexpr(cute.size(fa)):
                 m = row_base + ca[i][0]
                 k = kbase + ca[i][1]
                 fa[i] = {dtype}(0.0)
                 if m < {rows} and k < {reduction}:
-                    fa[i] = tensor_bindings[0][m, k]
+{coordinate_lines}                    fa[i] = tensor_bindings[0][{left_index}]
             for i in cutlass.range_constexpr(cute.size(fb)):
                 n = col_base + cb[i][0]
                 k = kbase + cb[i][1]

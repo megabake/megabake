@@ -96,3 +96,27 @@ def test_blackwell_complete_mlp_one_kernel_and_private_isolated_state(tmp_path, 
             isolated.launch_fast(token)
             torch.cuda.synchronize()
             torch.testing.assert_close(isolated.output, result, atol=0.01, rtol=0.01)
+
+
+def test_blackwell_mma_broadcast_bmm(tmp_path):
+    from megabake import make_backend
+
+    def model(source, weight):
+        return torch.bmm(source, weight.expand(source.shape[0], -1, -1))
+
+    torch.manual_seed(43)
+    source = torch.randn(47, 3, 1024, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(1, 1024, 1024, device="cuda", dtype=torch.bfloat16)
+    backend = make_backend(compile_kernel=True, cache=False, dump_dir=tmp_path)
+    compiled = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
+    with torch.inference_mode():
+        actual = compiled(source, weight)
+        torch.testing.assert_close(actual, model(source, weight), atol=0.04, rtol=0.01)
+    assert any(
+        selection.body.provider == "blackwell_mma"
+        for selection in backend.megabake_last_compiled.plan.selection.selections
+    ), "\n".join(
+        candidate.reason or candidate.status
+        for candidate in backend.megabake_last_compiled.search.candidates
+        if "blackwell_mma" in candidate.description
+    )
