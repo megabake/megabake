@@ -1008,6 +1008,8 @@ def bind_callable(
                 forward.megabake_runtime_state = state
             else:
                 state.rebind(input_tensors, full_inputs)
+            if not capturing:
+                state.prepare_parameter_cast_cache()
 
             launches = 0
             uploads_before = state.address_table_uploads
@@ -1041,6 +1043,8 @@ def bind_callable(
                     validate_counters=False,
                     synchronize=False,
                 )
+            if not capturing:
+                state.commit_parameter_cast_cache()
             outputs = tuple(
                 state.tensor_for_value(value_id) for value_id in graph.outputs
             )
@@ -1947,6 +1951,9 @@ class _RuntimeState:
         self._address_table: torch.Tensor | None = None
         self._address_mirror: np.ndarray | None = None
         self._phase_table: tuple[torch.Tensor, Any] | None = None
+        self._cached_parameter_phases = self._parameter_cast_phases()
+        self._cached_parameter_signature: tuple[tuple[int, int], ...] | None = None
+        self._parameter_cache_pending = False
         self._gemm_table: tuple[torch.Tensor, Any] | None = None
         self._stream_table: tuple[torch.Tensor, Any] | None = None
         # Phase scratch of table launches: FP32 elements and Int32 counters.
@@ -1981,6 +1988,61 @@ class _RuntimeState:
         # Address rings of CUDA graphs that captured this state; kept alive
         # with the state because the graphs read them on every replay.
         self._graph_rings: list[torch.Tensor] = []
+
+    def _parameter_cast_phases(self) -> tuple[int, ...]:
+        if not self.generated.launch.phase_table:
+            return ()
+        graph = self.plan.graph
+        if graph is None:
+            return ()
+        parameter_names = set(getattr(graph.runtime_context, "parameter_names", None) or ())
+        parameter_ids = {
+            value_id
+            for value_id, value in graph.values.items()
+            if value.binding_name in parameter_names
+        }
+        selections = {
+            selection.region_id: selection for selection in self.plan.selection.selections
+        }
+        return tuple(
+            phase.index
+            for phase in self.plan.phases
+            if (
+                (selection := selections[phase.region_id]).program.source_target
+                == "prims.convert_element_type.default"
+                and len(selection.program.loads) == 1
+                and selection.program.loads[0].value_id in parameter_ids
+            )
+        )
+
+    def prepare_parameter_cast_cache(self) -> None:
+        if not self._cached_parameter_phases:
+            return
+        graph = self.plan.graph
+        parameter_names = set(getattr(graph.runtime_context, "parameter_names", None) or ())
+        signature = tuple(
+            (tensor.data_ptr(), tensor._version)
+            for value_id, tensor in self.input_tensors.items()
+            if graph.values[value_id].binding_name in parameter_names
+        )
+        if signature == self._cached_parameter_signature:
+            return
+        self._cached_parameter_signature = signature
+        self._parameter_cache_pending = True
+        if self._phase_table is not None:
+            column = -2 if self.generated.launch.stream_table else -1
+            table = self._phase_table[0]
+            for phase in self._cached_parameter_phases:
+                table[phase, column] = self.generated.launch.phase_table[phase][column]
+
+    def commit_parameter_cast_cache(self) -> None:
+        if not self._parameter_cache_pending or self._phase_table is None:
+            return
+        column = -2 if self.generated.launch.stream_table else -1
+        table = self._phase_table[0]
+        for phase in self._cached_parameter_phases:
+            table[phase, column] = 0
+        self._parameter_cache_pending = False
 
     @classmethod
     def create(

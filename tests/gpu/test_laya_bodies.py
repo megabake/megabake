@@ -95,3 +95,38 @@ def test_blackwell_epilogue_rejects_narrow_output(tmp_path):
         torch.testing.assert_close(actual, model(*inputs))
     selections = backend.megabake_last_compiled.plan.selection.selections
     assert not any(selection.body.name == "blackwell_mma_16x32x16_epilogue" for selection in selections)
+
+
+def test_parameter_cast_cache_refreshes_after_mutation(tmp_path, monkeypatch):
+    import megabake.compiler as compiler_module
+
+    monkeypatch.setattr(compiler_module, "_TABLE_LAUNCH_OPS", 0)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(64, 64, device="cuda"))
+
+        def forward(self, source):
+            return source @ self.weight.to(source.dtype)
+
+    torch.manual_seed(317)
+    model = Model().eval()
+    source = torch.randn(8, 64, device="cuda", dtype=torch.bfloat16)
+    backend = make_backend(compile_kernel=True, cache=False, dump_dir=tmp_path, scheduler="phase")
+    compiled = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
+    with torch.inference_mode():
+        first = compiled(source)
+        torch.testing.assert_close(first, model(source), atol=0.04, rtol=0.01)
+        state = backend.megabake_last_callable.megabake_runtime_state
+        assert state._cached_parameter_phases
+        torch.cuda.synchronize()
+        column = -2 if state.generated.launch.stream_table else -1
+        assert all(
+            state._phase_table[0][phase, column].item() == 0
+            for phase in state._cached_parameter_phases
+        )
+        model.weight.add_(0.25)
+        second = compiled(source)
+        torch.testing.assert_close(second, model(source), atol=0.04, rtol=0.01)
+        assert not torch.equal(first, second)
