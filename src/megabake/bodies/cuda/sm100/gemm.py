@@ -10,8 +10,9 @@ from dataclasses import replace
 from math import prod
 
 from ....graph import Region
-from ....lowering import Accumulator, Binary, Cast, Constant, Load, TensorProgram
-from ..generic import GeneratedContractionBody, _emit_expression, UnsupportedMapBody
+from ....ir import Accumulator, Binary, Cast, Constant, Load, TensorProgram
+from ....ops.gemm import GemmEpilogue
+from ..generic import GeneratedContractionBody, _emit_expression, UnsupportedMapBody, generic_config
 from ...interface import (
     BodyConfig, CandidateSet, ParticipantContract, ProviderRejection, ResourceEvidence,
     SelectionPolicy, TargetFacts, TileContract, validate_body_config,
@@ -22,6 +23,21 @@ BLACKWELL_ARCHITECTURES = frozenset({"sm100", "sm103", "sm120", "sm121"})
 
 class BlackwellGemmProvider:
     provider_name = "blackwell_mma"
+
+    def emit(
+        self,
+        program: TensorProgram,
+        config: BodyConfig,
+        *,
+        defer_length_publish: bool = False,
+        workers: int | None = None,
+    ) -> GeneratedContractionBody:
+        return emit_blackwell_gemm(program, config)
+
+    def widen(self, program: TensorProgram, config: BodyConfig, threads: int) -> BodyConfig:
+        if threads != config.participants.participating_threads:
+            raise ValueError("the warp-MMA GEMM body runs four warps per CTA")
+        return config
 
     def get_candidates(
         self, region: Region, target: TargetFacts, policy: SelectionPolicy
@@ -36,8 +52,8 @@ class BlackwellGemmProvider:
         if len(region.tensor_programs) != 1:
             return reject("provider requires a single tensor program")
         program = region.tensor_programs[0]
-        fused = region.semantic_facts.get("family") == "gemm_epilogue"
-        if region.semantic_facts.get("paired"):
+        fused = isinstance(region.semantics, GemmEpilogue)
+        if fused and region.semantics.paired:
             return reject("paired GEMM epilogues require two accumulators")
         if (program.family != "contraction" or len(program.loads) < 2
                 or program.reduction_axes != ("r0",)):
@@ -87,9 +103,8 @@ class BlackwellGemmProvider:
                              axis_names, program.loads)
         except UnsupportedMapBody as error:
             return reject(str(error))
-        from ...catalog import _generic_config
-        base = _generic_config(region, program)
-        output_shape = tuple(region.semantic_facts.get("output_shape", program.store.shape))
+        base = generic_config(region, program)
+        output_shape = region.semantics.output_shape if fused else program.store.shape
         return CandidateSet((replace(
             base,
             provider=self.provider_name,
@@ -211,7 +226,7 @@ def run(
 '''
     return GeneratedContractionBody(
         source=source, threads_per_cta=128, output_tile_elements=512,
-        reduction_chunk=16, tile_count=((rows + 31) // 32) * ntiles,
+        reduction_chunk=16, tile_count=((rows + 31) // 32) * ntiles, work_step=1,
         work_iterator_encoding="one row-major 32x32 output tile ordinal per CTA",
         phases=("output_tile", "warp_mma", "epilogue"),
     )
