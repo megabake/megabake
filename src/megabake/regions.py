@@ -23,7 +23,7 @@ from .lowering import (
     Cast,
     Load,
     ScalarExpression,
-    TensorProgram,_fusion_candidates
+    TensorProgram,
     Unary,
     TensorStore,
     Where,
@@ -2399,6 +2399,7 @@ def _gemm_epilogue_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate |
             "contractions": tuple(contraction.id for contraction in contractions),
             "paired": len(contractions) == 2,
             "source_casts": "preserved",
+            "gemm_epilogue_output_shape": store.shape,
         },
         cost_bytes=sum(
             2 * _value_bytes(contraction.results[0], graph) for contraction in contractions

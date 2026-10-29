@@ -450,6 +450,12 @@ def _attention_body_order(
 def _contraction_body_order(
     config: BodyConfig, program: TensorProgram, policy: SelectionPolicy
 ) -> tuple[int, ...]:
+    if config.provider == "sm100_tma":
+        return (-2, 0, 0, 0, *_body_cost(config))
+    if (config.name.startswith("blackwell_matvec_") and program.store.shape[0] == 1) or (
+        config.name.startswith("blackwell_smallrows_") and 2 <= program.store.shape[0] <= 4
+    ):
+        return (-1, 0, 0, 0, *_body_cost(config))
     small_m = program.store.shape[0] <= 16
     mode_priority = 0 if (policy.mode == "decode") == small_m else 1
     small_tile = config.tiles.cta_shape[-1] <= 64
@@ -791,4 +797,3 @@ def _logical_tile(
 
 def _conversion_cost(layout: CuTeLayout) -> int:
     return 2 * prod(layout.shape) * DTYPE_BYTES.get(layout.dtype, 0)
-

@@ -84,6 +84,7 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
     release latency runs from the last CTA's arrival to the first CTA's exit.
     """
     phases = compiled.plan.phases
+    programs = {selection.region_id: selection.program for selection in compiled.plan.selection.selections}
     barriers = [row[1] != 0 for row in compiled.generated.launch.phase_table]
     samples = []
     for _ in range(calls):
@@ -131,8 +132,7 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
             times.append(per_cta[-1])
             fastest.append(per_cta[0])
             typical.append(per_cta[len(per_cta) // 2])
-        phase_rows.append(
-            {
+        row = {
                 "index": index,
                 "us": median(times) / 1e3,
                 # A CTA without tiles in the phase still walks it: these are
@@ -143,7 +143,15 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
                 "recompute": phase.recompute,
                 "barrier": barriers[index],
             }
-        )
+        program = programs.get(phase.region_id)
+        if phase.body.provider == "sm100_tma" and program is not None:
+            from megabake.bodies.cuda.sm90.gemm import split_k
+
+            reduction = next(domain.size for domain in program.iteration_domains
+                             if domain.axis in program.reduction_axes)
+            row.update(gemm_shape=[*program.store.shape, reduction],
+                       feature_tile=phase.body.tiles.cta_shape[1], split_k=split_k(phase.body))
+        phase_rows.append(row)
     totals = {
         key: sum(row[key] for row, _ in intervals) / 1e3
         for key in ("span", "critical", "mean_busy", "straggler_wait", "release")
@@ -251,6 +259,7 @@ def main() -> None:
     parser.add_argument("--model", default=SMOLLM_MODEL_NAME)
     parser.add_argument("--revision")
     parser.add_argument("--mode", choices=("prefill", "decode"), default="prefill")
+    parser.add_argument("--prompt-tokens", type=int, default=len(PROMPT))
     parser.add_argument("--attention", choices=("eager", "megabake"), default="eager")
     parser.add_argument("--capacity", type=int, default=128)
     parser.add_argument("--calls", type=int, default=9)
@@ -264,6 +273,8 @@ def main() -> None:
         help="profile a plan even if it fails the accuracy check (diagnostic only)",
     )
     args = parser.parse_args()
+    if args.prompt_tokens < 1:
+        parser.error("--prompt-tokens must be positive")
     if args.skip_accuracy_gate:
         compiler._TABLE_PLAN_RELATIVE_L2_LIMIT = float("inf")
         compiler._PLAN_RELATIVE_L2_LIMIT = float("inf")
@@ -272,7 +283,8 @@ def main() -> None:
     backend = make_backend(mode=args.mode, compile_kernel=True, cache=False, scheduler="phase")
     with torch.no_grad():
         if args.mode == "prefill":
-            ids = torch.tensor([PROMPT], device="cuda")
+            prompt = (PROMPT * -(-args.prompt_tokens // len(PROMPT)))[:args.prompt_tokens]
+            ids = torch.tensor([prompt], device="cuda")
             mask = torch.ones_like(ids)
             compiled_model = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
             run = lambda: compiled_model(ids, attention_mask=mask)  # noqa: E731
@@ -302,7 +314,9 @@ def main() -> None:
             raise SystemExit("plan has more phases than timer slots")
         for _ in range(3):
             run()
-        report = {"model": args.model, "mode": args.mode, **profile(callable_, compiled, run, args.calls)}
+        report = {"model": args.model, "mode": args.mode,
+                  "prompt_tokens": args.prompt_tokens if args.mode == "prefill" else None,
+                  **profile(callable_, compiled, run, args.calls)}
         if args.cta:
             report["cta"] = cta_profile(callable_, compiled, run, args.calls)
     print(json.dumps(report, indent=2))

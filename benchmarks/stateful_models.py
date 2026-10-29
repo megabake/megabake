@@ -37,6 +37,14 @@ def _l2norm(source: torch.Tensor) -> torch.Tensor:
     return source * torch.rsqrt((source * source).sum(dim=-1, keepdim=True) + 1e-6)
 
 
+def _rotary_positions(config, position_ids: torch.Tensor) -> torch.Tensor:
+    # Qwen3.5 text rotary embeddings expect the three spatial/temporal axes.
+    # For text-only decoding HF expands the same text position across them.
+    if getattr(config, "model_type", None) == "qwen3_5_text":
+        return position_ids.unsqueeze(0).expand(3, -1, -1)
+    return position_ids
+
+
 class StatefulCausalLM(torch.nn.Module):
     def __init__(self, model: torch.nn.Module):
         super().__init__()
@@ -134,10 +142,11 @@ class StatefulCausalLM(torch.nn.Module):
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, *state: torch.Tensor):
         hidden = self.model.embed_tokens(input_ids)
         position_ids = position_ids.to(torch.int64)
+        rotary_positions = _rotary_positions(self.config, position_ids)
         rotary = {}
         for kind in set(self.layer_types) - {"linear_attention"}:
             arguments = (kind,) if self.rotary_takes_type else ()
-            rotary[kind] = self.model.rotary_emb(hidden, position_ids, *arguments)
+            rotary[kind] = self.model.rotary_emb(hidden, rotary_positions, *arguments)
         offset = 0
         for layer, kind in zip(self.model.layers, self.layer_types, strict=True):
             residual = hidden

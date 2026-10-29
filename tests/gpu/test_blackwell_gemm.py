@@ -50,9 +50,114 @@ def test_blackwell_mma_tails_and_rebinding(tmp_path, dtype, shape, strided_input
     for _ in range(2):
         compiled(*args)
         torch.cuda.synchronize()
-        expected = Gemm()(a, b)
+        # Use FP64 accumulation for the reference.  PyTorch's default BF16
+        # GEMM may use reduced-precision reductions and lose accuracy around
+        # cancellation on Blackwell.
+        expected = (a.double() @ (b.double() if strided_input else b.double().T)).to(dtype)
         torch.testing.assert_close(c, expected, atol=0.04 if dtype == torch.bfloat16 else 0.004, rtol=0.01)
         a.add_(0.125)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("n,k", [(129, 70), (257, 2048)])
+def test_sm100_matvec_tails_and_rebinding(tmp_path, dtype, n, k, monkeypatch):
+    monkeypatch.setenv("MEGABAKE_SM100_MATVEC", "1")
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100-specific matvec")
+    class Gemm(torch.nn.Module):
+        def forward(self, a, b):
+            return a @ b.T
+    torch.manual_seed(2026)
+    a = torch.randn(1, k, device="cuda", dtype=dtype) / k**0.5
+    b = torch.randn(n, k, device="cuda", dtype=dtype) / k**0.5
+    prepared = prepare_fx_graph(torch.export.export(Gemm(), (a, b)).graph_module, (a, b))
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
+    region = next(r for r in graph.regions if r.tensor_programs[0].family == "contraction")
+    candidates = BlackwellGemmProvider().get_candidates(region, _target_facts(a.device), SelectionPolicy())
+    config = next(c for c in candidates.configurations if c.name == "blackwell_matvec_1x16")
+    body = emit_blackwell_gemm(region.tensor_programs[0], config)
+    path = tmp_path / "sm100_matvec_body.py"
+    path.write_text(body.source)
+    _load_module(path, "megabake_sm100_matvec_body")
+    launch = _load_launcher("megabake_sm100_matvec_body", 3, tmp_path)
+    work = torch.arange(body.tile_count, device="cuda", dtype=torch.int64)
+    result = torch.full((1, n), float("nan"), device="cuda", dtype=dtype)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    args = (_view(work), _view(a), _view(b.T), _view(result), stream)
+    compiled = cute.compile(launch, *args)
+    for _ in range(2):
+        compiled(*args)
+        torch.cuda.synchronize()
+        expected = (a.double() @ b.double().T).to(dtype)
+        torch.testing.assert_close(result, expected, atol=0.001, rtol=0.01)
+        a.add_(0.125)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("rows", [2, 3, 4])
+def test_sm100_smallrows_tails_and_rebinding(tmp_path, dtype, rows, monkeypatch):
+    monkeypatch.setenv("MEGABAKE_SM100_MATVEC", "1")
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100-specific small-row contraction")
+    class Gemm(torch.nn.Module):
+        def forward(self, a, b):
+            return a @ b.T
+    n, k = 129, 70
+    torch.manual_seed(2028)
+    a = torch.randn(rows, k, device="cuda", dtype=dtype) / k**0.5
+    b = torch.randn(n, k, device="cuda", dtype=dtype) / k**0.5
+    prepared = prepare_fx_graph(torch.export.export(Gemm(), (a, b)).graph_module, (a, b))
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
+    region = next(r for r in graph.regions if r.tensor_programs[0].family == "contraction")
+    candidates = BlackwellGemmProvider().get_candidates(region, _target_facts(a.device), SelectionPolicy())
+    config = next(c for c in candidates.configurations if c.name == f"blackwell_smallrows_{rows}x16")
+    body = emit_blackwell_gemm(region.tensor_programs[0], config)
+    path = tmp_path / "sm100_smallrows_body.py"
+    path.write_text(body.source)
+    _load_module(path, "megabake_sm100_smallrows_body")
+    launch = _load_launcher("megabake_sm100_smallrows_body", 3, tmp_path)
+    work = torch.arange(body.tile_count, device="cuda", dtype=torch.int64)
+    result = torch.full((rows, n), float("nan"), device="cuda", dtype=dtype)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    args = (_view(work), _view(a), _view(b.T), _view(result), stream)
+    compiled = cute.compile(launch, *args)
+    for _ in range(2):
+        compiled(*args)
+        torch.cuda.synchronize()
+        expected = (a.double() @ b.double().T).to(dtype)
+        torch.testing.assert_close(result, expected, atol=0.001, rtol=0.01)
+        a.add_(0.125)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("input_rank", [2, 3])
+def test_sm100_paired_matvec_fuses_gelu_and_rebinds(dtype, input_rank, monkeypatch):
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("SM100-specific matvec")
+    from megabake import make_backend
+    monkeypatch.setenv("MEGABAKE_SM100_PAIRED_MATVEC", "1")
+
+    class Paired(torch.nn.Module):
+        def forward(self, source, gate, up):
+            return torch.nn.functional.gelu(source @ gate.T, approximate="tanh") * (source @ up.T)
+
+    torch.manual_seed(2027)
+    args = (
+        torch.randn((1, 70) if input_rank == 2 else (1, 1, 70), device="cuda", dtype=dtype) / 8,
+        torch.randn(129, 70, device="cuda", dtype=dtype) / 8,
+        torch.randn(129, 70, device="cuda", dtype=dtype) / 8,
+    )
+    model = Paired().eval()
+    backend = make_backend(mode="decode", compile_kernel=True, scheduler="phase")
+    compiled_model = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
+    with torch.no_grad():
+        for current in (args, tuple(value + 0.125 for value in args)):
+            result = compiled_model(*current)
+            reference = model(*current)
+            relative = ((result.float() - reference.float()).norm() / reference.float().norm()).item()
+            assert relative < 0.02
+        assert any(s.body.name == "blackwell_matvec_pair_1x16"
+                   for s in backend.megabake_last_compiled.plan.selection.selections)
 
 
 @pytest.mark.parametrize("scheduler", ["phase", "region-events"])
