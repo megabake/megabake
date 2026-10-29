@@ -23,7 +23,7 @@ from .lowering import (
     Cast,
     Load,
     ScalarExpression,
-    TensorProgram,_fusion_candidates
+    TensorProgram,
     Unary,
     TensorStore,
     Where,
