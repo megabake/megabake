@@ -64,7 +64,7 @@ def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path
     assert generated.source.count("def _body_1(") == 1
     # Both reductions share one body and one table-dispatched call site.
     assert generated.source.count("_body_0(") == 2
-    assert "for phase in cutlass.range(3, unroll=1):" in generated.source
+    assert "for phase in cutlass.range(phase_begin, phase_end, unroll=1):" in generated.source
     assert "variant = cute.arch.make_warp_uniform(phase_table[phase, 0])" in generated.source
     # The independent reductions share a barrier interval before the join.
     assert [row[:2] for row in generated.launch.phase_table] == [
