@@ -455,14 +455,14 @@ def _bias_epilogue_rejection(program) -> str | None:
 
 def split_k(body: BodyConfig) -> int:
     """K splits of a G0 GEMM body (1 without split-K)."""
-    match = re.search(r"_k(\d+)(?:_bias)?$", body.name)
+    match = re.search(r"_k(\d+)(?:_bias|_epilogue)?$", body.name)
     return int(match.group(1)) if match else 1
 
 
 def is_swap_ab(body: BodyConfig) -> bool:
-    return body.provider == G0RangeBodyProvider.provider_name and body.name.startswith(
+    return (body.provider == G0RangeBodyProvider.provider_name and body.name.startswith(
         "g0_range_swapab_"
-    )
+    )) or body.provider == "sm100_tma"
 
 
 def kernel_tile(body: BodyConfig) -> tuple[int, int]:

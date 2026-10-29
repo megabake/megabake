@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import textwrap
 from functools import cache
 from typing import Any, Mapping
@@ -47,13 +48,14 @@ def _attention_shape_is_valid(
 
 
 def _attention_access(
-    load: Any, head_variable: str, binding_index: int, dimension_variable: str = "d"
+    load: Any, head_variable: str, binding_index: int, dimension_variable: str = "d",
+    key_variable: str = "key",
 ) -> str:
     indices = []
     for axis in load.axes:
         if isinstance(axis, str):
             if axis == "k":
-                indices.append("key")
+                indices.append(key_variable)
             elif axis == "d":
                 indices.append(dimension_variable)
             else:
@@ -220,8 +222,16 @@ class AttentionBodyProvider:
             # Only the table launch's split-context decode body computes them.
             return reject("query and key prologues need the split-context decode body")
 
-        if target.architecture != "sm90a" or not target.supports_wgmma:
-            return reject("provider targets WGMMA-capable sm90a only")
+        # The row and split-context bodies use warp reductions, shared memory,
+        # and device-scope synchronization rather than Hopper WGMMA.  SM100 is
+        # admitted independently, while Hopper retains its existing capability
+        # requirement.  Other Blackwell variants need their own GPU coverage.
+        if target.architecture not in {"sm90a", "sm100"} or (
+            target.architecture == "sm90a" and not target.supports_wgmma
+        ):
+            return reject("provider targets WGMMA-capable sm90a or sm100")
+        if target.threads_per_warp != 32:
+            return reject("provider requires 32-thread warps")
         if attention_scratch_rows(kv_length) < 1:
             return reject(
                 f"a {kv_length}-key FP32 score row exceeds {ATTENTION_SCRATCH_BYTES} scratch bytes"
@@ -241,6 +251,7 @@ class AttentionBodyProvider:
                     body_name,
                     target.multiprocessor_count,
                     stateful and policy.table_launch and head_dim % 32 == 0,
+                    target.architecture,
                 ),
             ),
             (),
@@ -259,12 +270,18 @@ _VALUE_BLOCK = 8
 _VALUE_UNROLL = 8
 
 
+def _prefill_value_block() -> int:
+    setting = os.environ.get("MEGABAKE_PREFILL_VALUE_BLOCK", "0")
+    return int(setting) if setting in {"4", "8"} else 0
+
+
 def attention_scratch_rows(kv_length: int) -> int:
     return min(ATTENTION_SCRATCH_ROWS, ATTENTION_SCRATCH_BYTES // (kv_length * 4))
 
 
 def _attention_config(
-    region: Region, program: Any, name: str, workers: int, split: bool
+    region: Region, program: Any, name: str, workers: int, split: bool,
+    architecture: str,
 ) -> BodyConfig:
     """``split`` sizes the scratch for the table launch's split-context decode
     body, which ``workers`` CTAs run."""
@@ -380,7 +397,7 @@ def _attention_config(
             register_fragments="row score, softmax maximum and total, and value accumulators",
         ),
         evidence=ResourceEvidence(
-            measured=not stateful,
+            measured=architecture == "sm90a" and not stateful,
             source=(
                 "stateful decode extension of the CuTe row pipeline adapted from "
                 "Mirage multitoken Hopper attention"
@@ -391,12 +408,13 @@ def _attention_config(
                 "mirage@f9eb70c254acefc9f3667b2a973d0dcf25471fce; task-28"
                 if stateful
                 else "mirage@f9eb70c254acefc9f3667b2a973d0dcf25471fce; task-26"
-            ),
+            ) + (f"; prefill-value-block={_prefill_value_block()}"
+                 if not stateful and _prefill_value_block() else ""),
             resources={
                 "threads": threads,
                 "shared_bytes": scratch_bytes,
                 "registers_per_thread": 48,
-                "active_blocks_per_sm": 10,
+                **({"active_blocks_per_sm": 10} if architecture == "sm90a" else {}),
             },
             measurements={
                 "target": "NVIDIA H200 MIG 3g.71GB",
@@ -405,7 +423,7 @@ def _attention_config(
                 "median_isolated_launch_us": 16.794,
                 "median_device_event_span_us": 137.040,
                 "median_complete_call_us": 150.397,
-            },
+            } if architecture == "sm90a" else {},
         ),
     )
 
@@ -668,6 +686,29 @@ def run(
     k_access = _attention_access(key_load, "kv_head", loads["attention:k"])
     value_load = next(load for load in program.loads if load.id == "attention:v")
     v_access = _attention_access(value_load, "kv_head", loads["attention:v"])
+    value_block = _prefill_value_block()
+    if value_block:
+        blocked = kv_length - kv_length % value_block
+        value_loads = "\n                        ".join(
+            f"value_{index} = " + _attention_access(
+                value_load, "kv_head", loads["attention:v"], key_variable=f"block_start + {index}"
+            )
+            for index in range(value_block)
+        )
+        value_sums = "\n                        ".join(
+            f"value = value + scratch[base + block_start + {index}] * value_{index}.to(cutlass.Float32)"
+            for index in range(value_block)
+        )
+        value_loop = (
+            f"for block_start in cutlass.range(0, {blocked}, {value_block}):\n"
+            f"                        {value_loads}\n"
+            f"                        {value_sums}\n"
+            f"                    for key in cutlass.range({blocked}, {kv_length}):\n"
+            f"                        value = value + scratch[base + key] * {v_access}.to(cutlass.Float32)"
+        )
+    else:
+        value_loop = (f"for key in cutlass.range({kv_length}, unroll=8):\n"
+                      f"                        value = value + scratch[base + key] * {v_access}.to(cutlass.Float32)")
     warps = min(threads // 32, config.scratch.size_bytes // (kv_length * 4))
     if warps < 1:
         raise UnsupportedAttentionBody("attention scratch must hold one score row per warp")
@@ -729,8 +770,7 @@ def run(
                 cute.arch.sync_warp()
                 for d in cutlass.range(lane, {head_dim}, 32):
                     value = cutlass.Float32(0.0)
-                    for key in cutlass.range({kv_length}, unroll=8):
-                        value = value + scratch[base + key] * {v_access}.to(cutlass.Float32)
+                    {value_loop}
                     tensor_bindings[{len(program.loads)}][bh, s, d] = value.to({output_type})
                 cute.arch.sync_warp()
 '''

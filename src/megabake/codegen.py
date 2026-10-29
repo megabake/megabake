@@ -202,9 +202,13 @@ def emit_cute(
     verify_plan(plan)
     if plan.launch.architecture not in {"sm90a", "sm100", "sm103", "sm120", "sm121"}:
         raise UnsupportedCodegen("codegen supports SM90 and Blackwell plans only")
+    if (event_schedule is not None or not table) and any(
+        phase.body.provider == "sm100_tma" for phase in plan.phases
+    ):
+        raise UnsupportedCodegen("SM100 TMA GEMM requires a cooperative phase-table launch")
 
     if event_schedule is None and (
-        table or not any(phase.body.provider == "g0_range" for phase in plan.phases)
+        table or not any(phase.body.provider in {"g0_range", "sm100_tma"} for phase in plan.phases)
     ):
         source, launch, source_map = _emit_table_module(plan)
     else:
@@ -248,7 +252,7 @@ def _emit_generic_module(
     selected = {
         selection.region_id: selection for selection in plan.selection.selections
     }
-    has_g0 = any(phase.body.provider == "g0_range" for phase in plan.phases)
+    has_g0 = any(phase.body.provider in {"g0_range", "sm100_tma"} for phase in plan.phases)
     normalized = (
         {
             region_id: _normalize_generic_selection(
@@ -290,7 +294,7 @@ def _emit_generic_module(
 
     for phase in plan.phases:
         selection = normalized[phase.region_id]
-        if phase.body.provider == "g0_range":
+        if phase.body.provider in {"g0_range", "sm100_tma"}:
             variant_key = (
                 phase.body.provider,
                 phase.body.tiles.cta_shape[:2],
@@ -749,7 +753,10 @@ def _emit_table_module(
     static layout, so kernel parameters and generated code stay bounded by the
     number of distinct bodies rather than by the number of layers.
     """
-    has_gemm = any(phase.body.provider == "g0_range" for phase in plan.phases)
+    has_gemm = any(phase.body.provider in {"g0_range", "sm100_tma"} for phase in plan.phases)
+    has_sm100_tma = any(phase.body.provider == "sm100_tma" for phase in plan.phases)
+    if has_sm100_tma and any(phase.body.provider == "g0_range" for phase in plan.phases):
+        raise UnsupportedCodegen("Hopper and SM100 TMA GEMMs cannot share one launch")
     selected = {
         selection.region_id: (
             _normalize_generic_selection(selection, plan.launch.threads_per_block)
@@ -865,7 +872,7 @@ def _emit_table_module(
 
     for phase in plan.phases:
         selection = selected[phase.region_id]
-        if phase.body.provider == "g0_range":
+        if phase.body.provider in {"g0_range", "sm100_tma"}:
             if phase.conversion_bodies:
                 raise UnsupportedCodegen(
                     f"table GEMM phase {phase.region_id} needs a layout conversion"
@@ -966,7 +973,7 @@ def _emit_table_module(
             gemm_of_phase[phase.index] = gemm_index
             # swapAB GEMMs load the weight as CUTLASS A, which streaming
             # loads ahead when no region of the launch writes it.
-            if is_swap_ab(phase.body) and all(
+            if not has_sm100_tma and is_swap_ab(phase.body) and all(
                 _read_only_input(plan, tensor_arguments[slot])
                 for slot in (gemm_slots[0], *((second_a_slot - 1,) if paired else ()))
             ):
@@ -1251,28 +1258,35 @@ def _emit_table_module(
         epilogues = "".join(
             f"_epilogue_{gemm_variant}_{kind}, " for kind in range(1, len(kinds) + 1)
         )
-        gemm_definitions.append(
-            f"{spec['symbol']} = HopperWgmmaGemmPersistentKernel(\n"
-            "    cutlass.Float32,\n"
-            f"    {gemm_kernel_tiles[gemm_variant]!r},\n"
-            "    (1, 1),\n"
-            "    1,\n"
-            "    True,\n"
-            f"    smem_capacity={spec['scratch']},\n"
-            "    reallocate_registers=False,\n"
-            f"    splits={spec['splits']},\n"
-            f"    bias_features={spec['bias_features']},\n"
-            f"    bias_along_m={spec['swap_ab']!r},\n"
-            f"    direct_store={spec['swap_ab'] and spec['splits'] == 1!r},\n"
-            + (f"    epilogues=({epilogues}),\n" if kinds else "")
-            + ("    paired=True,\n" if spec["paired"] else "")
-            + (
-                f"    stream_stages={WEIGHT_STREAM_STAGES},\n"
-                if gemm_variant in streamed_variants
-                else ""
+        if has_sm100_tma:
+            gemm_definitions.append(
+                f"{spec['symbol']} = Sm100TmaGemm({gemm_kernel_tiles[gemm_variant][0]}, {spec['splits']}, "
+                f"{gemm_kernel_tiles[gemm_variant][1]}"
+                + (f", epilogues=({epilogues})" if kinds else "") + ")"
             )
-            + ")"
-        )
+        else:
+            gemm_definitions.append(
+                f"{spec['symbol']} = HopperWgmmaGemmPersistentKernel(\n"
+                "    cutlass.Float32,\n"
+                f"    {gemm_kernel_tiles[gemm_variant]!r},\n"
+                "    (1, 1),\n"
+                "    1,\n"
+                "    True,\n"
+                f"    smem_capacity={spec['scratch']},\n"
+                "    reallocate_registers=False,\n"
+                f"    splits={spec['splits']},\n"
+                f"    bias_features={spec['bias_features']},\n"
+                f"    bias_along_m={spec['swap_ab']!r},\n"
+                f"    direct_store={spec['swap_ab'] and spec['splits'] == 1!r},\n"
+                + (f"    epilogues=({epilogues}),\n" if kinds else "")
+                + ("    paired=True,\n" if spec["paired"] else "")
+                + (
+                    f"    stream_stages={WEIGHT_STREAM_STAGES},\n"
+                    if gemm_variant in streamed_variants
+                    else ""
+                )
+                + ")"
+            )
         split_state = (
             [
                 "                (",
@@ -1334,7 +1348,7 @@ def _emit_table_module(
                         "                c_address=addresses["
                         "gemm_table[phase_table[phase, 6], 3]],"
                     ]
-                    if spec["swap_ab"] and spec["splits"] == 1
+                    if spec["swap_ab"] and (spec["splits"] == 1 or has_sm100_tma)
                     else []
                 ),
                 *epilogue_state,
@@ -1417,7 +1431,11 @@ def _emit_table_module(
     scratch_prelude = _scratch_prelude(scratch_plan, scratch_elements)
     shared_memory_bytes = plan.launch.dynamic_shared_memory_bytes
     if has_gemm:
-        if len(gemm_scratch_bytes) != 1 or len({key[0] for key in gemm_variants}) != 1:
+        # The SM100 tile variants share the same fixed-size SharedStorage;
+        # Hopper's implementations require a uniform tile layout.
+        if len(gemm_scratch_bytes) != 1 or (
+            not has_sm100_tma and len({key[0] for key in gemm_variants}) != 1
+        ):
             raise UnsupportedCodegen(
                 "table-launched GEMMs must share one tile and shared-memory layout"
             )
@@ -1583,6 +1601,12 @@ def _emit_table_module(
     )
     phase_table_width = len(phase_table[0])
     gemm_import = (
+        "from megabake.bodies.cuda.sm100.tcgen_gemm import (\n"
+        "    Sm100TmaGemm,\n"
+        "    build_sm100_table_descriptors as build_table_descriptors,\n"
+        ")\n"
+        "from megabake.bodies.cuda.sm90.gemm import table_descriptors\n"
+        if has_sm100_tma else
         "from megabake.bodies.cuda.sm90.gemm import (\n"
         "    HopperWgmmaGemmPersistentKernel,\n"
         "    build_table_descriptors,\n"
@@ -1786,7 +1810,9 @@ def launch(
         gemm_table=tuple(gemm_rows),
         stream_table=tuple(stream_rows) if streaming else (),
         gemm_template_phases=tuple(gemm_template_phases),
-        gemm_splits=tuple(gemm_splits),
+        # The SM100 body offsets TMA's K coordinates; its descriptors and
+        # host views continue to describe each full, unsplit operand.
+        gemm_splits=tuple(1 for _ in gemm_splits) if has_sm100_tma else tuple(gemm_splits),
         phase_float_elements=float_elements,
         phase_counter_count=counter_count,
 
@@ -2096,7 +2122,7 @@ def _event_worker_loop(
         workers,
         epoch,
         (
-{("," + chr(10)).join(f"            ({entry[0]}, {entry[1]}, {entry[2]}, {entry[3]})" for entry in entries)}
+{("," + chr(10)).join(f"            ({entry[0]}, {entry[1]}, {entry[2]}, {entry[3]})" for entry in entries)},
         ),
     )
 '''
@@ -2107,7 +2133,7 @@ def _normalize_generic_selection(
 ) -> SelectedBody:
     body = selection.body
     old_threads = body.participants.participating_threads
-    if body.provider == "g0_range" or old_threads == threads:
+    if body.provider in {"g0_range", "sm100_tma"} or old_threads == threads:
         return selection
     if threads % old_threads:
         raise UnsupportedCodegen(
@@ -2370,7 +2396,7 @@ def _generic_scratch_bytes(
 ) -> int:
     sizes = []
     for phase in plan.phases:
-        if phase.body.provider == "g0_range":
+        if phase.body.provider in {"g0_range", "sm100_tma"}:
             continue
         offset = 0
         for _ in phase.body.pipeline.barriers:
@@ -2391,12 +2417,12 @@ def _shared_scratch_source(
     phase_structs: list[str] = []
     scratch_phase_indices: list[int] = []
     generic_phases = tuple(
-        phase for phase in plan.phases if phase.body.provider != "g0_range"
+        phase for phase in plan.phases if phase.body.provider not in {"g0_range", "sm100_tma"}
     )
     if not any(_phase_has_scratch_fields(phase) for phase in generic_phases):
         return ""
     for phase_layout, phase in zip(worker.phases, plan.phases, strict=True):
-        if phase.body.provider == "g0_range":
+        if phase.body.provider in {"g0_range", "sm100_tma"}:
             continue
         fields: list[str] = []
         for index, name in enumerate(phase.body.pipeline.barriers):
@@ -2463,7 +2489,7 @@ def _scratch_prelude(
     plan: KernelPlan, scratch_elements: Mapping[int, int]
 ) -> str:
     generic_phases = tuple(
-        phase for phase in plan.phases if phase.body.provider != "g0_range"
+        phase for phase in plan.phases if phase.body.provider not in {"g0_range", "sm100_tma"}
     )
     if not any(_phase_has_scratch_fields(phase) for phase in generic_phases):
         return ""
@@ -2471,7 +2497,7 @@ def _scratch_prelude(
         "    _worker_scratch = cutlass.utils.SmemAllocator().allocate(_WorkerScratch)"
     ]
     for phase in plan.phases:
-        if phase.body.provider == "g0_range":
+        if phase.body.provider in {"g0_range", "sm100_tma"}:
             continue
         if _phase_has_scratch_fields(phase):
             elements = _phase_scratch_elements(plan, phase, scratch_elements)
@@ -2480,7 +2506,7 @@ def _scratch_prelude(
                 f".get_tensor(cute.make_layout({elements}))"
             )
     for phase in plan.phases:
-        if phase.body.provider == "g0_range":
+        if phase.body.provider in {"g0_range", "sm100_tma"}:
             continue
         if _phase_has_scratch_fields(phase):
             for index in range(len(phase.body.pipeline.barriers)):
@@ -2577,11 +2603,14 @@ def _source_map(
     }
     entries: list[SourceMapEntry] = []
     for record in phase_records:
-        if record.provider == "g0_range":
-            source_path = Path(inspect.getsourcefile(HopperWgmmaGemmPersistentKernel))
-            lines, line_start = inspect.getsourcelines(
-                HopperWgmmaGemmPersistentKernel.run
-            )
+        if record.provider in {"g0_range", "sm100_tma"}:
+            if record.provider == "sm100_tma":
+                from .bodies.cuda.sm100.tcgen_gemm import _run_tcgen_tile
+                source_object = _run_tcgen_tile
+            else:
+                source_object = HopperWgmmaGemmPersistentKernel.run
+            source_path = Path(inspect.getsourcefile(source_object))
+            lines, line_start = inspect.getsourcelines(source_object)
             entries.append(
                 SourceMapEntry(
                     record.body_symbol,

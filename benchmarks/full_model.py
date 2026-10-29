@@ -99,14 +99,16 @@ def _pipelined_calls(calls) -> float:
 
 
 def _measure(
-    name: str, build, step, args: argparse.Namespace, traces: Path, pipelined=None
+    name: str, build, step, args: argparse.Namespace, traces: Path, pipelined=None, validate=None
 ) -> dict:
     torch._dynamo.reset()
     function = build()
     started = time.perf_counter()
-    step(function)
+    first_result = step(function)
     torch.cuda.synchronize()
     first_call = time.perf_counter() - started
+    correctness = validate(first_result) if validate is not None else None
+    del first_result
     for _ in range(args.warmup):
         step(function)
     entry = _time_calls(lambda: step(function), args.samples)
@@ -120,16 +122,18 @@ def _measure(
         launch_count=trace["launch_count"],
         kernel_duration_us=trace["kernel_duration_us"],
     )
+    if correctness is not None:
+        entry["correctness"] = correctness
     summary = {key: value for key, value in entry.items() if not key.endswith("samples_us")}
     print(f"{name}: {json.dumps(summary)}", flush=True)
     return entry
 
 
 def _measure_or_error(
-    name: str, build, step, args: argparse.Namespace, traces: Path, pipelined=None
+    name: str, build, step, args: argparse.Namespace, traces: Path, pipelined=None, validate=None
 ) -> dict:
     try:
-        return _measure(name, build, step, args, traces, pipelined)
+        return _measure(name, build, step, args, traces, pipelined, validate)
     except Exception as error:  # noqa: BLE001 - keep benchmarking the other variants
         traceback.print_exc()
         print(f"{name}: FAILED {type(error).__name__}: {error}", flush=True)
@@ -140,6 +144,18 @@ def _megabake(mode: str, out: Path):
     return make_backend(
         mode=mode, compile_kernel=True, cache=False, dump_dir=out / "dumps" / mode, scheduler="phase"
     )
+
+
+class GraphedPrefill:
+    """Capture one MegaBake prefill with stable input and mask buffers."""
+
+    def __init__(self, function, ids, mask):
+        self.graph = graphed(lambda tokens, attention_mask: function(
+            tokens, attention_mask=attention_mask
+        ), ids, mask)
+
+    def __call__(self, ids, attention_mask):
+        return self.graph(ids, attention_mask)
 
 
 def bench_prefill(model, args) -> dict:
@@ -156,8 +172,27 @@ def bench_prefill(model, args) -> dict:
         "megabake": lambda: torch.compile(
             model, backend=_megabake("prefill", args.out), fullgraph=True, dynamic=False
         ),
+        "megabake_graphed": lambda: GraphedPrefill(
+            torch.compile(model, backend=_megabake("prefill", args.out), fullgraph=True, dynamic=False),
+            ids,
+            mask,
+        ),
     }
     with torch.no_grad():
+        reference = (model(ids, attention_mask=mask).logits.detach().float()
+                     if getattr(args, "check_prefill_correctness", False) else None)
+
+        def validate(output):
+            actual = output.logits.detach().float()
+            difference = actual - reference
+            return {
+                "relative_l2_vs_eager": (difference.norm() / reference.norm()).item(),
+                "max_abs_vs_eager": difference.abs().max().item(),
+                "top_token_matches": int((actual.argmax(-1) == reference.argmax(-1)).sum().item()),
+                "positions": int(reference.shape[-2]),
+                "finite": bool(torch.isfinite(actual).all().item()),
+            }
+
         return {
             "prompt_tokens": len(prompt),
             **{
@@ -167,6 +202,7 @@ def bench_prefill(model, args) -> dict:
                     lambda function: function(ids, attention_mask=mask),
                     args,
                     args.out / "traces",
+                    validate=validate if reference is not None else None,
                 )
                 for name, build in variants.items()
                 if name in args.variants
@@ -254,6 +290,7 @@ class GraphedStep:
 
     def __init__(self, function, token, state, warmup: int = 3):
         self.state = state
+        self.token = token
         self.position = torch.zeros((1, 1), dtype=torch.long, device="cuda")
         with _graphable_kv_attention():
             side = torch.cuda.Stream()
@@ -273,6 +310,8 @@ class GraphedStep:
     def __call__(self, token, position_ids, *state):
         if any(given is not captured for given, captured in zip(state, self.state, strict=True)):
             raise ValueError("a graphed decode step must reuse its captured state tensors")
+        if token is not self.token:
+            self.token.copy_(token)
         self.position.copy_(position_ids)
         self.graph.replay()
         return self.output
@@ -495,6 +534,8 @@ def main() -> None:
     parser.add_argument(
         "--prompt-tokens", type=int, default=len(PROMPT), help="prefill prompt length"
     )
+    parser.add_argument("--check-prefill-correctness", action="store_true",
+                        help="compare each prefill variant's logits with BF16 eager")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--capacity", type=int, default=128, help="decode KV cache capacity")
     parser.add_argument(

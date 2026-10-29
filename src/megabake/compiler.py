@@ -1309,6 +1309,10 @@ def _search_scheduler(
     reset_state: Callable[[], None] | None = None,
     teacher_check: _TeacherForcedCheck | None = None,
 ):
+    # SM100's TMA body is implemented for cooperative table launches. Event
+    # schedules use the generic launch, so select its existing fallback bodies.
+    if scheduler == "region-events" and target.architecture == "sm100" and policy is not None:
+        policy = replace(policy, allow_tma_gemm=False)
     evaluator = (
         budget.evaluator
         if scheduler == "phase" and budget.evaluator is not None
@@ -2152,7 +2156,7 @@ class _RuntimeState:
         g0_tensors = tuple(
             _g0_operands(phase.body, selected, plan.graph, input_tensors, values)
             for phase in plan.phases
-            if phase.body.provider == "g0_range"
+            if phase.body.provider in {"g0_range", "sm100_tma"}
             and (not table_launch or phase.index in template_phases)
             for selected in plan.selection.selections
             if selected.region_id == phase.region_id

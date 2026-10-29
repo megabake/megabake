@@ -738,7 +738,7 @@ def _projected_shared_memory(plan: KernelPlan) -> int:
             phase.body.scratch.size_bytes,
         )
         for phase in plan.phases
-        if phase.body.provider == "g0_range"
+        if phase.body.provider in {"g0_range", "sm100_tma"}
     }
     g0_bytes = sum(variant[3] for variant in g0_variants)
     phase_sizes = {
@@ -749,7 +749,7 @@ def _projected_shared_memory(plan: KernelPlan) -> int:
         (
             phase_sizes.get(phase.region_id, 0)
             for phase in plan.phases
-            if phase.body.provider != "g0_range"
+            if phase.body.provider not in {"g0_range", "sm100_tma"}
         ),
         default=0,
     )
@@ -765,7 +765,7 @@ def _selection_projected_shared_memory(selection: BodySelectionPlan) -> int:
             selected.body.scratch.size_bytes,
         )
         for selected in selection.selections
-        if selected.body.provider == "g0_range"
+        if selected.body.provider in {"g0_range", "sm100_tma"}
     }
     if not g0_variants:
         return 0
@@ -774,7 +774,7 @@ def _selection_projected_shared_memory(selection: BodySelectionPlan) -> int:
         (
             selected.resources.shared_memory_bytes
             for selected in selection.selections
-            if selected.body.provider != "g0_range"
+            if selected.body.provider not in {"g0_range", "sm100_tma"}
         ),
         default=0,
     )
