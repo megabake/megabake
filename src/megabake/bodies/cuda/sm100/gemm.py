@@ -93,9 +93,9 @@ class BlackwellGemmProvider:
         return CandidateSet((replace(
             base,
             provider=self.provider_name,
-            name="blackwell_mma_16x32x16_epilogue" if fused else "blackwell_mma_16x32x16",
+            name="blackwell_mma_32x32x16_epilogue" if fused else "blackwell_mma_32x32x16",
             tiles=TileContract(
-                cta_shape=(1, 16, 32) if broadcast_bmm else (16, 32),
+                cta_shape=(1, 32, 32) if broadcast_bmm else (32, 32),
                 cluster_shape=(1, 1, 1) if broadcast_bmm else (1, 1),
                 work_partition="persistent range of output tiles",
                 mma_family="mma.sync", reduction_tile=(16,),
@@ -110,7 +110,7 @@ class BlackwellGemmProvider:
             ),
             evidence=ResourceEvidence(
                 measured=False, source="megabake Blackwell warp MMA baseline",
-                revision="blackwell-mma-v1", resources={
+                revision="blackwell-mma-v2", resources={
                     "threads": 128, "shared_bytes": 0,
                     "output_shape": output_shape, "broadcast_bmm": broadcast_bmm,
                 },
@@ -122,11 +122,11 @@ class BlackwellGemmProvider:
 def emit_blackwell_gemm(
     program: TensorProgram, config: BodyConfig
 ) -> GeneratedContractionBody:
-    """Emit a synchronous 16x32 CTA tile with predicated M/N/K tails."""
+    """Emit a synchronous 32x32 CTA tile with predicated M/N/K tails."""
     validate_body_config(config)
     if (config.provider != "blackwell_mma"
-            or config.tiles.cta_shape not in {(16, 32), (1, 16, 32)}):
-        raise ValueError("Blackwell GEMM requires the 16x32 warp MMA body contract")
+            or config.tiles.cta_shape not in {(32, 32), (1, 32, 32)}):
+        raise ValueError("Blackwell GEMM requires the 32x32 warp MMA body contract")
     broadcast_bmm = bool(config.evidence.resources.get("broadcast_bmm"))
     rows, columns = prod(program.store.shape[:-1]), program.store.shape[-1]
     reduction = next(d.size for d in program.iteration_domains if d.axis == "r0")
@@ -175,17 +175,17 @@ def run(
     block, _, _ = cute.arch.block_idx()
     thread, _, _ = cute.arch.thread_idx()
     workers, _, _ = cute.arch.grid_dim()
-    mma = cute.make_tiled_mma(cute.nvgpu.warp.MmaF16BF16Op({dtype}, cutlass.Float32, (16, 8, 16)), (1, 4, 1))
+    mma = cute.make_tiled_mma(cute.nvgpu.warp.MmaF16BF16Op({dtype}, cutlass.Float32, (16, 8, 16)), (2, 2, 1))
     thr_mma = mma.get_slice(thread)
-    ca = thr_mma.partition_A(cute.make_identity_tensor((16, 16)))
+    ca = thr_mma.partition_A(cute.make_identity_tensor((32, 16)))
     cb = thr_mma.partition_B(cute.make_identity_tensor((32, 16)))
-    cc = thr_mma.partition_C(cute.make_identity_tensor((16, 32)))
+    cc = thr_mma.partition_C(cute.make_identity_tensor((32, 32)))
     fa = cute.make_rmem_tensor(ca.shape, {dtype})
     fb = cute.make_rmem_tensor(cb.shape, {dtype})
     fc = cute.make_rmem_tensor(cc.shape, cutlass.Float32)
     for tile in cutlass.range(block, cute.size(work_iterator), workers):
         tile_id = cutlass.Int32(work_iterator[tile])
-        row_base = (tile_id // {ntiles}) * 16
+        row_base = (tile_id // {ntiles}) * 32
         col_base = (tile_id % {ntiles}) * 32
 {tile_coordinate_line}        fc.fill(0.0)
         for kbase in cutlass.range(0, {reduction}, 16):
@@ -211,7 +211,7 @@ def run(
 '''
     return GeneratedContractionBody(
         source=source, threads_per_cta=128, output_tile_elements=512,
-        reduction_chunk=16, tile_count=((rows + 15) // 16) * ntiles,
-        work_iterator_encoding="one row-major 16x32 output tile ordinal per CTA",
+        reduction_chunk=16, tile_count=((rows + 31) // 32) * ntiles,
+        work_iterator_encoding="one row-major 32x32 output tile ordinal per CTA",
         phases=("output_tile", "warp_mma", "epilogue"),
     )

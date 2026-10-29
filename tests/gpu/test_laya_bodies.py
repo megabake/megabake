@@ -54,7 +54,7 @@ def test_blackwell_bias_residual_epilogue(tmp_path):
         actual = compiled(*inputs)
         torch.testing.assert_close(actual, model(*inputs), atol=0.004, rtol=0.01)
     candidates = backend.megabake_last_compiled.search.candidates
-    assert any("blackwell_mma_16x32x16_epilogue" in candidate.description for candidate in candidates)
+    assert any("blackwell_mma_32x32x16_epilogue" in candidate.description for candidate in candidates)
 
 
 @pytest.mark.skipif(torch.cuda.is_available() and torch.cuda.get_device_capability()[0] not in {10, 12},
@@ -74,7 +74,7 @@ def test_blackwell_epilogue_supports_rank_three_output(tmp_path):
         torch.testing.assert_close(actual, model(*inputs))
     candidates = backend.megabake_last_compiled.search.candidates
     assert any(candidate.status == "measured" and
-               "blackwell_mma_16x32x16_epilogue" in candidate.description
+               "blackwell_mma_32x32x16_epilogue" in candidate.description
                for candidate in candidates)
 
 
@@ -94,7 +94,7 @@ def test_blackwell_epilogue_rejects_narrow_output(tmp_path):
         actual = compiled(*inputs)
         torch.testing.assert_close(actual, model(*inputs))
     selections = backend.megabake_last_compiled.plan.selection.selections
-    assert not any(selection.body.name == "blackwell_mma_16x32x16_epilogue" for selection in selections)
+    assert not any(selection.body.name == "blackwell_mma_32x32x16_epilogue" for selection in selections)
 
 
 def test_parameter_cast_cache_refreshes_after_mutation(tmp_path, monkeypatch):
