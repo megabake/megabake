@@ -324,7 +324,7 @@ def emit_reduction_body(
         "cute.Tensor" for _ in range(len(input_value_ids) + 1)
     )
     accumulator_type = _cutlass_type(program.accumulator_dtype or "")
-    reduction_operator = _ordered_reduction_operator(program.combine)
+    reduction_operator = _ordered_reduction_operator(program.combine, (1,) if program.source_target == "layer_norm" else ())
     # Output axes that only the post-reduction expression reads (the feature
     # axis of a norm) share one row reduction: reduce each row once, then let
     # every thread write that row's outputs.
@@ -586,6 +586,25 @@ def _emit_row_reduction_body(
         if reduction_operator == "maximum"
         else "accumulator = accumulator + scratch[block, warp_index]"
     )
+    mean_prologue = ""
+    if program.source_target == "layer_norm":
+        source_load = program.loads[0]
+        access = _load_access(source_load, load_indices[source_load.id], program.loads,
+                              {**axis_coordinates, reduction_domain.axis: reduction_coordinate}).code
+        mean_prologue = f'''            accumulator_1 = cutlass.Float32(0.0)
+            for reduction_index in {_strided_range("thread", reduction_domain.size, threads)}:
+                {reduction_coordinate} = reduction_index
+                accumulator_1 = accumulator_1 + {access}
+            mean_partial = cute.arch.warp_reduction_sum(accumulator_1)
+            if lane == 0:
+                scratch[block, warp] = mean_partial
+            cute.arch.sync_threads()
+            accumulator_1 = cutlass.Float32(0.0)
+            for warp_index in cutlass.range(warps):
+                accumulator_1 = accumulator_1 + scratch[block, warp_index]
+            accumulator_1 = accumulator_1 / cutlass.Float32({reduction_domain.size})
+            cute.arch.sync_threads()
+'''
     source = f'''import cutlass
 import cutlass.cute as cute
 
@@ -613,7 +632,7 @@ def run(
     for tile in cutlass.range(block, cute.size(work_iterator), workers):
         row_index = work_iterator[tile]
         if row_index < {row_count}:
-{_row_major_lines(row_domains, axis_coordinates, "row_index", "            ")}            accumulator = {accumulator_type}({accumulator.code})
+{_row_major_lines(row_domains, axis_coordinates, "row_index", "            ")}{mean_prologue}            accumulator = {accumulator_type}({accumulator.code})
             for reduction_index in {_strided_range("thread", reduction_domain.size, threads)}:
                 {reduction_coordinate} = reduction_index
                 accumulator = {combine.code}
@@ -828,7 +847,7 @@ def _validate_reduction_body(program: TensorProgram, config: BodyConfig) -> None
         )
     if program.init is None or program.post is None or program.accumulator_dtype is None:
         raise UnsupportedReductionBody("reduction body requires complete reduction state")
-    if _ordered_reduction_operator(program.combine) not in {"add", "maximum"}:
+    if _ordered_reduction_operator(program.combine, (1,) if program.source_target == "layer_norm" else ()) not in {"add", "maximum"}:
         raise UnsupportedReductionBody(
             "reduction body generator supports ordered addition or maximum"
         )
@@ -995,16 +1014,18 @@ def _is_add_reduction(expression: ScalarExpression) -> bool:
     return left != right
 
 
-def _ordered_reduction_operator(expression: ScalarExpression) -> str | None:
+def _ordered_reduction_operator(expression: ScalarExpression, invariants: tuple[int, ...] = ()) -> str | None:
     if not isinstance(expression, Binary):
         return None
-    left = _expression_has_accumulator(expression.lhs)
-    right = _expression_has_accumulator(expression.rhs)
+    left = _expression_has_accumulator(expression.lhs, invariants)
+    right = _expression_has_accumulator(expression.rhs, invariants)
     return expression.operator if left != right else None
 
 
-def _maximum_code(left: str, right: str) -> str:
-    return f"cute.arch.fmax({left}, {right}, nan=True)"
+def _maximum_code(left: str, right: str, dtype: str) -> str:
+    if _is_float(dtype):
+        return f"cute.arch.fmax({left}, {right}, nan=True)"
+    return f"(({left}) if ({left}) > ({right}) else ({right}))"
 
 
 def _constant_code(value: int | float | bool) -> str:
@@ -1013,20 +1034,20 @@ def _constant_code(value: int | float | bool) -> str:
     return repr(value)
 
 
-def _expression_has_accumulator(expression: ScalarExpression) -> bool:
+def _expression_has_accumulator(expression: ScalarExpression, invariants: tuple[int, ...] = ()) -> bool:
     if isinstance(expression, Accumulator):
-        return True
+        return expression.index not in invariants
     if isinstance(expression, Binary):
-        return _expression_has_accumulator(expression.lhs) or _expression_has_accumulator(
-            expression.rhs
+        return _expression_has_accumulator(expression.lhs, invariants) or _expression_has_accumulator(
+            expression.rhs, invariants
         )
     if isinstance(expression, Unary):
-        return _expression_has_accumulator(expression.operand)
+        return _expression_has_accumulator(expression.operand, invariants)
     if isinstance(expression, Cast):
-        return _expression_has_accumulator(expression.operand)
+        return _expression_has_accumulator(expression.operand, invariants)
     if isinstance(expression, Where):
         return any(
-            _expression_has_accumulator(value)
+            _expression_has_accumulator(value, invariants)
             for value in (expression.condition, expression.true_value, expression.false_value)
         )
     return False
@@ -1110,7 +1131,7 @@ def _emit_expression(
         if expression.operator == "pow":
             code = f"cute.pow({left.code}, {right.code})"
         elif expression.operator == "maximum":
-            code = _maximum_code(left.code, right.code)
+            code = _maximum_code(left.code, right.code, expression.dtype)
         elif expression.operator == "minimum":
             code = f"cute.arch.fmin({left.code}, {right.code}, nan=True)"
         else:

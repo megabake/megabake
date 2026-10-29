@@ -14,7 +14,7 @@ from megabake import (
     verify_plan,
 )
 from megabake.bodies import SelectionPolicy, TargetFacts
-from megabake.compiler import _gather_index_is_static
+from megabake.compiler import _gather_index_is_static, _output_relative_l2
 from megabake.fx_handler.export import capture_exported_program
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
@@ -222,3 +222,9 @@ def test_task31_plan_search_restores_state_between_runs():
     snapshot.reset()
     assert all(torch.equal(private, original) for private, original in snapshot.pairs)
     assert all(int(value.abs().sum()) == 0 for value in args[2:])
+
+
+def test_task31_output_validation_rejects_non_finite_mismatch():
+    expected = torch.tensor([1.0, 2.0])
+    assert _output_relative_l2(expected, torch.tensor([1.0, float("nan")])) == float("inf")
+    assert _output_relative_l2(expected, torch.tensor([1.0, float("inf")])) == float("inf")

@@ -1522,10 +1522,16 @@ def _gather_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorP
     result = _result_value(op, graph)
     if source.shape is None or index.shape is None or result.shape is None:
         raise UnsupportedLowering("gather operands need static shapes")
-    if index.shape != result.shape or source.shape != result.shape:
-        raise UnsupportedLowering("gather operands and result must have the same shape")
-    if index.id not in graph.inputs:
-        raise UnsupportedLowering("data-dependent gather requires a runtime index input")
+    if index.shape != result.shape or len(source.shape) != len(result.shape):
+        raise UnsupportedLowering("gather index and result must have the source rank")
+    if any(
+        result_extent > source_extent
+        for axis, (result_extent, source_extent) in enumerate(
+            zip(result.shape, source.shape, strict=True)
+        )
+        if axis != dimension
+    ):
+        raise UnsupportedLowering("gather result exceeds a non-indexed source dimension")
     if index.dtype not in {
         "torch.int32",
         "torch.int64",

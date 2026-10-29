@@ -5,6 +5,7 @@ import textwrap
 from functools import cache
 from typing import Any, Mapping
 
+from ..sm100.gemm import BLACKWELL_ARCHITECTURES
 from ....graph import Region
 from ....ops import HF_EAGER_NUMERICS, Attention, HeadGrouping, Prologue
 from ...interface import (
@@ -229,8 +230,11 @@ class AttentionBodyProvider:
             # Only the table launch's split-context decode body computes them.
             return reject("query and key prologues need the split-context decode body")
 
-        if target.architecture != "sm90a" or not target.supports_wgmma:
-            return reject("provider targets WGMMA-capable sm90a only")
+        supported_target = (
+            target.architecture == "sm90a" and target.supports_wgmma
+        ) or target.architecture in BLACKWELL_ARCHITECTURES
+        if not supported_target:
+            return reject("provider requires sm90a or a supported Blackwell target")
         if attention_scratch_rows(kv_length) < 1:
             return reject(
                 f"a {kv_length}-key FP32 score row exceeds {ATTENTION_SCRATCH_BYTES} scratch bytes"
@@ -248,6 +252,7 @@ class AttentionBodyProvider:
                     region,
                     program,
                     body_name,
+                    target,
                     target.multiprocessor_count,
                     stateful and policy.table_launch and head_dim % 32 == 0,
                 ),
@@ -273,7 +278,12 @@ def attention_scratch_rows(kv_length: int) -> int:
 
 
 def _attention_config(
-    region: Region, program: Any, name: str, workers: int, split: bool
+    region: Region,
+    program: Any,
+    name: str,
+    target: TargetFacts,
+    workers: int,
+    split: bool,
 ) -> BodyConfig:
     """``split`` sizes the scratch for the table launch's split-context decode
     body, which ``workers`` CTAs run."""
@@ -379,7 +389,7 @@ def _attention_config(
             register_fragments="row score, softmax maximum and total, and value accumulators",
         ),
         evidence=ResourceEvidence(
-            measured=not stateful,
+            measured=not stateful and target.architecture == "sm90a",
             source=(
                 "stateful decode extension of the CuTe row pipeline adapted from "
                 "Mirage multitoken Hopper attention"
@@ -621,11 +631,15 @@ def run(
         mask_load = next(load for load in program.loads if load.id == "attention:mask")
         if mask_load.source_shape is None or len(mask_load.source_shape) != 4:
             raise UnsupportedAttentionBody("additive mask must be four-dimensional")
-        mask_head_is_broadcast = mask_load.source_shape[1] == 1
+        mask_indices = tuple(
+            "0" if size == 1 else index
+            for size, index in zip(
+                mask_load.source_shape, ("b", "h", "s", "key"), strict=True
+            )
+        )
         mask_access = (
-            f"tensor_bindings[{loads['attention:mask']}][b, 0, s, key]"
-            if mask_head_is_broadcast
-            else f"tensor_bindings[{loads['attention:mask']}][b, h, s, key]"
+            f"tensor_bindings[{loads['attention:mask']}]"
+            f"[{', '.join(mask_indices)}]"
         )
         mask_code = f"score = (score.to(cutlass.Float32) + ({mask_access}).to(cutlass.Float32)).to(cutlass.BFloat16)"
     elif mask.kind == "typed_where":
@@ -713,7 +727,10 @@ def run(
                 maximum = cute.arch.warp_reduction_max(maximum)
                 total = cutlass.Float32(0.0)
                 for key in cutlass.range(lane, {kv_length}, 32):
-                    probability = cute.exp(scratch[base + key] - maximum)
+                    score = scratch[base + key]
+                    probability = cutlass.Float32(0.0)
+                    if score > cutlass.Float32(-1.0e30):
+                        probability = cute.exp(score - maximum)
                     scratch[base + key] = probability
                     total = total + probability
                 total = cute.arch.warp_reduction_sum(total)

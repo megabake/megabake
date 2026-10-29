@@ -177,7 +177,7 @@ class CallableTrace:
 # Above this size, per-phase kernel parameters exceed CUDA's limit, so plans
 # use the table-driven launch: tensors come from a device address table and
 # TMA GEMM descriptors are written per phase in the kernel prologue.
-_TABLE_LAUNCH_OPS = 1_000
+_TABLE_LAUNCH_OPS = 256
 
 
 # CUDA kernel parameters are limited to 32 KiB; launches passing one CuTe
@@ -240,9 +240,9 @@ class _TeacherForcedCheck:
         with torch.no_grad():
             rerun = bound(*self.snapshot.inputs)
         torch.cuda.synchronize()
-        # Same code and arithmetic order; only workspace addresses differ.
-        if not _outputs_identical(actual, rerun):
-            return "outputs change when workspace is not reused"
+        # Continue through the region check when consecutive executions are
+        # unstable so the diagnostic names the first bad materialized value.
+        unstable_outputs = not _outputs_identical(actual, rerun)
         values = bound.megabake_runtime_state.values
         originals = {id(private): original for private, original in self.snapshot.pairs}
         nodes = list(self.prepared.graph.graph.nodes)
@@ -259,8 +259,9 @@ class _TeacherForcedCheck:
                 selected, values, inputs, state, by_name, order, self.prepared.graph
             )
             if reason is not None:
-                return reason
-        return None
+                prefix = "outputs are unstable; " if unstable_outputs else ""
+                return prefix + reason
+        return "outputs change between identical runs" if unstable_outputs else None
 
 
 def _region_failure(
@@ -989,6 +990,8 @@ def bind_callable(
                 forward.megabake_runtime_state = state
             else:
                 state.rebind(input_tensors, full_inputs)
+            if not capturing:
+                state.prepare_parameter_cast_cache()
 
             launches = 0
             uploads_before = state.address_table_uploads
@@ -1001,16 +1004,51 @@ def bind_callable(
                 launches += 1
 
             if compiled_kernel.event_schedule is None:
-                execute_phase_plan(
-                    compiled_kernel.plan,
-                    kernel,
-                    active_stream,
-                    admission=compiled_kernel.admission,
-                    ready=state.ready,
-                    epoch=next_epoch,
-                    synchronize=False,
-                    capturable=capturing,
-                )
+                cutlass_phases = state.cutlass_gemm_phases()
+                if cutlass_phases:
+                    phase_begin = 0
+                    for cutlass_phase in cutlass_phases:
+                        phase_index = cutlass_phase.index
+                        if phase_begin < phase_index or phase_begin == 0:
+                            state.launch(
+                                compiled_kernel.compiled,
+                                next_epoch,
+                                active_stream,
+                                phase_begin=phase_begin,
+                                phase_end=phase_index,
+                            )
+                            launches += 1
+                        state.launch_cutlass_phase(cutlass_phase)
+                        launches += 1
+                        state.launch(
+                            compiled_kernel.compiled,
+                            next_epoch,
+                            active_stream,
+                            phase_begin=phase_index,
+                            phase_end=phase_index + 1,
+                        )
+                        launches += 1
+                        phase_begin = phase_index + 1
+                    if phase_begin < len(compiled_kernel.plan.phases):
+                        state.launch(
+                            compiled_kernel.compiled,
+                            next_epoch,
+                            active_stream,
+                            phase_begin=phase_begin,
+                            phase_end=len(compiled_kernel.plan.phases),
+                        )
+                        launches += 1
+                else:
+                    execute_phase_plan(
+                        compiled_kernel.plan,
+                        kernel,
+                        active_stream,
+                        admission=compiled_kernel.admission,
+                        ready=state.ready,
+                        epoch=next_epoch,
+                        synchronize=False,
+                        capturable=capturing,
+                    )
             else:
                 execute_event_plan(
                     compiled_kernel.event_schedule,
@@ -1022,6 +1060,8 @@ def bind_callable(
                     validate_counters=False,
                     synchronize=False,
                 )
+            if not capturing:
+                state.commit_parameter_cast_cache()
             outputs = tuple(
                 state.tensor_for_value(value_id) for value_id in graph.outputs
             )
@@ -1230,22 +1270,24 @@ def _make_plan_evaluator(
             with torch.no_grad():
                 actual = executable(*prepared.example_inputs)
             relative_error = _output_relative_l2(reference, actual)
-            if relative_error >= _plan_relative_l2_limit(plan):
-                failure = (
-                    teacher_check.failure(compiled, actual)
-                    if teacher_check is not None
-                    else "no teacher-forced check"
+            has_teacher = (
+                teacher_check is not None
+                and plan.graph is not None
+                and _uses_table_launch(plan.graph)
+            )
+            failure = teacher_check.failure(compiled, actual) if has_teacher else None
+            if failure is not None or (
+                not has_teacher and relative_error >= _plan_relative_l2_limit(plan)
+            ):
+                return PlanMeasurement(
+                    compiled=compiled,
+                    resources=compiled.resources,
+                    correct=False,
+                    error=(
+                        f"relative L2 error {relative_error:.6g}; "
+                        f"teacher-forced verification: {failure or 'unavailable'}"
+                    ),
                 )
-                if failure is not None:
-                    return PlanMeasurement(
-                        compiled=compiled,
-                        resources=compiled.resources,
-                        correct=False,
-                        error=(
-                            f"relative L2 error {relative_error:.6g}; "
-                            f"teacher-forced verification: {failure}"
-                        ),
-                    )
             complete_samples, device_samples = _complete_call_samples(
                 executable,
                 prepared.example_inputs,
@@ -1492,8 +1534,12 @@ def _output_relative_l2(expected: Any, actual: Any) -> float:
             or expected_value.dtype != actual_value.dtype
         ):
             return float("inf")
-        difference = (expected_value.float() - actual_value.float()).square().sum()
-        denominator_value = expected_value.float().square().sum()
+        expected_float = expected_value.float()
+        actual_float = actual_value.float()
+        if not torch.equal(torch.isfinite(expected_float), torch.isfinite(actual_float)):
+            return float("inf")
+        difference = (expected_float - actual_float).square().sum()
+        denominator_value = expected_float.square().sum()
         numerator += float(difference.item())
         denominator += float(denominator_value.item())
     if denominator == 0:
@@ -1685,14 +1731,21 @@ def _validate_data_indices(plan: KernelPlan, inputs: Mapping[str, torch.Tensor])
                 )
                 index_tensor = inputs.get(index_load.value_id)
                 if index_tensor is None:
-                    if _gather_index_is_static(plan.graph, index_load.value_id):
+                    index_value = plan.graph.values.get(index_load.value_id)
+                    if (
+                        _gather_index_is_static(plan.graph, index_load.value_id)
+                        or index_value is not None
+                        and index_value.producer in plan.graph.ops
+                    ):
+                        # Produced indices are validated by the generated gather
+                        # body's device-side range check once their phase runs.
                         continue
                     raise CompilerError(
                         CompilerDiagnostic(
                             "runtime-binding",
-                            f"gather index {index_load.value_id} is not a runtime input",
+                            f"gather index {index_load.value_id} is not bound or produced",
                             selected.source_op_ids,
-                            requirement="runtime gather index",
+                            requirement="bound or produced gather index",
                         )
                     )
 
@@ -1877,6 +1930,16 @@ class _TableRebind:
         return addresses
 
 
+@dataclass(frozen=True)
+class _CutlassGemmPhase:
+    index: int
+    gemm: Any
+    source_id: str
+    weight_id: str
+    output_id: str
+    transpose_weight: bool
+
+
 class _RuntimeState:
     def __init__(
         self,
@@ -1915,6 +1978,10 @@ class _RuntimeState:
         self._address_table: torch.Tensor | None = None
         self._address_mirror: np.ndarray | None = None
         self._phase_table: tuple[torch.Tensor, Any] | None = None
+        self._cached_parameter_phases = self._parameter_cast_phases()
+        self._cached_parameter_signature: tuple[tuple[int, int], ...] | None = None
+        self._parameter_cache_pending = False
+        self._cutlass_phase_cache: tuple[_CutlassGemmPhase, ...] | None = None
         self._gemm_table: tuple[torch.Tensor, Any] | None = None
         self._stream_table: tuple[torch.Tensor, Any] | None = None
         # Phase scratch of table launches: FP32 elements and Int32 counters.
@@ -1949,6 +2016,131 @@ class _RuntimeState:
         # Address rings of CUDA graphs that captured this state; kept alive
         # with the state because the graphs read them on every replay.
         self._graph_rings: list[torch.Tensor] = []
+
+    def _parameter_cast_phases(self) -> tuple[int, ...]:
+        if not self.generated.launch.phase_table:
+            return ()
+        graph = self.plan.graph
+        if graph is None:
+            return ()
+        parameter_names = set(getattr(graph.runtime_context, "parameter_names", None) or ())
+        parameter_ids = {
+            value_id
+            for value_id, value in graph.values.items()
+            if value.binding_name in parameter_names
+        }
+        selections = {
+            selection.region_id: selection for selection in self.plan.selection.selections
+        }
+        return tuple(
+            phase.index
+            for phase in self.plan.phases
+            if (
+                (selection := selections[phase.region_id]).program.source_target
+                == "prims.convert_element_type.default"
+                and len(selection.program.loads) == 1
+                and selection.program.loads[0].value_id in parameter_ids
+            )
+        )
+
+    def prepare_parameter_cast_cache(self) -> None:
+        if not self._cached_parameter_phases:
+            return
+        graph = self.plan.graph
+        parameter_names = set(getattr(graph.runtime_context, "parameter_names", None) or ())
+        signature = tuple(
+            (tensor.data_ptr(), tensor._version)
+            for value_id, tensor in self.input_tensors.items()
+            if graph.values[value_id].binding_name in parameter_names
+        )
+        if signature == self._cached_parameter_signature:
+            return
+        self._cached_parameter_signature = signature
+        self._parameter_cache_pending = True
+        if self._phase_table is not None:
+            column = -2 if self.generated.launch.stream_table else -1
+            table = self._phase_table[0]
+            for phase in self._cached_parameter_phases:
+                table[phase, column] = self.generated.launch.phase_table[phase][column]
+
+    def commit_parameter_cast_cache(self) -> None:
+        if not self._parameter_cache_pending or self._phase_table is None:
+            return
+        column = -2 if self.generated.launch.stream_table else -1
+        table = self._phase_table[0]
+        for phase in self._cached_parameter_phases:
+            table[phase, column] = 0
+        self._parameter_cache_pending = False
+
+    def cutlass_gemm_phases(self) -> tuple[_CutlassGemmPhase, ...]:
+        if self._cutlass_phase_cache is not None:
+            return self._cutlass_phase_cache
+        if (
+            self.generated.launch.launch_policy != "megabake_cooperative_table"
+            or self.plan.target is None
+            or self.plan.target.architecture not in {"sm120", "sm121"}
+        ):
+            self._cutlass_phase_cache = ()
+            return ()
+        from .bodies.cuda.sm100.cutlass_runtime import CutlassSm120Gemm
+
+        selections = {
+            selection.region_id: selection for selection in self.plan.selection.selections
+        }
+        phases = []
+        for phase in self.plan.phases:
+            selection = selections[phase.region_id]
+            program = selection.program
+            if (
+                selection.body.name != "blackwell_mma_32x32x16"
+                or len(program.store.shape) != 2
+                or len(program.loads) != 2
+                or program.loads[0].axes != ("o0", "r0")
+                or program.loads[1].axes not in {("o1", "r0"), ("r0", "o1")}
+            ):
+                continue
+            source_id = program.loads[0].value_id
+            weight_id = program.loads[1].value_id
+            output_id = program.store.value_id
+            source = self.tensor_for_value(source_id)
+            weight = self.tensor_for_value(weight_id)
+            if program.loads[1].axes == ("r0", "o1"):
+                weight = weight.T
+            output = self.tensor_for_value(output_id)
+            try:
+                gemm = CutlassSm120Gemm(source, weight, output)
+            except ValueError:
+                continue
+            phases.append(
+                _CutlassGemmPhase(
+                    index=phase.index,
+                    gemm=gemm,
+                    source_id=source_id,
+                    weight_id=weight_id,
+                    output_id=output_id,
+                    transpose_weight=program.loads[1].axes == ("r0", "o1"),
+                )
+            )
+        self._cutlass_phase_cache = tuple(phases)
+        if phases and self._phase_table is None:
+            phase_table = torch.tensor(
+                self.generated.launch.phase_table,
+                dtype=torch.int32,
+                device=self.ready.device,
+            )
+            self._phase_table = (phase_table, _cute_view(phase_table))
+        if phases:
+            column = -2 if self.generated.launch.stream_table else -1
+            for phase in phases:
+                self._phase_table[0][phase.index, column] = 0
+        return self._cutlass_phase_cache
+
+    def launch_cutlass_phase(self, phase: _CutlassGemmPhase) -> None:
+        source = self.tensor_for_value(phase.source_id)
+        weight = self.tensor_for_value(phase.weight_id)
+        if phase.transpose_weight:
+            weight = weight.T
+        phase.gemm(source, weight, self.tensor_for_value(phase.output_id))
 
     @classmethod
     def create(
@@ -2073,6 +2265,7 @@ class _RuntimeState:
         device = next(iter(input_tensors.values())).device
         workspace = self.workspace
         values: dict[str, torch.Tensor] = {}
+        pending_aliases = []
         self._allocated_outputs = {}
         for binding in plan.storage.bindings:
             if binding.storage_id in workspace:
@@ -2117,14 +2310,62 @@ class _RuntimeState:
                 self._allocated_outputs[binding.value_id] = binding.layout
                 continue
             if binding.kind == "alias":
+                pending_aliases.append(binding)
+
+        while pending_aliases:
+            unresolved = []
+            for binding in pending_aliases:
+                internal_alias = _internal_alias(
+                    binding.value_id, plan.graph, values
+                )
+                if internal_alias is not None and binding.layout is not None:
+                    alias_id, alias_tensor = internal_alias
+                    values[binding.value_id] = alias_tensor.as_strided(
+                        binding.layout.shape,
+                        binding.layout.strides,
+                        _alias_storage_offset(
+                            binding.value_id, alias_id, alias_tensor, plan.graph
+                        ),
+                    )
+                    continue
+                relation = plan.graph.values[
+                    binding.value_id
+                ].storage_relation
+                if (
+                    relation.storage_id in workspace
+                    and binding.layout is not None
+                ):
+                    alias_tensor = workspace[relation.storage_id]
+                    values[binding.value_id] = alias_tensor.as_strided(
+                        binding.layout.shape,
+                        binding.layout.strides,
+                        _alias_storage_offset(
+                            binding.value_id,
+                            relation.storage_id,
+                            alias_tensor,
+                            plan.graph,
+                        ),
+                    )
+                    continue
+                alias = _boundary_alias(
+                    binding.value_id, plan.graph, input_tensors
+                )
+                if alias is not None:
+                    values[binding.value_id] = alias
+                    continue
+                unresolved.append(binding)
+            if len(unresolved) == len(pending_aliases):
+                binding = unresolved[0]
                 raise CompilerError(
                     CompilerDiagnostic(
                         "runtime-binding",
                         f"cannot resolve alias {binding.value_id}",
                         (binding.value_id,),
-                        requirement="boundary alias",
+                        requirement="boundary or allocated alias",
                     )
                 )
+            pending_aliases = unresolved
+
         # Table launches bind only one template group per GEMM variant; the
         # kernel writes every phase's descriptors from the address table.
         template_phases = set(self.generated.launch.gemm_template_phases)
@@ -2382,6 +2623,9 @@ class _RuntimeState:
         *,
         include_constants: bool = False,
         ring: torch.Tensor | None = None,
+        barrier_epoch: int = -1,
+        phase_begin: int = 0,
+        phase_end: int | None = None,
     ) -> tuple[Any, ...]:
         """Kernel arguments of a table launch.
 
@@ -2527,7 +2771,9 @@ class _RuntimeState:
         cached = self._table_argument_cache
         handle = int(stream)
         if (
-            not include_constants
+            phase_begin == 0
+            and phase_end is None
+            and not include_constants
             and ring is None
             and cached is not None
             and cached[2] == handle
@@ -2545,6 +2791,9 @@ class _RuntimeState:
             self._dynamic_slot_table[1],
             self._phase_scratch[0][1],
             self._phase_scratch[1][1],
+            cutlass.Int32(barrier_epoch),
+            cutlass.Int32(phase_begin),
+            cutlass.Int32(len(self.plan.phases) if phase_end is None else phase_end),
         ]
         if launch.gemm_table:
             arguments.extend(
@@ -2559,12 +2808,18 @@ class _RuntimeState:
                 arguments.append(self._max_active_clusters)
         arguments.append(stream)
         result = tuple(arguments)
-        if not include_constants and ring is None:
+        if phase_begin == 0 and phase_end is None and not include_constants and ring is None:
             self._table_argument_cache = (parts, result, handle)
         return result
 
     def prepare_launch(
-        self, compiled: Any, epoch: int, stream: torch.cuda.Stream
+        self,
+        compiled: Any,
+        epoch: int,
+        stream: torch.cuda.Stream,
+        *,
+        phase_begin: int = 0,
+        phase_end: int | None = None,
     ) -> tuple[Any, ...]:
         """Bind this launch's arguments; ``run_launch`` enqueues it.
 
@@ -2586,14 +2841,27 @@ class _RuntimeState:
                 (DYNAMIC_ADDRESS_RING, len(self.generated.launch.dynamic_slots) + 1),
                 dtype=torch.int64,
             ).pin_memory()
-            arguments = self._table_arguments(cu_stream, ring=ring)
+            arguments = self._table_arguments(
+                cu_stream,
+                ring=ring,
+                barrier_epoch=(
+                    epoch if phase_begin != 0 or phase_end is not None else -1
+                ),
+                phase_begin=phase_begin,
+                phase_end=phase_end,
+            )
             ring[:, 0] = -1
             ring[:, 1:] = torch.from_numpy(self._pending_dynamic_addresses)
             self._graph_rings.append(ring)
             _graph_capture.append(self)
             return (None, arguments, *_pack_arguments(compiled, arguments))
         self._wrap_calls()
-        arguments = self._table_arguments(cu_stream)
+        arguments = self._table_arguments(
+            cu_stream,
+            barrier_epoch=(epoch if phase_begin != 0 or phase_end is not None else -1),
+            phase_begin=phase_begin,
+            phase_end=phase_end,
+        )
         call = self._calls
         host, rows, events = self._dynamic_ring
         entry = call % DYNAMIC_ADDRESS_RING
@@ -2606,10 +2874,12 @@ class _RuntimeState:
         )
         self._calls += 1
         self._prepared_calls += 1
-        packed = self._packed_arguments
+        full_range = phase_begin == 0 and phase_end is None
+        packed = self._packed_arguments if full_range else None
         if packed is None or packed[0] is not arguments:
             packed = (arguments, *_pack_arguments(compiled, arguments))
-            self._packed_arguments = packed
+            if full_range:
+                self._packed_arguments = packed
         return (call, arguments, packed[1], packed[2])
 
     def run_launch(
@@ -2629,9 +2899,27 @@ class _RuntimeState:
         event.record(stream)
         events[entry] = event
 
-    def launch(self, compiled: Any, epoch: int, stream: torch.cuda.Stream) -> None:
+    def launch(
+        self,
+        compiled: Any,
+        epoch: int,
+        stream: torch.cuda.Stream,
+        *,
+        phase_begin: int = 0,
+        phase_end: int | None = None,
+    ) -> None:
         """Enqueue one launch of ``compiled`` on ``stream`` without blocking."""
-        self.run_launch(compiled, self.prepare_launch(compiled, epoch, stream), stream)
+        self.run_launch(
+            compiled,
+            self.prepare_launch(
+                compiled,
+                epoch,
+                stream,
+                phase_begin=phase_begin,
+                phase_end=phase_end,
+            ),
+            stream,
+        )
 
     def _check_gemm_alignment(self, addresses: np.ndarray) -> None:
         """TMA descriptors need 16-byte-aligned operand base addresses."""
@@ -2988,15 +3276,10 @@ def _g0_value_source_tensor(
 
 
 def _cute_view(tensor: torch.Tensor) -> Any:
-    if tensor.data_ptr() % 16:
-        raise CompilerError(
-            CompilerDiagnostic(
-                "runtime-binding",
-                f"tensor at {tensor.data_ptr():#x} is not 16-byte aligned",
-                requirement="16-byte tensor alignment",
-            )
-        )
-    result = from_dlpack(tensor.detach(), assumed_align=16)
+    # Generic bodies support scalar accesses and view offsets, so their runtime
+    # pointers must not claim TMA-style 16-byte alignment. GEMM bindings enforce
+    # their stronger alignment contract separately.
+    result = from_dlpack(tensor.detach(), assumed_align=1)
     leading_dimension = next(
         (index for index, stride in enumerate(tensor.stride()) if stride == 1),
         None,

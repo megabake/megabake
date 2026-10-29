@@ -225,6 +225,11 @@ def _enumerate_body_selections(
             if option is not None
             for operation_id in option[0].source_op_ids
         }
+        base_region_indices = {
+            operation_id: index
+            for index, region in enumerate(graph.regions)
+            for operation_id in region.source_op_ids
+        }
         for index, options in enumerate(options_by_region):
             if first_combination[index] is not None:
                 continue
@@ -241,9 +246,16 @@ def _enumerate_body_selections(
             if replacement is None:
                 continue
             replacement_operations = set(replacement[0].source_op_ids)
+            missing_operations = replacement_operations - operation_indices.keys()
+            if any(
+                base_region_indices[operation_id] not in covered_empty_regions
+                for operation_id in missing_operations
+            ):
+                continue
             replaced_indices = {
                 operation_indices[operation_id]
                 for operation_id in replacement_operations
+                if operation_id in operation_indices
             }
             replaced_operations = {
                 operation_id
@@ -287,9 +299,12 @@ def _enumerate_body_selections(
             chosen.append(option)
             covered_operations.update(option[0].source_op_ids)
         if any(
-            not combination[index]
-            and not set(graph.regions[index].source_op_ids) <= covered_operations
-            for index in covered_empty_regions
+            not set(region.source_op_ids) <= covered_operations
+            for region in graph.regions
+            if not all(
+                isinstance(program, TensorProgram) and program.family == "view"
+                for program in region.tensor_programs
+            )
         ):
             continue
         if not chosen:

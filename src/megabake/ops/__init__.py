@@ -23,11 +23,11 @@ from .attention import (
 )
 from .elementwise import ScalarChain
 from .gemm import GemmEpilogue, ViewPlusGemm
-from .norm import RMSNorm
+from .norm import LayerNorm, RMSNorm
 from .rope import Rope
 
 # The descriptor a region or fusion candidate carries, if any.
-Semantics = Attention | GemmEpilogue | RMSNorm | Rope | ScalarChain | ViewPlusGemm
+Semantics = LayerNorm | Attention | GemmEpilogue | RMSNorm | Rope | ScalarChain | ViewPlusGemm
 
 __all__ = [
     "ATTENTION_OP",
@@ -40,6 +40,7 @@ __all__ = [
     "Mask",
     "NumericalPolicy",
     "Prologue",
+    "LayerNorm",
     "RMSNorm",
     "Rope",
     "ScalarChain",

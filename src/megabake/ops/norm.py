@@ -8,10 +8,11 @@ post-reduction expressions, so the source's casts are kept.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..graph import ComputeGraph, Op, RegionCandidate
 from ..ir import (
+    Accumulator,
     AxisPredicate,
     Binary,
     Constant,
@@ -23,6 +24,8 @@ from ..ir import (
     TensorStore,
 )
 from .matching import (
+    binary_operator,
+    scalar_operand,
     external_inputs_of,
     has_illegal_effects,
     live_outputs_of,
@@ -32,6 +35,15 @@ from .matching import (
     substitute_loads,
     value_bytes,
 )
+
+from .elementwise import compose_scalar_chain, is_scalar_operation
+
+
+@dataclass(frozen=True)
+class LayerNorm:
+    """A centered norm over the final tensor axis."""
+
+    width: int
 
 
 @dataclass(frozen=True)
@@ -57,6 +69,10 @@ def candidates(graph: ComputeGraph) -> tuple[RegionCandidate, ...]:
         ):
             continue
         candidate = _rms_norm_candidate(operation, graph)
+        if candidate is not None:
+            candidates.append(candidate)
+    for operation in graph.ops.values():
+        candidate = _layer_norm_candidate(operation, graph)
         if candidate is not None:
             candidates.append(candidate)
     return tuple(candidates)
@@ -353,3 +369,98 @@ def _rms_norm_chain(
         return None
     return tuple(operations), x_id, weight_id, add_program.combine.rhs.value
 
+
+
+def _layer_norm_candidate(mean: Op, graph: ComputeGraph) -> RegionCandidate | None:
+    if not matches_target(mean, "aten.mean.dim") or len(mean.operands) != 1:
+        return None
+    source = graph.values[mean.operands[0]]
+    if source.dtype != "torch.float32" or not source.shape or len(source.shape) < 2:
+        return None
+    width = source.shape[-1]
+    arguments = mean.attributes.get("fx_args", ())
+    if len(arguments) < 3 or arguments[1] not in ([len(source.shape) - 1], [-1]) or arguments[2] is not True:
+        return None
+    centered = sole_user(mean, graph)
+    if not binary_operator(centered, "sub") or centered.operands != (source.id, mean.results[0]):
+        return None
+    users = [graph.ops[user] for user in graph.values[centered.results[0]].users]
+    square = next((user for user in users if binary_operator(user, "mul")
+                   and user.operands == (centered.results[0],)), None)
+    if square is None:
+        return None
+    variance = sole_user(square, graph)
+    if variance is None or not matches_target(variance, "aten.sum.dim_IntList"):
+        return None
+    variance_args = variance.attributes.get("fx_args", ())
+    if len(variance_args) < 3 or variance_args[1:3] != arguments[1:3]:
+        return None
+    divide = sole_user(variance, graph)
+    if not binary_operator(divide, "div") or scalar_operand(divide, 1) != width:
+        return None
+    epsilon = sole_user(divide, graph)
+    if not binary_operator(epsilon, "add") or not isinstance(scalar_operand(epsilon, 1), (int, float)):
+        return None
+    inverse = sole_user(epsilon, graph)
+    if inverse is None or not matches_target(inverse, "aten.rsqrt.default"):
+        return None
+    normalized = sole_user(inverse, graph)
+    if not binary_operator(normalized, "mul") or set(normalized.operands) != {centered.results[0], inverse.results[0]}:
+        return None
+    operations = [mean, centered, square, variance, divide, epsilon, inverse, normalized]
+    tail = normalized
+    for _ in range(3):
+        user = sole_user(tail, graph)
+        if user is None or not is_scalar_operation(user) or graph.values[user.results[0]].shape != source.shape:
+            break
+        if not (binary_operator(user, "mul") or binary_operator(user, "add")
+                or matches_target(user, "prims.convert_element_type.default")):
+            break
+        other = [value for value in user.operands if value != tail.results[0]]
+        if any(graph.values[value].shape != (width,) for value in other):
+            break
+        operations.append(user)
+        tail = user
+    if graph.values[tail.results[0]].dtype != "torch.bfloat16":
+        return None
+    operation_ids = {operation.id for operation in operations}
+    if any(has_illegal_effects(operation) for operation in operations) or any(
+        operation.results[0] in graph.outputs
+        or any(user not in operation_ids for user in graph.values[operation.results[0]].users)
+        for operation in operations[:-1]
+    ):
+        return None
+    composed = compose_scalar_chain(tuple(operation for operation in operations
+                                            if operation not in (mean, variance)), graph)
+    if composed is None:
+        return None
+    loads = [IndexedLoad("norm:reduction", source.id,
+                         (*tuple(f"o{index}" for index in range(len(source.shape) - 1)), "r0"),
+                         source.strides, source.dtype, source.shape)]
+    replacements = {}
+    for load in composed.loads:
+        if load.value_id == mean.results[0]:
+            replacements[load.id] = Accumulator("torch.float32", 1)
+        elif load.value_id == variance.results[0]:
+            replacements[load.id] = Accumulator("torch.float32")
+        else:
+            loads.append(load)
+            replacements[load.id] = Load(load.id, load.dtype)
+    centered_expression = Binary("sub", Load(loads[0].id, source.dtype),
+                                 Accumulator("torch.float32", 1), "torch.float32")
+    program = replace(composed, family="reduction", source_target="layer_norm",
+                      iteration_domains=(*composed.iteration_domains, IterationDomain("r0", width)),
+                      reduction_axes=("r0",), loads=tuple(loads),
+                      init=Constant(0.0, "torch.float32"), accumulator_dtype="torch.float32",
+                      combine=Binary("add", Accumulator("torch.float32"),
+                                     Binary("mul", centered_expression, centered_expression, "torch.float32"), "torch.float32"),
+                      post=substitute_loads(composed.combine, replacements),
+                      predicates=(*composed.predicates, AxisPredicate("r0", width)))
+    return RegionCandidate(
+        id=f"region:{tail.id.removeprefix('op:')}:layer_norm",
+        source_op_ids=tuple(operation.id for operation in operations),
+        external_inputs=tuple(dict.fromkeys(load.value_id for load in loads)),
+        live_outputs=(tail.results[0],), tensor_program=program,
+        semantics=LayerNorm(width),
+        cost_bytes=sum(2 * value_bytes(operation.results[0], graph) for operation in operations[:-1]),
+    )

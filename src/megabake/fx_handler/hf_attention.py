@@ -61,6 +61,39 @@ def megabake_attention_forward(
     return output.view(batch, heads, length, dim).transpose(1, 2).contiguous(), None
 
 
+
+def megabake_scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    *,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> torch.Tensor:
+    """Declare inference SDPA calls made outside Transformers' interface."""
+    if dropout_p or is_causal or enable_gqa:
+        raise NotImplementedError(
+            "declared SDPA supports inference without causal masking or GQA"
+        )
+    if attn_mask is not None and attn_mask.dtype == torch.bool:
+        zero = torch.zeros((), dtype=query.dtype, device=query.device)
+        negative_infinity = torch.full(
+            (), float("-inf"), dtype=query.dtype, device=query.device
+        )
+        attn_mask = torch.where(attn_mask, zero, negative_infinity)
+    batch, heads, query_length, dim = query.shape
+    scaling = dim**-0.5 if scale is None else scale
+    output = attention(
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+        value.transpose(1, 2),
+        attn_mask,
+        float(scaling),
+    )
+    return output.view(batch, heads, query_length, dim)
 def register_transformers_attention() -> str:
     """Register the ``megabake`` attention and mask implementations; returns the name."""
     from transformers import AttentionInterface

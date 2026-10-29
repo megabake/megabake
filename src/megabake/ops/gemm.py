@@ -55,6 +55,7 @@ class GemmEpilogue:
     left operand), whose consumer chain runs as their epilogue."""
 
     contractions: tuple[str, ...]
+    output_shape: tuple[int, ...] = ()
 
     @property
     def paired(self) -> bool:
@@ -236,7 +237,7 @@ def _gemm_epilogue_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate |
         external_inputs=tuple(dict.fromkeys(load.value_id for load in program.loads)),
         live_outputs=(tail.results[0],),
         tensor_program=program,
-        semantics=GemmEpilogue(tuple(contraction.id for contraction in contractions)),
+        semantics=GemmEpilogue(tuple(contraction.id for contraction in contractions), store.shape),
         cost_bytes=sum(
             2 * value_bytes(contraction.results[0], graph) for contraction in contractions
         )
