@@ -3,20 +3,17 @@ from __future__ import annotations
 import collections
 import copy
 import functools
+import sys
+import threading
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from importlib.util import module_from_spec, spec_from_file_location
-from statistics import median
-import threading
-import sys
-import time
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from statistics import median
+from typing import Any
 
-import cutlass
-import cutlass.cute as cute
 import numpy as np
-from cutlass.cute.runtime import from_dlpack
-from cuda.bindings import driver as cuda
 import torch
 from torch.utils import _pytree as pytree
 
@@ -40,24 +37,25 @@ from .plan import (
     search_plans,
 )
 from .planner import enumerate_body_selections
-from .schedule import (
-    EventSchedule,
-    _recompute_assignments,
-    _worker_assignments,
-    make_region_event_schedule,
-)
+from .platform import cuda, cute, cutlass, from_dlpack
 from .regions import form_regions
 from .runtime import (
     DYNAMIC_ADDRESS_RING,
     EventRuntimeAdmission,
     RuntimeAdmission,
-    admit_event_runtime,
     _stream_is_capturing,
+    admit_event_runtime,
     admit_runtime,
     execute_event_plan,
     execute_phase_plan,
     make_ready,
     reset_ready,
+)
+from .schedule import (
+    EventSchedule,
+    _recompute_assignments,
+    _worker_assignments,
+    make_region_event_schedule,
 )
 
 
@@ -104,9 +102,7 @@ def _preflight_complete_plan(
 ) -> None:
     # One structurally complete plan proves existence; the measured search
     # that follows builds its own candidates.
-    result = search_plans(
-        graph, target, policy, SearchBudget(evaluator=None, max_plans=1)
-    )
+    result = search_plans(graph, target, policy, SearchBudget(evaluator=None, max_plans=1))
     if any(
         candidate.plan is not None and candidate.status == "unmeasured"
         for candidate in result.candidates
@@ -219,9 +215,9 @@ class _TeacherForcedCheck:
     """Verify a candidate region by region, on inputs it computed itself."""
 
     prepared: PreparedFX
-    snapshot: "_StateSnapshot"
+    snapshot: _StateSnapshot
 
-    def failure(self, compiled: "CompiledKernel", actual: Any) -> str | None:
+    def failure(self, compiled: CompiledKernel, actual: Any) -> str | None:
         """None when the candidate is verified, otherwise the reason it is not."""
         plan = compiled.plan
         if plan.graph is None or not _uses_table_launch(plan.graph):
@@ -251,7 +247,9 @@ class _TeacherForcedCheck:
             name: originals.get(id(value), value)
             for name, value in zip(placeholders, self.snapshot.inputs, strict=True)
         }
-        state = {name for name, value in inputs.items() if any(value is o for o in originals.values())}
+        state = {
+            name for name, value in inputs.items() if any(value is o for o in originals.values())
+        }
         by_name = {node.name: node for node in nodes}
         order = {node.name: index for index, node in enumerate(nodes)}
         for selected in plan.selection.selections:
@@ -263,9 +261,7 @@ class _TeacherForcedCheck:
         return None
 
 
-def _region_failure(
-    selected, values, inputs, state, by_name, order, module=None
-) -> str | None:
+def _region_failure(selected, values, inputs, state, by_name, order, module=None) -> str | None:
     members = sorted(
         (op_id.removeprefix("op:") for op_id in selected.source_op_ids), key=order.__getitem__
     )
@@ -290,7 +286,11 @@ def _region_failure(
             return tuple(parts)
         # Not materialized (a view of a materialized value, say): recompute it
         # with PyTorch from what the candidate did materialize.
-        if argument.op == "placeholder" or getattr(argument.target, "_schema", None) is not None and argument.target._schema.is_mutable:
+        if (
+            argument.op == "placeholder"
+            or getattr(argument.target, "_schema", None) is not None
+            and argument.target._schema.is_mutable
+        ):
             raise KeyError(f"{name} is not materialized")
         env[name] = evaluate(argument)
         return env[name]
@@ -307,7 +307,7 @@ def _region_failure(
     try:
         for name in members:
             env[name] = evaluate(by_name[name])
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - report candidate evaluation failures.
         return f"cannot evaluate {selected.region_id}: {type(error).__name__}: {error}"
     compared = 0
     for value_id in selected.outputs:
@@ -367,14 +367,11 @@ def compile_post_grad(
 ) -> Callable[..., Any]:
     compile_started = time.perf_counter()
     if scheduler not in {"phase", "region-events", "auto"}:
-        raise ValueError(
-            "scheduler must be 'phase', 'region-events', or 'auto'"
-        )
+        raise ValueError("scheduler must be 'phase', 'region-events', or 'auto'")
     graph, selected_target = _post_grad_graph(prepared, target)
     if policy is not None and policy.mode != prepared.context.mode:
         raise ValueError(
-            f"selection mode {policy.mode!r} does not match backend mode "
-            f"{prepared.context.mode!r}"
+            f"selection mode {policy.mode!r} does not match backend mode {prepared.context.mode!r}"
         )
     if policy is None:
         table_launch = _uses_table_launch(graph)
@@ -394,9 +391,7 @@ def compile_post_grad(
 
     plan_key: str | None = None
     if cache is not None:
-        selections = enumerate_body_selections(
-            graph, selected_target, policy, max_plans=1
-        )
+        selections = enumerate_body_selections(graph, selected_target, policy, max_plans=1)
         key_selection = (
             selections[0]
             if selections
@@ -466,16 +461,8 @@ def compile_post_grad(
             result = PlanSearchResult(
                 chosen.selected,
                 chosen.selected_compiled,
-                tuple(
-                    candidate
-                    for labeled in choices
-                    for candidate in labeled.candidates
-                ),
-                tuple(
-                    rejection
-                    for labeled in choices
-                    for rejection in labeled.rejections
-                ),
+                tuple(candidate for labeled in choices for candidate in labeled.candidates),
+                tuple(rejection for labeled in choices for rejection in labeled.rejections),
                 any(labeled.budget_exhausted for labeled in choices),
                 chosen.selected_description,
             )
@@ -549,31 +536,23 @@ def compile_post_grad(
     parameter_tensors = _current_parameter_tensors(
         compiled, prepared.context, prepared.example_inputs
     )
-    forward = bind_callable(
-        compiled, prepared.context, parameter_tensors=parameter_tensors
-    )
+    forward = bind_callable(compiled, prepared.context, parameter_tensors=parameter_tensors)
     forward.megabake_compile_us = (time.perf_counter() - compile_started) * 1_000_000
     forward.megabake_cache_hit = cache_hit
     return forward
 
 
-def compile_inductor_fallback(
-    prepared: PreparedFX, reason: str
-) -> Callable[..., Any]:
+def compile_inductor_fallback(prepared: PreparedFX, reason: str) -> Callable[..., Any]:
     from torch._inductor.compile_fx import compile_fx
 
     graph = copy.deepcopy(prepared.graph)
     compiled = compile_fx(graph, prepared.example_inputs)
     context = prepared.context
     parameter_positions = {
-        index
-        for index, name in enumerate(context.input_order)
-        if name in context.parameter_names
+        index for index, name in enumerate(context.input_order) if name in context.parameter_names
     }
     runtime_positions = [
-        index
-        for index in range(len(context.input_order))
-        if index not in parameter_positions
+        index for index in range(len(context.input_order)) if index not in parameter_positions
     ]
     current_parameters = {
         context.input_order[index]: prepared.example_inputs[index]
@@ -822,17 +801,13 @@ def _current_parameter_tensors(
     context: CaptureContext,
     example_inputs: Sequence[Any],
 ) -> dict[str, torch.Tensor]:
-    positions = {
-        spec.name: position for position, spec in enumerate(context.input_specs)
-    }
+    positions = {spec.name: position for position, spec in enumerate(context.input_specs)}
     values: dict[str, torch.Tensor] = {}
     for graph_name in compiled_kernel.input_order:
         if graph_name not in compiled_kernel.parameter_names:
             continue
         candidates = (graph_name, graph_name.removeprefix("l_").removesuffix("_"))
-        position = next(
-            (positions[name] for name in candidates if name in positions), None
-        )
+        position = next((positions[name] for name in candidates if name in positions), None)
         if position is None:
             raise CompilerError(
                 CompilerDiagnostic(
@@ -845,9 +820,7 @@ def _current_parameter_tensors(
     return values
 
 
-def _initial_ready(
-    compiled_kernel: CompiledKernel, device: torch.device
-) -> torch.Tensor | None:
+def _initial_ready(compiled_kernel: CompiledKernel, device: torch.device) -> torch.Tensor | None:
     if compiled_kernel.event_schedule is None:
         return None
     return torch.zeros(
@@ -957,16 +930,13 @@ def bind_callable(
             if state is None:
                 # Structural: every graph input is bound on every call.
                 _validate_data_indices(compiled_kernel.plan, input_tensors)
-            active_stream = torch.cuda.current_stream(
-                next(iter(input_tensors.values())).device
-            )
+            active_stream = torch.cuda.current_stream(next(iter(input_tensors.values())).device)
             capturing = _stream_is_capturing(active_stream)
             if capturing and (
                 _graph_capture is None
                 or state is None
                 or compiled_kernel.event_schedule is not None
-                or compiled_kernel.generated.launch.launch_policy
-                != "megabake_cooperative_table"
+                or compiled_kernel.generated.launch.launch_policy != "megabake_cooperative_table"
             ):
                 raise CompilerError(
                     CompilerDiagnostic(
@@ -993,9 +963,7 @@ def bind_callable(
             launches = 0
             uploads_before = state.address_table_uploads
 
-            def kernel(
-                ready: torch.Tensor, epoch: int, stream: torch.cuda.Stream
-            ) -> None:
+            def kernel(ready: torch.Tensor, epoch: int, stream: torch.cuda.Stream) -> None:
                 nonlocal launches
                 state.launch(compiled_kernel.compiled, epoch, stream)
                 launches += 1
@@ -1022,9 +990,7 @@ def bind_callable(
                     validate_counters=False,
                     synchronize=False,
                 )
-            outputs = tuple(
-                state.tensor_for_value(value_id) for value_id in graph.outputs
-            )
+            outputs = tuple(state.tensor_for_value(value_id) for value_id in graph.outputs)
             trace.append(
                 CallableTrace(
                     workload_kernel_launches=launches,
@@ -1062,9 +1028,7 @@ class GraphedCall:
     def __init__(self, function: Callable[..., Any], args: tuple[Any, ...], warmup: int):
         global _graph_capture
         self._inputs, self._spec = pytree.tree_flatten(args)
-        saved = [
-            leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in self._inputs
-        ]
+        saved = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in self._inputs]
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
@@ -1138,9 +1102,7 @@ def _post_grad_graph(
         semantic = _semantic_diagnostic(graph)
         if semantic is not None:
             raise CompilerError(semantic, safe_for_fallback=True)
-        selected_target = target or _target_facts(
-            _common_cuda_device(prepared.example_inputs)
-        )
+        selected_target = target or _target_facts(_common_cuda_device(prepared.example_inputs))
         return graph, selected_target
     except CompilerError:
         raise
@@ -1162,9 +1124,7 @@ class _StateSnapshot:
     pairs: tuple[tuple[torch.Tensor, torch.Tensor], ...]
 
     @classmethod
-    def create(
-        cls, graph: ComputeGraph, example_inputs: Sequence[Any]
-    ) -> "_StateSnapshot":
+    def create(cls, graph: ComputeGraph, example_inputs: Sequence[Any]) -> _StateSnapshot:
         state_ids = {
             value_id
             for operation in graph.ops.values()
@@ -1251,9 +1211,7 @@ def _make_plan_evaluator(
                 prepared.example_inputs,
                 budget.timing_samples,
             )
-            verification_samples, _ = _complete_call_samples(
-                executable, prepared.example_inputs, 1
-            )
+            verification_samples, _ = _complete_call_samples(executable, prepared.example_inputs, 1)
             isolated_samples = _isolated_kernel_samples(
                 compiled,
                 prepared.context,
@@ -1273,7 +1231,7 @@ def _make_plan_evaluator(
                 median_isolated_launch_us=median(isolated_samples),
                 verification_complete_call_us=verification_samples[0],
             )
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - convert measurement failures to results.
             return PlanMeasurement(error=f"{type(error).__name__}: {error}")
 
     return evaluate
@@ -1311,9 +1269,7 @@ def _search_scheduler(
             for candidate in result.candidates
         ),
         selected_description=(
-            None
-            if result.selected_description is None
-            else prefix + result.selected_description
+            None if result.selected_description is None else prefix + result.selected_description
         ),
     )
 
@@ -1365,12 +1321,10 @@ def _isolated_kernel_samples(
     epoch_stride = _epoch_stride(compiled_kernel)
     torch_stream = torch.cuda.current_stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
-    table_launch = (
-        compiled_kernel.generated.launch.launch_policy == "megabake_cooperative_table"
+    table_launch = compiled_kernel.generated.launch.launch_policy == "megabake_cooperative_table"
+    fast_path = hasattr(compiled_kernel.compiled, "generate_execution_args") and hasattr(
+        compiled_kernel.compiled, "run_compiled_program"
     )
-    fast_path = hasattr(
-        compiled_kernel.compiled, "generate_execution_args"
-    ) and hasattr(compiled_kernel.compiled, "run_compiled_program")
     epoch = 0
 
     def prepare() -> tuple[Any, ...]:
@@ -1382,11 +1336,7 @@ def _isolated_kernel_samples(
         if not fast_path:
             return arguments, arguments, arguments
         packed = compiled_kernel.compiled.generate_execution_args(*arguments)
-        execution = (
-            packed[0]
-            if isinstance(packed, tuple) and len(packed) == 2
-            else packed
-        )
+        execution = packed[0] if isinstance(packed, tuple) and len(packed) == 2 else packed
         return execution, packed, arguments
 
     def launch(token: tuple[Any, ...]) -> None:
@@ -1399,9 +1349,7 @@ def _isolated_kernel_samples(
 
     samples: list[float] = []
     # A stateful launch advances its state, so time one launch per reset.
-    launches_per_sample = (
-        1 if reset_state is not None else min(count, DYNAMIC_ADDRESS_RING)
-    )
+    launches_per_sample = 1 if reset_state is not None else min(count, DYNAMIC_ADDRESS_RING)
     for _ in range(count):
         if reset_state is not None:
             reset_state()
@@ -1423,16 +1371,11 @@ def _graph_ordered_inputs(
     context: CaptureContext,
     example_inputs: Sequence[Any],
 ) -> tuple[Any, ...]:
-    positions = {
-        spec.name: position
-        for position, spec in enumerate(context.input_specs)
-    }
+    positions = {spec.name: position for position, spec in enumerate(context.input_specs)}
     ordered: list[Any] = [None] * len(example_inputs)
     for graph_name in compiled_kernel.input_order:
         candidates = (graph_name, graph_name.removeprefix("l_").removesuffix("_"))
-        position = next(
-            (positions[name] for name in candidates if name in positions), None
-        )
+        position = next((positions[name] for name in candidates if name in positions), None)
         if position is None:
             raise CompilerError(
                 CompilerDiagnostic(
@@ -1542,11 +1485,7 @@ def _target_facts(device: torch.device) -> TargetFacts:
 
 
 def _common_cuda_device(example_inputs: Sequence[Any]) -> torch.device:
-    devices = {
-        value.device
-        for value in example_inputs
-        if isinstance(value, torch.Tensor)
-    }
+    devices = {value.device for value in example_inputs if isinstance(value, torch.Tensor)}
     if not devices or any(device.type != "cuda" for device in devices):
         raise UnsupportedCompiler("all captured tensor inputs must be CUDA tensors")
     if len(devices) != 1:
@@ -1644,9 +1583,7 @@ def _gather_index_is_static(graph: ComputeGraph, value_id: str) -> bool:
     return True
 
 
-def _recurring_operations(
-    launches: int, address_uploads: int
-) -> tuple[tuple[str, int], ...]:
+def _recurring_operations(launches: int, address_uploads: int) -> tuple[tuple[str, int], ...]:
     operations = [("workload_kernel", launches)]
     if address_uploads:
         operations.append(("address_table_upload", address_uploads))
@@ -1660,11 +1597,7 @@ def _epoch_stride(compiled_kernel: CompiledKernel) -> int:
         return compiled_kernel.generated.launch.barrier_epochs
     return max(
         max(
-            (
-                phase.index
-                for phase in compiled_kernel.plan.phases
-                if phase.barrier is not None
-            ),
+            (phase.index for phase in compiled_kernel.plan.phases if phase.barrier is not None),
             default=-1,
         )
         + 1,
@@ -1680,7 +1613,8 @@ def _validate_data_indices(plan: KernelPlan, inputs: Mapping[str, torch.Tensor])
                 if not isinstance(axis, DataIndex):
                     continue
                 index_load = next(
-                    candidate for candidate in selected.program.loads
+                    candidate
+                    for candidate in selected.program.loads
                     if candidate.id == axis.load_id
                 )
                 index_tensor = inputs.get(index_load.value_id)
@@ -1824,9 +1758,7 @@ def _with_worker_count(
             ),
             barrier=None
             if phase.barrier is None
-            else replace(
-                phase.barrier, participating_workers=tuple(range(worker_count))
-            ),
+            else replace(phase.barrier, participating_workers=tuple(range(worker_count))),
         )
         for phase in plan.phases
     )
@@ -1904,12 +1836,8 @@ class _RuntimeState:
         self._values_stale = False
         self.g0_tensors = g0_tensors
         self._normal_view_cache: dict[str, tuple[tuple[Any, ...], Any]] = {}
-        self._work_iterator_view_cache: dict[
-            str, tuple[tuple[Any, ...], Any]
-        ] = {}
-        self._g0_view_cache: dict[
-            int, tuple[tuple[tuple[Any, ...], ...], tuple[Any, ...]]
-        ] = {}
+        self._work_iterator_view_cache: dict[str, tuple[tuple[Any, ...], Any]] = {}
+        self._g0_view_cache: dict[int, tuple[tuple[tuple[Any, ...], ...], tuple[Any, ...]]] = {}
         self._ready_view: tuple[torch.Tensor, Any] | None = None
         self._max_active_clusters = max_active_clusters
         self._address_table: torch.Tensor | None = None
@@ -1983,9 +1911,7 @@ class _RuntimeState:
                 )
                 for iterator in generated.launch.work_iterators
             }
-        workspace_base = torch.empty(
-            plan.storage.workspace_bytes, dtype=torch.uint8, device=device
-        )
+        workspace_base = torch.empty(plan.storage.workspace_bytes, dtype=torch.uint8, device=device)
         workspace: dict[str, torch.Tensor] = {
             assignment.storage_id: _workspace_view(workspace_base, assignment)
             for assignment in plan.storage.workspace
@@ -2011,9 +1937,7 @@ class _RuntimeState:
         input_tensors: Mapping[str, torch.Tensor],
         ordered: Sequence[torch.Tensor] | None = None,
     ) -> None:
-        if self._table_rebind is not None and self._fast_table_rebind(
-            input_tensors, ordered
-        ):
+        if self._table_rebind is not None and self._fast_table_rebind(input_tensors, ordered):
             return
         self._refresh_values(input_tensors)
 
@@ -2082,17 +2006,13 @@ class _RuntimeState:
                 values[binding.value_id] = input_tensors[binding.value_id]
                 continue
             if binding.kind in {"alias", "output"}:
-                internal_alias = _internal_alias(
-                    binding.value_id, plan.graph, values
-                )
+                internal_alias = _internal_alias(binding.value_id, plan.graph, values)
                 if internal_alias is not None and binding.layout is not None:
                     alias_id, alias_tensor = internal_alias
                     values[binding.value_id] = alias_tensor.as_strided(
                         binding.layout.shape,
                         binding.layout.strides,
-                        _alias_storage_offset(
-                            binding.value_id, alias_id, alias_tensor, plan.graph
-                        ),
+                        _alias_storage_offset(binding.value_id, alias_id, alias_tensor, plan.graph),
                     )
                     continue
                 alias = _boundary_alias(binding.value_id, plan.graph, input_tensors)
@@ -2128,9 +2048,7 @@ class _RuntimeState:
         # Table launches bind only one template group per GEMM variant; the
         # kernel writes every phase's descriptors from the address table.
         template_phases = set(self.generated.launch.gemm_template_phases)
-        table_launch = (
-            self.generated.launch.launch_policy == "megabake_cooperative_table"
-        )
+        table_launch = self.generated.launch.launch_policy == "megabake_cooperative_table"
         g0_tensors = tuple(
             _g0_operands(phase.body, selected, plan.graph, input_tensors, values)
             for phase in plan.phases
@@ -2142,9 +2060,7 @@ class _RuntimeState:
         self.input_tensors = input_tensors
         self._values = values
         self._values_stale = False
-        self.outputs = {
-            value_id: values[value_id] for value_id in plan.graph.outputs
-        }
+        self.outputs = {value_id: values[value_id] for value_id in plan.graph.outputs}
         if reuse_outputs is not None:
             # Diagnostic re-derivation keeps the fast path and its templates.
             return
@@ -2280,9 +2196,7 @@ class _RuntimeState:
         ):
             root = roots[position]
             graph_outputs[value_id] = (
-                root
-                if is_root
-                else root.as_strided(shape, stride, root.storage_offset() + offset)
+                root if is_root else root.as_strided(shape, stride, root.storage_offset() + offset)
             )
         values.update(graph_outputs)
         self.outputs = graph_outputs
@@ -2317,11 +2231,7 @@ class _RuntimeState:
             self._cached_gemm_tensors(group_index, tensors)
             for group_index, tensors in enumerate(self.g0_tensors)
         )
-        g0_views = tuple(
-            view
-            for group in g0_view_groups
-            for view in group
-        )
+        g0_views = tuple(view for group in g0_view_groups for view in group)
         g0_names = [
             argument.name
             for argument in self.generated.launch.tensors
@@ -2332,10 +2242,7 @@ class _RuntimeState:
         arguments = []
         for name in self.generated.launch.arguments:
             if name == "ready":
-                if (
-                    self._ready_view is None
-                    or self._ready_view[0] is not self.ready
-                ):
+                if self._ready_view is None or self._ready_view[0] is not self.ready:
                     self._ready_view = (self.ready, _cute_view(self.ready))
                 arguments.append(self._ready_view[1])
             elif name == "workers":
@@ -2395,16 +2302,12 @@ class _RuntimeState:
         if self._slot_addresses is None:
             for slot, argument in enumerate(launch.tensors):
                 if argument.layout is not None:
-                    self._check_slot_layout(
-                        slot, argument, self.values[argument.value_id]
-                    )
+                    self._check_slot_layout(slot, argument, self.values[argument.value_id])
             self._prepare_table_rebind()
         if self._slot_addresses is None:
             addresses = np.array(
                 [
-                    0
-                    if argument.layout is None
-                    else self.values[argument.value_id].data_ptr()
+                    0 if argument.layout is None else self.values[argument.value_id].data_ptr()
                     for argument in launch.tensors
                 ]
                 or [0],
@@ -2443,16 +2346,13 @@ class _RuntimeState:
             self.address_table_uploads += 1
         self._pending_dynamic_addresses = addresses[dynamic_slots]
         if self._phase_table is None:
-            phase_table = torch.tensor(
-                launch.phase_table, dtype=torch.int32, device=device
-            )
+            phase_table = torch.tensor(launch.phase_table, dtype=torch.int32, device=device)
             self._phase_table = (phase_table, _cute_view(phase_table))
         if self._ready_view is None or self._ready_view[0] is not self.ready:
             self._ready_view = (self.ready, _cute_view(self.ready))
         if self._work_iterator_views is None:
             self._work_iterator_views = tuple(
-                _cute_view(self.work_iterators[iterator.name])
-                for iterator in launch.work_iterators
+                _cute_view(self.work_iterators[iterator.name]) for iterator in launch.work_iterators
             )
         if self._dynamic_slot_table is None:
             slot_table = torch.tensor(
@@ -2474,20 +2374,14 @@ class _RuntimeState:
             )
         if self._dynamic_ring is None:
             words = len(launch.dynamic_slots) + 1
-            host = torch.zeros(
-                (DYNAMIC_ADDRESS_RING, words), dtype=torch.int64
-            ).pin_memory()
+            host = torch.zeros((DYNAMIC_ADDRESS_RING, words), dtype=torch.int64).pin_memory()
             self._dynamic_ring = (host, host.numpy(), [None] * DYNAMIC_ADDRESS_RING)
         if launch.gemm_table:
             if self._gemm_table is None:
-                gemm_table = torch.tensor(
-                    launch.gemm_table, dtype=torch.int32, device=device
-                )
+                gemm_table = torch.tensor(launch.gemm_table, dtype=torch.int32, device=device)
                 self._gemm_table = (gemm_table, _cute_view(gemm_table))
             if self._stream_table is None and launch.stream_table:
-                stream_table = torch.tensor(
-                    launch.stream_table, dtype=torch.int32, device=device
-                )
+                stream_table = torch.tensor(launch.stream_table, dtype=torch.int32, device=device)
                 self._stream_table = (stream_table, _cute_view(stream_table))
             if self._tma_descriptors is None:
                 descriptors = torch.zeros(
@@ -2595,15 +2489,13 @@ class _RuntimeState:
         self._wrap_calls()
         arguments = self._table_arguments(cu_stream)
         call = self._calls
-        host, rows, events = self._dynamic_ring
+        _host, rows, events = self._dynamic_ring
         entry = call % DYNAMIC_ADDRESS_RING
         if events[entry] is not None:
             # The launch that read this entry DYNAMIC_ADDRESS_RING calls ago.
             events[entry].synchronize()
         rows[entry, 0] = call
-        rows[entry, 1 : 1 + len(self._pending_dynamic_addresses)] = (
-            self._pending_dynamic_addresses
-        )
+        rows[entry, 1 : 1 + len(self._pending_dynamic_addresses)] = self._pending_dynamic_addresses
         self._calls += 1
         self._prepared_calls += 1
         packed = self._packed_arguments
@@ -2612,9 +2504,7 @@ class _RuntimeState:
             self._packed_arguments = packed
         return (call, arguments, packed[1], packed[2])
 
-    def run_launch(
-        self, compiled: Any, token: tuple[Any, ...], stream: torch.cuda.Stream
-    ) -> None:
+    def run_launch(self, compiled: Any, token: tuple[Any, ...], stream: torch.cuda.Stream) -> None:
         call, arguments, execution, _ = token
         if execution is not None:
             compiled.run_compiled_program(execution)
@@ -2662,9 +2552,7 @@ class _RuntimeState:
                 )
             )
 
-    def _check_slot_layout(
-        self, slot: int, argument: Any, tensor: torch.Tensor
-    ) -> None:
+    def _check_slot_layout(self, slot: int, argument: Any, tensor: torch.Tensor) -> None:
         identity = _tensor_identity(tensor)
         if self._checked_layouts.get(slot) == identity:
             return
@@ -2672,9 +2560,7 @@ class _RuntimeState:
         shape = tuple(layout.shape)
         if tuple(tensor.shape) != shape or any(
             size > 1 and actual != expected
-            for size, actual, expected in zip(
-                shape, tensor.stride(), layout.strides, strict=True
-            )
+            for size, actual, expected in zip(shape, tensor.stride(), layout.strides, strict=True)
         ):
             raise CompilerError(
                 CompilerDiagnostic(
@@ -2712,9 +2598,7 @@ class _RuntimeState:
             splits = self.generated.launch.gemm_splits
             entry = (
                 identities,
-                cute_gemm_tensors(
-                    *tensors, splits=splits[group_index] if splits else 1
-                ),
+                cute_gemm_tensors(*tensors, splits=splits[group_index] if splits else 1),
             )
             self._g0_view_cache[group_index] = entry
         return entry[1]
@@ -2724,14 +2608,11 @@ def _pack_arguments(compiled: Any, arguments: tuple[Any, ...]) -> tuple[Any, Any
     """CuTe execution arguments for ``arguments`` and what keeps them alive,
     or ``(None, None)`` when the executor cannot launch packed arguments."""
     if not (
-        hasattr(compiled, "generate_execution_args")
-        and hasattr(compiled, "run_compiled_program")
+        hasattr(compiled, "generate_execution_args") and hasattr(compiled, "run_compiled_program")
     ):
         return None, None
     generated = compiled.generate_execution_args(*arguments)
-    execution = (
-        generated[0] if isinstance(generated, tuple) and len(generated) == 2 else generated
-    )
+    execution = generated[0] if isinstance(generated, tuple) and len(generated) == 2 else generated
     return execution, generated
 
 
@@ -2739,9 +2620,7 @@ def _tensor_identity(tensor: torch.Tensor) -> tuple[Any, ...]:
     return (tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
 
 
-def _validate_state_capacities(
-    plan: KernelPlan, input_tensors: Mapping[str, torch.Tensor]
-) -> None:
+def _validate_state_capacities(plan: KernelPlan, input_tensors: Mapping[str, torch.Tensor]) -> None:
     for state in plan.storage.state:
         valid_length = input_tensors[state.valid_length_value_id]
         length = int(valid_length.item())
@@ -2770,17 +2649,13 @@ def _workspace_view(base: torch.Tensor, assignment: Any) -> torch.Tensor:
                 requirement="dtype-aligned workspace slice",
             )
         )
-    storage = base.narrow(
-        0, assignment.offset_bytes, assignment.required_bytes
-    ).view(dtype)
+    storage = base.narrow(0, assignment.offset_bytes, assignment.required_bytes).view(dtype)
     return storage.as_strided(assignment.layout.shape, assignment.layout.strides)
 
 
 def _allocate(layout: Any, device: torch.device) -> torch.Tensor:
     dtype = getattr(torch, layout.dtype.removeprefix("torch."))
-    return torch.empty_strided(
-        layout.shape, layout.strides, dtype=dtype, device=device
-    )
+    return torch.empty_strided(layout.shape, layout.strides, dtype=dtype, device=device)
 
 
 def _boundary_alias(
@@ -2870,8 +2745,7 @@ def _g0_operands(
         graph,
     )
     weights = tuple(
-        _g0_source_tensor(load.value_id, graph, input_tensors, values)
-        for load in weight_loads
+        _g0_source_tensor(load.value_id, graph, input_tensors, values) for load in weight_loads
     )
     output = values[selected.program.store.value_id]
     if output.dim() != 2:
@@ -2907,9 +2781,7 @@ def _g0_source_tensor(
     return _g0_value_source_tensor(value_id, graph, value_tensors)
 
 
-def _g0_activation_view(
-    value_id: str, source: torch.Tensor, graph: ComputeGraph
-) -> torch.Tensor:
+def _g0_activation_view(value_id: str, source: torch.Tensor, graph: ComputeGraph) -> torch.Tensor:
     # The G0 body flattens leading axes of A, which is only valid when the
     # source root already ends in the GEMM K axis; otherwise bind the 2-D view.
     value = graph.values.get(value_id)

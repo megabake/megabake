@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import replace
 import json
+from dataclasses import replace
 
 import torch
 
@@ -10,17 +10,16 @@ from megabake import (
     assign_storage,
     derive_dependencies,
     emit_cute,
-    KernelPlan,
     make_phase_schedule,
     select_bodies,
 )
-from megabake.schedule import make_region_event_schedule
-from megabake.plan import ConversionBody, CuTeLayout
 from megabake.bodies import SelectionPolicy, TargetFacts
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
+from megabake.plan import ConversionBody, CuTeLayout
 from megabake.regions import form_regions
+from megabake.schedule import make_region_event_schedule
 
 
 def _target() -> TargetFacts:
@@ -37,18 +36,10 @@ def _target() -> TargetFacts:
 
 
 def _plan(model, *inputs):
-    prepared = prepare_fx_graph(
-        torch.export.export(model, inputs).graph_module, inputs
-    )
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
-    selection = select_bodies(
-        graph, _target(), SelectionPolicy(allow_tuned=False)
-    )
-    return assign_storage(
-        make_phase_schedule(selection, derive_dependencies(selection))
-    )
+    prepared = prepare_fx_graph(torch.export.export(model, inputs).graph_module, inputs)
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
+    selection = select_bodies(graph, _target(), SelectionPolicy(allow_tuned=False))
+    return assign_storage(make_phase_schedule(selection, derive_dependencies(selection)))
 
 
 def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path):
@@ -90,15 +81,14 @@ def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path
     source_lines = generated.source.splitlines()
     for symbol, expected in (
         ("_body_0", "sync_threads"),
-        ("megabake_kernel", "counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])"),
+        (
+            "megabake_kernel",
+            "counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])",
+        ),
         ("launch", ".launch("),
     ):
-        entry = next(
-            entry for entry in generated.source_map if entry.symbol == symbol
-        )
-        mapped_source = "\n".join(
-            source_lines[entry.line_start - 1 : entry.line_end]
-        )
+        entry = next(entry for entry in generated.source_map if entry.symbol == symbol)
+        mapped_source = "\n".join(source_lines[entry.line_start - 1 : entry.line_end])
         assert expected in mapped_source
 
 
@@ -133,13 +123,9 @@ def test_emit_cute_puts_g0_inside_one_cooperative_kernel(tmp_path):
         torch.export.export(Model(), (source, weight)).graph_module,
         (source, weight),
     )
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     selection = select_bodies(graph, _target(), SelectionPolicy(allow_tuned=True))
-    plan = assign_storage(
-        make_phase_schedule(selection, derive_dependencies(selection))
-    )
+    plan = assign_storage(make_phase_schedule(selection, derive_dependencies(selection)))
 
     generated = emit_cute(plan, tmp_path)
 
@@ -164,13 +150,9 @@ def test_emit_cute_reuses_g0_scratch_for_duplicate_body_variants(tmp_path):
         torch.export.export(Model(), (source, weight, other_weight)).graph_module,
         (source, weight, other_weight),
     )
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     selection = select_bodies(graph, _target(), SelectionPolicy(allow_tuned=True))
-    plan = assign_storage(
-        make_phase_schedule(selection, derive_dependencies(selection))
-    )
+    plan = assign_storage(make_phase_schedule(selection, derive_dependencies(selection)))
 
     generated = emit_cute(plan, tmp_path)
 
@@ -196,13 +178,9 @@ def test_emit_cute_keeps_g0_variants_with_different_configurations(tmp_path):
         torch.export.export(Model(), (source, weight, other_weight)).graph_module,
         (source, weight, other_weight),
     )
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     selection = select_bodies(graph, _target(), SelectionPolicy(allow_tuned=True))
-    plan = assign_storage(
-        make_phase_schedule(selection, derive_dependencies(selection))
-    )
+    plan = assign_storage(make_phase_schedule(selection, derive_dependencies(selection)))
     first, second = plan.phases
     first_body = replace(
         first.body,
@@ -242,29 +220,17 @@ def test_emit_cute_emits_explicit_layout_conversion(tmp_path):
             return value.relu().sum(dim=-1)
 
     value = torch.randn(2, 3)
-    prepared = prepare_fx_graph(
-        torch.export.export(Model(), (value,)).graph_module, (value,)
-    )
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
-    selection = select_bodies(
-        graph, _target(), SelectionPolicy(allow_tuned=False)
-    )
+    prepared = prepare_fx_graph(torch.export.export(Model(), (value,)).graph_module, (value,))
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
+    selection = select_bodies(graph, _target(), SelectionPolicy(allow_tuned=False))
     producer = next(
-        selected
-        for selected in selection.selections
-        if selected.program.family == "elementwise"
+        selected for selected in selection.selections if selected.program.family == "elementwise"
     )
     consumer = next(
-        selected
-        for selected in selection.selections
-        if selected.program.family == "reduction"
+        selected for selected in selection.selections if selected.program.family == "reduction"
     )
     value_id = producer.outputs[0]
-    source_layout = CuTeLayout.from_contract(
-        producer.body.layouts.outputs[value_id]
-    )
+    source_layout = CuTeLayout.from_contract(producer.body.layouts.outputs[value_id])
     target_layout = replace(source_layout, strides=(1, 3))
     load = consumer.program.loads[0]
     consumer_program = replace(
@@ -296,26 +262,19 @@ def test_emit_cute_emits_explicit_layout_conversion(tmp_path):
         selection,
         selections=(
             producer,
-            replace(
-                consumer, program=consumer_program, body=consumer_body
-            ),
+            replace(consumer, program=consumer_program, body=consumer_body),
         ),
         conversions=(conversion,),
     )
     plan = assign_storage(
-        make_phase_schedule(
-            converted_selection, derive_dependencies(converted_selection)
-        )
+        make_phase_schedule(converted_selection, derive_dependencies(converted_selection))
     )
 
     generated = emit_cute(plan, tmp_path)
     ast.parse(generated.source)
     assert "_conversion_0_0(" in generated.source
     assert generated.launch.phases[0].conversion_symbols == ("_conversion_0_0",)
-    assert any(
-        entry.kind == "layout_conversion"
-        for entry in generated.source_map
-    )
+    assert any(entry.kind == "layout_conversion" for entry in generated.source_map)
 
 
 def test_weight_stream_schedule_streams_each_ctas_first_gemm_of_the_next_interval():
@@ -353,4 +312,3 @@ def test_weight_stream_schedule_streams_each_ctas_first_gemm_of_the_next_interva
         plan, rotations, units, gemm_of_phase, variants, {0, 1, 2}, 0
     )
     assert rows == [(0,) * 12] and issues == {}
-

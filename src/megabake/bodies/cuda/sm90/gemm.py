@@ -6,22 +6,16 @@ fork of NVIDIA CUTLASS's persistent Hopper GEMM (the pinned upstream file is in
 module only drives it.
 """
 
+import os
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from math import prod
-import os
-import re
-
-import cuda.bindings.driver as cuda
-import cutlass
-import cutlass.cute as cute
-from cutlass.tensor_utils import TensorMapManager, TensorMapUpdateMode
-
-from .cutlass_gemm import HopperWgmmaGemmPersistentKernel
 
 from ....graph import ComputeGraph, Region
 from ....ir import TensorProgram
 from ....ops import ViewPlusGemm
+from ....platform import TensorMapManager, TensorMapUpdateMode, cuda, cute, cutlass
 from ...interface import (
     BodyConfig,
     CandidateSet,
@@ -41,7 +35,7 @@ from ...interface import (
     access_effects,
     validate_body_config,
 )
-
+from .cutlass_gemm import HopperWgmmaGemmPersistentKernel
 
 # Pipeline barriers (1 KiB), eight 64x64x64 BF16 A/B stages, and four 64x32
 # BF16 epilogue stages; HopperWgmmaGemmPersistentKernel derives eight stages
@@ -303,7 +297,8 @@ class G0RangeBodyProvider:
         paired = paired_contraction(program)
         fused = paired or not (
             plain_contraction(program)
-            or len(program.loads) == 3 and _bias_epilogue_rejection(program) is None
+            or len(program.loads) == 3
+            and _bias_epilogue_rejection(program) is None
         )
         if fused:
             reason = _epilogue_rejection(program, policy)
@@ -366,9 +361,15 @@ class G0RangeBodyProvider:
                 return CandidateSet(
                     (
                         _g0_config(
-                            region, program, (token_tile, 64), 8,
-                            TABLE_GEMM_SHARED_BYTES, swap_ab=True, splits=splits,
-                            epilogue=fused, paired=paired,
+                            region,
+                            program,
+                            (token_tile, 64),
+                            8,
+                            TABLE_GEMM_SHARED_BYTES,
+                            swap_ab=True,
+                            splits=splits,
+                            epilogue=fused,
+                            paired=paired,
                         ),
                     ),
                     (),
@@ -449,9 +450,7 @@ def _bias_epilogue_rejection(program) -> str | None:
     axes = dict(zip(bias.axes, bias.strides, strict=True))
     if bias.dtype != "torch.bfloat16":
         return "bias must be BF16"
-    if axes.get("o1") != 1 or any(
-        not isinstance(axis, int) for axis in bias.axes if axis != "o1"
-    ):
+    if axes.get("o1") != 1 or any(not isinstance(axis, int) for axis in bias.axes if axis != "o1"):
         return "bias must be contiguous over the output columns"
     if bias.source_shape is not None and prod(bias.source_shape) != columns:
         return "bias must hold one value per output column"
@@ -550,9 +549,7 @@ def gemm_candidates(
     target: TargetFacts,
     policy: SelectionPolicy | None = None,
 ) -> CandidateSet:
-    result = G0RangeBodyProvider().get_candidates(
-        region, target, policy or SelectionPolicy()
-    )
+    result = G0RangeBodyProvider().get_candidates(region, target, policy or SelectionPolicy())
     configurations = []
     rejections = list(result.rejections)
     for config in result.configurations:
@@ -566,9 +563,7 @@ def gemm_candidates(
 
 
 def g0_range_body(config: BodyConfig) -> HopperWgmmaGemmPersistentKernel:
-    return HopperWgmmaGemmPersistentKernel(
-        cutlass.Float32, config.tiles.cta_shape, (1, 1), 1, True
-    )
+    return HopperWgmmaGemmPersistentKernel(cutlass.Float32, config.tiles.cta_shape, (1, 1), 1, True)
 
 
 def cute_gemm_tensors(a, b, c, splits: int = 1):
@@ -586,9 +581,7 @@ def cute_gemm_tensors(a, b, c, splits: int = 1):
         raise ValueError("GEMM tensor base addresses must be 16-byte aligned")
 
     def view(tensor):
-        leading_dim = next(
-            index for index, stride in enumerate(tensor.stride()) if stride == 1
-        )
+        leading_dim = next(index for index, stride in enumerate(tensor.stride()) if stride == 1)
         return from_dlpack(tensor.unsqueeze(-1), assumed_align=16).mark_layout_dynamic(
             leading_dim=leading_dim
         )
@@ -625,7 +618,10 @@ def g0_range_resources(compiled, threads, shared_bytes):
         for label, attribute in (
             ("registers_per_thread", cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS),
             ("static_shared_bytes", cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES),
-            ("local_bytes_per_thread", cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+            (
+                "local_bytes_per_thread",
+                cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+            ),
         ):
             status, value = cuda.cuKernelGetAttribute(attribute, kernel, 0)
             if int(status) != 0:
@@ -634,7 +630,7 @@ def g0_range_resources(compiled, threads, shared_bytes):
         status, function = cuda.cuKernelGetFunction(kernel)
         if int(status) != 0:
             raise RuntimeError(f"failed to get kernel function: {status}")
-        status, = cuda.cuFuncSetAttribute(
+        (status,) = cuda.cuFuncSetAttribute(
             function,
             cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
             shared_bytes,
@@ -646,9 +642,7 @@ def g0_range_resources(compiled, threads, shared_bytes):
         )
         if int(status) != 0:
             raise RuntimeError(f"failed to query occupancy: {status}")
-        values.update(
-            {"shared_storage_bytes": shared_bytes, "active_blocks_per_sm": active_blocks}
-        )
+        values.update({"shared_storage_bytes": shared_bytes, "active_blocks_per_sm": active_blocks})
         resources.append(values)
     if len(resources) != 1:
         raise RuntimeError(f"expected one GEMM kernel, found {len(resources)}")
@@ -742,9 +736,7 @@ def _g0_config(
                 "another CTA may read them after the enclosing kernel grid-synchronizes"
             ),
             scratch_reusable="scratch is reusable when run returns",
-            register_fragments=(
-                "WGMMA accumulators feed the body epilogue without conversion"
-            ),
+            register_fragments=("WGMMA accumulators feed the body epilogue without conversion"),
         ),
         evidence=ResourceEvidence(
             measured=True,
@@ -784,9 +776,7 @@ def _layouts(program, alignment_bytes: int) -> LayoutContract:
             alignment_bytes=alignment_bytes,
             # Epilogue operands may index by affine maps of the output axes;
             # their shape is the source tensor's.
-            shape=tuple(
-                1 if isinstance(axis, int) else domain_sizes[axis] for axis in load.axes
-            )
+            shape=tuple(1 if isinstance(axis, int) else domain_sizes[axis] for axis in load.axes)
             if all(isinstance(axis, (int, str)) for axis in load.axes)
             else load.source_shape,
         )

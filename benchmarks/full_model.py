@@ -31,19 +31,26 @@ import torch
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from megabake import graphed, make_backend  # noqa: E402
-from benchmarks.measure import kernel_trace  # noqa: E402
-from benchmarks.stateful_models import StatefulCausalLM, layer_types, text_config  # noqa: E402
-from megabake.fx_handler.hf_attention import (  # noqa: E402
+from benchmarks.measure import kernel_trace
+from benchmarks.stateful_models import StatefulCausalLM, layer_types, text_config
+from megabake import graphed, make_backend
+from megabake.fx_handler.hf_attention import (
     ATTENTION_IMPLEMENTATION,
     DecodeStep,
     register_transformers_attention,
 )
-from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION, StatefulSmolLM  # noqa: E402
-from megabake.ops.attention import kv_attention  # noqa: E402
+from megabake.ops.attention import kv_attention
+from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION, StatefulSmolLM
 
 PROMPT = [1, 504, 3458, 314]
-VARIANTS = ("eager", "inductor", "inductor_cudagraphs", "inductor_graphed", "megabake", "megabake_graphed")
+VARIANTS = (
+    "eager",
+    "inductor",
+    "inductor_cudagraphs",
+    "inductor_graphed",
+    "megabake",
+    "megabake_graphed",
+)
 
 
 def _load(name: str, revision: str | None, attention: str = "eager") -> torch.nn.Module:
@@ -138,7 +145,11 @@ def _measure_or_error(
 
 def _megabake(mode: str, out: Path):
     return make_backend(
-        mode=mode, compile_kernel=True, cache=False, dump_dir=out / "dumps" / mode, scheduler="phase"
+        mode=mode,
+        compile_kernel=True,
+        cache=False,
+        dump_dir=out / "dumps" / mode,
+        scheduler="phase",
     )
 
 
@@ -309,13 +320,16 @@ def bench_decode(model, args) -> dict:
             ]
             position = [0]
             if name == "inductor_graphed":
-                build = lambda state=state: GraphedStep(  # noqa: E731
+                build = lambda state=state: GraphedStep(
                     torch.compile(stateful, fullgraph=True, dynamic=False), token, state
                 )
             if name == "megabake_graphed":
-                build = lambda state=state: graphed(  # noqa: E731
+                build = lambda state=state: graphed(
                     torch.compile(
-                        stateful, backend=_megabake("decode", args.out), fullgraph=True, dynamic=False
+                        stateful,
+                        backend=_megabake("decode", args.out),
+                        fullgraph=True,
+                        dynamic=False,
                     ),
                     token,
                     torch.zeros((1, 1), dtype=torch.long, device="cuda"),
@@ -394,7 +408,10 @@ def bench_decode_contexts(model, args) -> dict:
                 elif name == "megabake_graphed":
                     function = graphed(
                         torch.compile(
-                            stateful, backend=_megabake("decode", args.out), fullgraph=True, dynamic=False
+                            stateful,
+                            backend=_megabake("decode", args.out),
+                            fullgraph=True,
+                            dynamic=False,
                         ),
                         token,
                         torch.tensor([[0]], device="cuda"),
@@ -425,7 +442,9 @@ def bench_decode_contexts(model, args) -> dict:
                         complete.append((time.perf_counter() - started) * 1e6)
                     pipelined = _pipelined_calls(
                         [
-                            lambda position=position: function(token, position, *state)
+                            lambda position=position, function=function, state=state: function(
+                                token, position, *state
+                            )
                             for position in positions[4 + args.samples :]
                         ]
                     )
@@ -437,7 +456,9 @@ def bench_decode_contexts(model, args) -> dict:
                 summary = {
                     context: round(row["pipelined_call_us"]) for context, row in rows.items()
                 }
-                print(f"decode_contexts_{name} pipelined_call_us: {json.dumps(summary)}", flush=True)
+                print(
+                    f"decode_contexts_{name} pipelined_call_us: {json.dumps(summary)}", flush=True
+                )
             except Exception as error:  # noqa: BLE001 - keep benchmarking the other variants
                 traceback.print_exc()
                 print(f"decode_contexts_{name}: FAILED {type(error).__name__}: {error}", flush=True)
@@ -475,7 +496,8 @@ def main() -> None:
         "--model", nargs="+", default=[SMOLLM_MODEL_NAME], help="Hugging Face causal LM id(s)"
     )
     parser.add_argument(
-        "--revision", help=f"checkpoint revision (default: pinned for {SMOLLM_MODEL_NAME}, else main)"
+        "--revision",
+        help=f"checkpoint revision (default: pinned for {SMOLLM_MODEL_NAME}, else main)",
     )
     parser.add_argument(
         "--attention",
@@ -483,7 +505,9 @@ def main() -> None:
         default="eager",
         help="prefill attention: eager (pattern-matched by MegaBake) or the declared megabake op",
     )
-    parser.add_argument("--modes", nargs="*", choices=("prefill", "decode"), default=["prefill", "decode"])
+    parser.add_argument(
+        "--modes", nargs="*", choices=("prefill", "decode"), default=["prefill", "decode"]
+    )
     parser.add_argument(
         "--variants",
         nargs="+",

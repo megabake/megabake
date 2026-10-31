@@ -26,11 +26,7 @@ GENERATIONS: tuple[Generation, ...] = (sm90.GENERATION, sm100.GENERATION)
 
 def generation(target: TargetFacts) -> Generation | None:
     return next(
-        (
-            candidate
-            for candidate in GENERATIONS
-            if target.architecture in candidate.architectures
-        ),
+        (candidate for candidate in GENERATIONS if target.architecture in candidate.architectures),
         None,
     )
 
@@ -42,9 +38,7 @@ def providers(target: TargetFacts) -> tuple[BodyProvider, ...]:
 
 def provider(name: str) -> BodyProvider:
     """The provider that emits bodies configured with ``BodyConfig.provider``."""
-    for candidate in GENERIC + tuple(
-        item for found in GENERATIONS for item in found.providers
-    ):
+    for candidate in GENERIC + tuple(item for found in GENERATIONS for item in found.providers):
         if candidate.provider_name == name:
             return candidate
     raise KeyError(f"no body provider named {name!r}")
@@ -58,9 +52,7 @@ def launch_options(graph: ComputeGraph, target: TargetFacts, table_launch: bool)
     return found.launch_options(graph, table_launch)
 
 
-def get_candidates(
-    region: Region, target: TargetFacts, policy: SelectionPolicy
-) -> CandidateSet:
+def get_candidates(region: Region, target: TargetFacts, policy: SelectionPolicy) -> CandidateSet:
     configurations: list[BodyConfig] = []
     rejections: list[ProviderRejection] = []
     for candidate in providers(target):

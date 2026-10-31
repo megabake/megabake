@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 import textwrap
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from functools import cache
-from typing import Any, Mapping
+from typing import Any
 
 from ....graph import Region
 from ....ops import HF_EAGER_NUMERICS, Attention, HeadGrouping, Prologue
@@ -179,17 +180,10 @@ class AttentionBodyProvider:
         if (
             query_length is None
             or kv_length is None
-            or not _attention_shape_is_valid(
-                q_load, batch, query_length, query_heads, head_dim
-            )
-            or not _attention_shape_is_valid(
-                k_load, batch, kv_length, kv_heads, head_dim
-            )
-            or not _attention_shape_is_valid(
-                v_load, batch, kv_length, kv_heads, head_dim
-            )
-            or program.store.shape
-            != (batch * query_heads, query_length, head_dim)
+            or not _attention_shape_is_valid(q_load, batch, query_length, query_heads, head_dim)
+            or not _attention_shape_is_valid(k_load, batch, kv_length, kv_heads, head_dim)
+            or not _attention_shape_is_valid(v_load, batch, kv_length, kv_heads, head_dim)
+            or program.store.shape != (batch * query_heads, query_length, head_dim)
         ):
             return reject("attention shapes do not match the captured access maps")
 
@@ -201,9 +195,7 @@ class AttentionBodyProvider:
             if not program.state_accesses:
                 return reject("stateful causal mask has no KV state contract")
         elif mask.kind == "typed_where":
-            if mask.window_offsets is not None or not isinstance(
-                mask.false_value, (int, float)
-            ):
+            if mask.window_offsets is not None or not isinstance(mask.false_value, (int, float)):
                 return reject("provider supports additive tensors and causal masks only")
             if mask.causal_offset is None and (
                 "attention:mask" not in loads or mask.true_value not in (0, 0.0)
@@ -223,9 +215,7 @@ class AttentionBodyProvider:
             return reject("provider supports read-only or bounded stateful KV caches only")
         if stateful and query_length != 1:
             return reject("stateful KV attention supports one-token decode only")
-        if attention.prologues and not (
-            stateful and policy.table_launch and head_dim % 32 == 0
-        ):
+        if attention.prologues and not (stateful and policy.table_launch and head_dim % 32 == 0):
             # Only the table launch's split-context decode body computes them.
             return reject("query and key prologues need the split-context decode body")
 
@@ -333,7 +323,11 @@ def _attention_config(
         ),
         layouts=LayoutContract(layouts, {program.store.value_id: layouts[program.store.value_id]}),
         tiles=TileContract(
-            cta_shape=(1, 1, next(load.source_shape[3] for load in program.loads if load.id == "attention:q")),
+            cta_shape=(
+                1,
+                1,
+                next(load.source_shape[3] for load in program.loads if load.id == "attention:q"),
+            ),
             cluster_shape=(1, 1, 1),
             work_partition=(
                 "one query row per warp in one CTA" if stateful else "one query row per warp"
@@ -489,8 +483,17 @@ def emit_attention_body(
         prologues = attention.prologues
         if defer_length_publish and workers is not None and head_dim % 32 == 0:
             return _split_decode_attention_body(
-                program, loads, batch, query_heads // group_size, group_size, head_dim,
-                kv_length, scale, threads, workers, config.scratch.size_bytes,
+                program,
+                loads,
+                batch,
+                query_heads // group_size,
+                group_size,
+                head_dim,
+                kv_length,
+                scale,
+                threads,
+                workers,
+                config.scratch.size_bytes,
                 prologues,
             )
         if prologues:
@@ -529,7 +532,7 @@ def emit_attention_body(
             f"value = value + scratch[base + block_start + {index}] * value_{index}.to(cutlass.Float32)"
             for index in range(VALUE_BLOCK)
         )
-        source = f'''import cutlass
+        source = f"""import cutlass
 import cutlass.cute as cute
 from megabake.runtime import trap_if
 
@@ -545,7 +548,7 @@ def run(
     thread, _, _ = cute.arch.thread_idx()
     workers, _, _ = cute.arch.grid_dim()
     row_count = {row_count}
-    current_length = tensor_bindings[{loads['attention:valid_length']}][0].to(cutlass.Int32)
+    current_length = tensor_bindings[{loads["attention:valid_length"]}][0].to(cutlass.Int32)
     trap_if(current_length < 0 or current_length + cutlass.Int32(1) > cutlass.Int32({kv_length}))
     # Each of the first {warps} warps takes whole query rows: lanes split the
     # visible keys for scores and the head dimensions for the value sum, and
@@ -565,10 +568,10 @@ def run(
                     score = cutlass.Float32(0.0)
                     if key < current_length:
                         for d in cutlass.range_constexpr({head_dim}):
-                            score = score + tensor_bindings[{loads['attention:q']}][b, s, h, d].to(cutlass.Float32) * tensor_bindings[{loads['attention:k']}][b, key, kv_head, d].to(cutlass.Float32)
+                            score = score + tensor_bindings[{loads["attention:q"]}][b, s, h, d].to(cutlass.Float32) * tensor_bindings[{loads["attention:k"]}][b, key, kv_head, d].to(cutlass.Float32)
                     else:
                         for d in cutlass.range_constexpr({head_dim}):
-                            score = score + tensor_bindings[{loads['attention:q']}][b, s, h, d].to(cutlass.Float32) * tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, d].to(cutlass.Float32)
+                            score = score + tensor_bindings[{loads["attention:q"]}][b, s, h, d].to(cutlass.Float32) * tensor_bindings[{loads["attention:new_k"]}][b, 0, kv_head, d].to(cutlass.Float32)
                     score = score.to(cutlass.BFloat16).to(cutlass.Float32)
                     score = score * cutlass.Float32({scale!r})
                     scratch[base + key] = score
@@ -596,17 +599,17 @@ def run(
                         {value_loads}
                         {value_sums}
                     for key in cutlass.range(blocked, current_length):
-                        value = value + scratch[base + key] * tensor_bindings[{loads['attention:v']}][b, key, kv_head, d].to(cutlass.Float32)
-                    value = value + scratch[base + current_length] * tensor_bindings[{loads['attention:new_v']}][b, 0, kv_head, d].to(cutlass.Float32)
+                        value = value + scratch[base + key] * tensor_bindings[{loads["attention:v"]}][b, key, kv_head, d].to(cutlass.Float32)
+                    value = value + scratch[base + current_length] * tensor_bindings[{loads["attention:new_v"]}][b, 0, kv_head, d].to(cutlass.Float32)
                     tensor_bindings[{len(program.loads)}][bh, s, d] = value.to(cutlass.BFloat16)
                 # Keys before current_length come from the cache and the new
                 # key from new_k, so appending here cannot race with readers.
                 if h % {group_size} == 0:
                     for d in cutlass.range(lane, {head_dim}, 32):
-                        tensor_bindings[{loads['attention:k']}][b, current_length, kv_head, d] = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, d]
-                        tensor_bindings[{loads['attention:v']}][b, current_length, kv_head, d] = tensor_bindings[{loads['attention:new_v']}][b, 0, kv_head, d]
+                        tensor_bindings[{loads["attention:k"]}][b, current_length, kv_head, d] = tensor_bindings[{loads["attention:new_k"]}][b, 0, kv_head, d]
+                        tensor_bindings[{loads["attention:v"]}][b, current_length, kv_head, d] = tensor_bindings[{loads["attention:new_v"]}][b, 0, kv_head, d]
                 cute.arch.sync_warp()
-{length_publish}'''
+{length_publish}"""
         return GeneratedAttentionBody(
             source=source,
             threads_per_cta=threads,
@@ -634,21 +637,13 @@ def run(
         if not isinstance(masked_value, (int, float)):
             raise UnsupportedAttentionBody("attention mask lacks a fill value")
         if isinstance(causal_offset, int):
-            mask_code = (
-                f"score = (score.to(cutlass.Float32) + cutlass.Float32({masked_value!r})).to(cutlass.BFloat16) if key > s + {causal_offset} else score"
-            )
+            mask_code = f"score = (score.to(cutlass.Float32) + cutlass.Float32({masked_value!r})).to(cutlass.BFloat16) if key > s + {causal_offset} else score"
         else:
             if "attention:mask" not in loads:
                 raise UnsupportedAttentionBody("typed attention mask is not bound")
-            mask_load = next(
-                load for load in program.loads if load.id == "attention:mask"
-            )
-            mask_access = _attention_access(
-                mask_load, "h", loads["attention:mask"]
-            )
-            mask_code = (
-                f"score = (score.to(cutlass.Float32) + cutlass.Float32({masked_value!r})).to(cutlass.BFloat16) if not {mask_access} else score"
-            )
+            mask_load = next(load for load in program.loads if load.id == "attention:mask")
+            mask_access = _attention_access(mask_load, "h", loads["attention:mask"])
+            mask_code = f"score = (score.to(cutlass.Float32) + cutlass.Float32({masked_value!r})).to(cutlass.BFloat16) if not {mask_access} else score"
     elif mask.kind == "none":
         mask_code = "pass"
     else:
@@ -668,7 +663,7 @@ def run(
     if warps < 1:
         raise UnsupportedAttentionBody("attention scratch must hold one score row per warp")
     tile_count = (row_count + warps - 1) // warps
-    source = f'''import cutlass
+    source = f"""import cutlass
 import cutlass.cute as cute
 
 
@@ -729,7 +724,7 @@ def run(
                         value = value + scratch[base + key] * {v_access}.to(cutlass.Float32)
                     tensor_bindings[{len(program.loads)}][bh, s, d] = value.to({output_type})
                 cute.arch.sync_warp()
-'''
+"""
     return GeneratedAttentionBody(
         source=source,
         threads_per_cta=threads,
@@ -738,9 +733,7 @@ def run(
     )
 
 
-def _prologue_lines(
-    prologue: Prologue, program: Any, head: str, target: str, name: str
-) -> str:
+def _prologue_lines(prologue: Prologue, program: Any, head: str, target: str, name: str) -> str:
     """Lines storing to ``target`` (as FP32) an elementwise producer of a
     (batch, sequence, head, dim) attention operand evaluated at (b,
     sequence, ``head``, d), rounded as the producer stores it, from the
@@ -909,8 +902,19 @@ def _split_decode_attention_body(
     packed = decode_packed_heads(group_size, head_dim)
     variants = [
         _decode_variant(
-            program, loads, batch, kv_heads, group_size, head_dim, kv_length, scale,
-            threads, workers, scratch_bytes, prologues or {}, heads,
+            program,
+            loads,
+            batch,
+            kv_heads,
+            group_size,
+            head_dim,
+            kv_length,
+            scale,
+            threads,
+            workers,
+            scratch_bytes,
+            prologues or {},
+            heads,
         )
         for heads in dict.fromkeys((1, packed))
     ]
@@ -922,7 +926,7 @@ def _split_decode_attention_body(
             + "    else:\n"
             + textwrap.indent(variants[1].block, "    ")
         )
-    source = f'''import cutlass
+    source = f"""import cutlass
 import cutlass.cute as cute
 from megabake.runtime import trap_if
 
@@ -943,7 +947,7 @@ def run(
     keys = current_length + cutlass.Int32(1)
     warp = thread // 32
     lane = thread % 32
-{blocks}'''
+{blocks}"""
     return GeneratedAttentionBody(
         source=source,
         threads_per_cta=threads,
@@ -1045,7 +1049,7 @@ def _decode_variant(
             return f"scratch[{layout.scores + g * capacity} + {key} - start]"
         return (
             f"cute.arch.load(floats.iterator + scores + {g * capacity} + {key} - start, "
-            "cutlass.Float32, cop=\"cg\")"
+            'cutlass.Float32, cop="cg")'
         )
 
     def score_store(g: int, key: str, value: str) -> str:
@@ -1053,7 +1057,7 @@ def _decode_variant(
             return f"scratch[{layout.scores + g * capacity} + {key} - start] = {value}"
         return (
             f"cute.arch.store(floats.iterator + scores + {g * capacity} + {key} - start, "
-            f"{value}, cop=\"cg\")"
+            f'{value}, cop="cg")'
         )
 
     def shared_row(offset: int) -> str:
@@ -1063,9 +1067,7 @@ def _decode_variant(
         return "\n".join(indent + template.format(g=g) for g in range(groups))
 
     # The group's query rows, and the computed new key, in shared scratch.
-    staging = "".join(
-        f"            head_{g} = head_base + {g}\n" for g in range(groups)
-    )
+    staging = "".join(f"            head_{g} = head_base + {g}\n" for g in range(groups))
     for g in range(groups):
         target = f"scratch[{layout.query_rows + g * head_dim} + d]"
         staging += f"            for d in cutlass.range(thread, {head_dim}, {threads}):\n"
@@ -1081,7 +1083,11 @@ def _decode_variant(
     if "attention:new_k" in prologues:
         staging += f"            for d in cutlass.range(thread, {head_dim}, {threads}):\n"
         staging += _prologue_lines(
-            prologues["attention:new_k"], program, "kv_head", f"scratch[{layout.key_row} + d]", "key"
+            prologues["attention:new_k"],
+            program,
+            "kv_head",
+            f"scratch[{layout.key_row} + d]",
+            "key",
         )
     if prologues:
         staging = "            sequence = cutlass.Int32(0)\n" + staging
@@ -1119,9 +1125,14 @@ def _decode_variant(
 
     def warp_statistics(name: str, combine: str) -> str:
         return (
-            per_head(f"{name}_{{g}} = cute.arch.warp_reduction_{combine}({name}_{{g}})", "            ")
+            per_head(
+                f"{name}_{{g}} = cute.arch.warp_reduction_{combine}({name}_{{g}})", "            "
+            )
             + "\n            cute.arch.sync_threads()\n            if lane == 0:\n"
-            + per_head(f"scratch[{layout.values} + warp * {groups} + {{g}}] = {name}_{{g}}", "                ")
+            + per_head(
+                f"scratch[{layout.values} + warp * {groups} + {{g}}] = {name}_{{g}}",
+                "                ",
+            )
             + "\n            cute.arch.sync_threads()\n"
         )
 
@@ -1130,17 +1141,27 @@ def _decode_variant(
             f"                key_{u} = base + {u * warps}\n"
             + "\n".join(f"                probability_{u}_{g} = cutlass.Float32(0.0)" for g in tile)
             + f"\n                if key_{u} < cached_stop:\n"
-            + "\n".join(f"                    probability_{u}_{g} = {score_load(g, f'key_{u}')}" for g in tile)
+            + "\n".join(
+                f"                    probability_{u}_{g} = {score_load(g, f'key_{u}')}"
+                for g in tile
+            )
             + f"\n                else:\n                    key_{u} = cached_stop - cutlass.Int32(1)\n"
             + lines(
-                "row_{u}_{j} = tensor_bindings[" + str(v_index) + "][b, key_{u}, kv_head, {d}].to(cutlass.Float32)",
+                "row_{u}_{j} = tensor_bindings["
+                + str(v_index)
+                + "][b, key_{u}, kv_head, {d}].to(cutlass.Float32)",
                 "                ",
                 u=u,
             )
             for u in range(unroll)
         )
         sums = "\n".join(
-            lines("value_{g}_{j} = value_{g}_{j} + probability_{u}_{g} * row_{u}_{j}", "                ", u=u, g=g)
+            lines(
+                "value_{g}_{j} = value_{g}_{j} + probability_{u}_{g} * row_{u}_{j}",
+                "                ",
+                u=u,
+                g=g,
+            )
             for u in range(unroll)
             for g in tile
         )
@@ -1156,7 +1177,15 @@ def _decode_variant(
             for g in tile
         )
         reduce_heads = "".join(
-            lines("scratch[" + str(layout.values) + " + warp * " + str(head_dim) + " + {d}] = value_{g}_{j}", "            ", g=g)
+            lines(
+                "scratch["
+                + str(layout.values)
+                + " + warp * "
+                + str(head_dim)
+                + " + {d}] = value_{g}_{j}",
+                "            ",
+                g=g,
+            )
             + "\n            cute.arch.sync_threads()\n"
             f"            for d in cutlass.range(thread, {head_dim}, {threads}):\n"
             f"                value = scratch[{layout.values} + d]\n"
@@ -1166,13 +1195,15 @@ def _decode_variant(
             f"                    tensor_bindings[{output_index}][b * {query_heads} + head_{g}, 0, d] = value.to(cutlass.BFloat16)\n"
             "                else:\n"
             "                    cute.arch.store(\n"
-            f"                        floats.iterator + partials + (chunk * {groups} + {g}) * {head_dim} + d, value, cop=\"cg\"\n"
+            f'                        floats.iterator + partials + (chunk * {groups} + {g}) * {head_dim} + d, value, cop="cg"\n'
             "                    )\n"
             "            cute.arch.sync_threads()\n"
             for g in tile
         )
         return (
-            "\n".join(lines("value_{g}_{j} = cutlass.Float32(0.0)", "            ", g=g) for g in tile)
+            "\n".join(
+                lines("value_{g}_{j} = cutlass.Float32(0.0)", "            ", g=g) for g in tile
+            )
             + f"\n            for base in cutlass.range(start + warp, cached_stop, {unroll * warps}):\n"
             + loads_
             + "\n"
@@ -1214,7 +1245,7 @@ def _decode_variant(
             "                cute.arch.fence_acq_rel_gpu()\n"
         )
 
-    block = f'''    in_use = (keys + cutlass.Int32({DECODE_MIN_CHUNK_KEYS - 1})) // cutlass.Int32({DECODE_MIN_CHUNK_KEYS})
+    block = f"""    in_use = (keys + cutlass.Int32({DECODE_MIN_CHUNK_KEYS - 1})) // cutlass.Int32({DECODE_MIN_CHUNK_KEYS})
     if in_use > cutlass.Int32({chunks}):
         in_use = cutlass.Int32({chunks})
 {one_wave}    chunk_keys = (keys + in_use - cutlass.Int32(1)) // in_use
@@ -1349,5 +1380,5 @@ def _decode_variant(
                         tensor_bindings[{k_index}][b, current_length, kv_head, d] = {new_key_value}
                         tensor_bindings[{v_index}][b, current_length, kv_head, d] = tensor_bindings[{new_v_index}][b, 0, kv_head, d]
             cute.arch.sync_threads()
-'''
+"""
     return _DecodeVariant(block, rows * chunks, floats, rows * 2)

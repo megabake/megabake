@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields, is_dataclass
 import hashlib
 import json
 import platform
 import threading
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, fields, is_dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any
 
-import cutlass
 import torch
 
 from .graph import ComputeGraph
 from .plan import BodySelectionPlan, KernelPlan
+from .platform import cutlass
 from .runtime import PHASE_TIMER_SLOTS, WEIGHT_STREAM_STAGES
 
 if TYPE_CHECKING:
@@ -42,9 +43,7 @@ class PlanCache:
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
 
-    def get_or_compile(
-        self, key: str, compiler: Callable[[], Any]
-    ) -> PlanCacheResult:
+    def get_or_compile(self, key: str, compiler: Callable[[], Any]) -> PlanCacheResult:
         with self._lock:
             entry = self.entries.get(key)
             if entry is not None:
@@ -82,11 +81,7 @@ def make_plan_key(
 
 
 def _context_data(context: CaptureContext) -> dict[str, Any]:
-    requirements = {
-        key: value
-        for key, value in context.requirements.items()
-        if key != "execution"
-    }
+    requirements = {key: value for key, value in context.requirements.items() if key != "execution"}
     return {
         "mode": context.mode,
         "fallback": context.fallback,
@@ -120,9 +115,7 @@ def _plan_data(
                 body.evidence.revision,
                 body.semantic.numerical_policy,
             )
-            for body in (
-                selected.body for selected in selection.selections
-            )
+            for body in (selected.body for selected in selection.selections)
         ),
     }
 
@@ -141,7 +134,7 @@ def _diagnostics(compiled: Any) -> Mapping[str, Any]:
     if callable(report):
         try:
             return report()
-        except Exception:
+        except Exception:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
             return {}
     return {}
 
@@ -162,10 +155,7 @@ def _canonical(value: Any) -> Any:
     if is_dataclass(value) and not isinstance(value, type):
         return {
             "__dataclass__": type(value).__qualname__,
-            **{
-                field.name: _canonical(getattr(value, field.name))
-                for field in fields(value)
-            },
+            **{field.name: _canonical(getattr(value, field.name)) for field in fields(value)},
         }
     if isinstance(value, Mapping):
         items = [(_canonical(key), _canonical(item)) for key, item in value.items()]
@@ -184,7 +174,7 @@ def _canonical(value: Any) -> Any:
     if isinstance(value, (str, bool, int)) or value is None:
         return value
     if isinstance(value, float):
-        return value if value == value and abs(value) != float("inf") else str(value)
+        return value if value == value and abs(value) != float("inf") else str(value)  # noqa: PLR0124  # Self-comparison intentionally detects NaN.
     if isinstance(value, (type, Callable)):
         return {
             "__callable__": type(value).__qualname__,
