@@ -276,6 +276,7 @@ def main() -> None:
     parser.add_argument("--attention", choices=("eager", "megabake"), default="eager")
     parser.add_argument("--capacity", type=int, default=128)
     parser.add_argument("--calls", type=int, default=9)
+    parser.add_argument("--start-context", type=int, default=0)
     parser.add_argument("--out", type=Path)
     parser.add_argument(
         "--cta", action="store_true", help="also split intervals into work and wait per CTA"
@@ -304,8 +305,12 @@ def main() -> None:
             token = torch.tensor([[504]], device="cuda")
             compiled_model = torch.compile(stateful, backend=backend, fullgraph=True, dynamic=False)
 
-            if args.calls + 4 > args.capacity:
-                raise SystemExit("--capacity must exceed --calls + 4")
+            if (
+                args.start_context < 0
+                or args.calls < 1
+                or max(args.calls + 4, args.start_context + args.calls) > args.capacity
+            ):
+                raise SystemExit("--capacity must accommodate warmup and --start-context + --calls")
 
             run = _DecodeStepRunner(compiled_model, token, state)
 
@@ -320,12 +325,24 @@ def main() -> None:
             raise SystemExit("plan has more phases than timer slots")
         for _ in range(3):
             run()
+
+        def reset_context():
+            if args.mode == "decode":
+                run.position = args.start_context
+                for tensor in state:
+                    if tensor.dtype == torch.int32 and tensor.numel() == 1:
+                        tensor.fill_(args.start_context)
+                torch.cuda.synchronize()
+
+        reset_context()
         report = {
+            "start_context": args.start_context,
             "model": args.model,
             "mode": args.mode,
             **profile(callable_, compiled, run, args.calls),
         }
         if args.cta:
+            reset_context()
             report["cta"] = cta_profile(callable_, compiled, run, args.calls)
     print(json.dumps(report, indent=2))
     if args.out is not None:
