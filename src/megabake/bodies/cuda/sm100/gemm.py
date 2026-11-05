@@ -24,7 +24,7 @@ from ...interface import (
 )
 from ..generic import GeneratedContractionBody, generic_config
 
-BLACKWELL_ARCHITECTURES = frozenset({"sm100", "sm103", "sm120", "sm121"})
+BLACKWELL_ARCHITECTURES = frozenset({"sm100", "sm103"})
 
 
 class BlackwellGemmProvider:

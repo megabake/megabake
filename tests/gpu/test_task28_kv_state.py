@@ -7,8 +7,8 @@ from megabake import make_backend
 from megabake.fx_handler.transformers import StatefulAttention
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),
-    reason="task 28 requires an SM90 CUDA device",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] not in {9, 12},
+    reason="task 28 requires an SM90 or SM12x CUDA device",
 )
 
 

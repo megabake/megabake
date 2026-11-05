@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..graph import ComputeGraph, Region
-from .cuda import sm90, sm100
+from .cuda import sm90, sm100, sm120
 from .cuda.generic import GenericBodyProvider
 from .interface import (
     BodyConfig,
@@ -21,7 +21,7 @@ from .interface import (
 )
 
 GENERIC: tuple[BodyProvider, ...] = (GenericBodyProvider(),)
-GENERATIONS: tuple[Generation, ...] = (sm90.GENERATION, sm100.GENERATION)
+GENERATIONS: tuple[Generation, ...] = (sm90.GENERATION, sm100.GENERATION, sm120.GENERATION)
 
 
 def generation(target: TargetFacts) -> Generation | None:

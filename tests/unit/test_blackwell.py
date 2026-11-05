@@ -29,7 +29,7 @@ def _region():
     )
 
 
-@pytest.mark.parametrize("architecture", ["sm100", "sm103", "sm120", "sm121"])
+@pytest.mark.parametrize("architecture", ["sm100", "sm103"])
 def test_blackwell_provider_is_tensor_core_without_hopper_resources(architecture):
     target = _target(
         architecture=architecture, supports_wgmma=False, max_shared_memory_per_cta=99_328
@@ -46,7 +46,7 @@ def test_blackwell_provider_is_tensor_core_without_hopper_resources(architecture
 def test_blackwell_provider_rejects_other_targets_policy_and_changed_semantics():
     provider = BlackwellGemmProvider()
     region = _region()
-    target = _target(architecture="sm121", supports_wgmma=False)
+    target = _target(architecture="sm103", supports_wgmma=False)
     assert not provider.get_candidates(region, _target(), SelectionPolicy()).configurations
     assert not provider.get_candidates(
         region, target, SelectionPolicy(allow_tuned=False)

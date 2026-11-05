@@ -89,6 +89,8 @@ class GeneratedAttentionBody:
 
 class AttentionBodyProvider:
     provider_name = "attention"
+    architectures = frozenset({"sm90a"})
+    requires_wgmma = True
 
     def emit(
         self,
@@ -219,8 +221,10 @@ class AttentionBodyProvider:
             # Only the table launch's split-context decode body computes them.
             return reject("query and key prologues need the split-context decode body")
 
-        if target.architecture != "sm90a" or not target.supports_wgmma:
-            return reject("provider targets WGMMA-capable sm90a only")
+        if target.architecture not in self.architectures:
+            return reject(f"provider does not target {target.architecture}")
+        if self.requires_wgmma and not target.supports_wgmma:
+            return reject("provider requires WGMMA support")
         if attention_scratch_rows(kv_length) < 1:
             return reject(
                 f"a {kv_length}-key FP32 score row exceeds {ATTENTION_SCRATCH_BYTES} scratch bytes"
@@ -240,6 +244,7 @@ class AttentionBodyProvider:
                     body_name,
                     target.multiprocessor_count,
                     stateful and policy.table_launch and head_dim % 32 == 0,
+                    self.provider_name,
                 ),
             ),
             (),
@@ -263,7 +268,7 @@ def attention_scratch_rows(kv_length: int) -> int:
 
 
 def _attention_config(
-    region: Region, program: Any, name: str, workers: int, split: bool
+    region: Region, program: Any, name: str, workers: int, split: bool, provider: str
 ) -> BodyConfig:
     """``split`` sizes the scratch for the table launch's split-context decode
     body, which ``workers`` CTAs run."""
@@ -311,7 +316,7 @@ def _attention_config(
         program.store.shape,
     )
     return BodyConfig(
-        provider="attention",
+        provider=provider,
         name=name,
         semantic=SemanticContract(
             operation_family="attention",

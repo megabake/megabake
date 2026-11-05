@@ -255,9 +255,14 @@ def _enumerate_body_selections(
         if combination_count > combination_limit:
             break
     seed = (tuple(first_combination),)
-    combinations = (
-        seed if combination_count > combination_limit else chain(seed, product(*options_by_region))
-    )
+    if combination_count > combination_limit and target.architecture in {"sm120", "sm121"}:
+        combinations = _grouped_combinations(first_combination, options_by_region, max_plans)
+    else:
+        combinations = (
+            seed
+            if combination_count > combination_limit
+            else chain(seed, product(*options_by_region))
+        )
     examined_combinations = 0
     for combination in combinations:
         examined_combinations += 1
@@ -327,6 +332,68 @@ def _enumerate_body_selections(
         if examined_combinations >= max_plans * 16:
             break
     return tuple(selections), rejections, unsupported
+
+
+def _grouped_combinations(first, options_by_region, limit):
+    """Bounded deterministic beam over interchangeable semantic body groups.
+
+    Preserve the incumbent's fusion coverage: alternative bodies must implement
+    exactly the same source operations. Do not enumerate a model-sized product.
+    """
+    groups = {}
+    for index, option in enumerate(first):
+        if option is None:
+            continue
+        region, program, _ = option
+        key = (
+            program.family,
+            program.store.shape,
+            program.store.dtype,
+            tuple((load.axes, load.strides, load.dtype) for load in program.loads),
+            tuple((domain.axis, domain.size) for domain in program.iteration_domains),
+        )
+        groups.setdefault(key, []).append(index)
+    frontier = [tuple(first)]
+    seen = {
+        tuple(
+            None if item is None else (item[0].id, item[2].provider, item[2].name) for item in first
+        )
+    }
+    yield tuple(first)
+    emitted = 1
+    while frontier and emitted < limit:
+        next_frontier = []
+        for current in frontier:
+            for indices in groups.values():
+                common = None
+                choices = {}
+                for index in indices:
+                    region = current[index][0]
+                    available = {
+                        (item[2].provider, item[2].name): item
+                        for item in options_by_region[index]
+                        if item is not None and item[0].source_op_ids == region.source_op_ids
+                    }
+                    choices[index] = available
+                    common = set(available) if common is None else common & set(available)
+                for body_key in sorted(common or ()):
+                    changed = list(current)
+                    for index in indices:
+                        changed[index] = choices[index][body_key]
+                    identity = tuple(
+                        None if item is None else (item[0].id, item[2].provider, item[2].name)
+                        for item in changed
+                    )
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    changed = tuple(changed)
+                    next_frontier.append(changed)
+                    yield changed
+                    emitted += 1
+                    if emitted >= limit:
+                        return
+        frontier = next_frontier[:4]
 
 
 def _body_options(
@@ -431,6 +498,9 @@ def _contraction_body_order(
     small_tile = config.tiles.cta_shape[-1] <= 64
     return (
         0 if config.evidence.measured else 1,
+        # A one-row SM12x dot product avoids padding fifteen MMA rows.
+        # Put it inside the bounded search before adding more MMA variants.
+        0 if config.name == "sm12x_gemv_warp4" else 1,
         0 if config.tiles.mma_family else 1,
         0 if small_tile == small_m else 1,
         mode_priority,

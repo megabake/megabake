@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 from cuda.bindings import driver as cuda
 from cutlass import cute
 
 from megabake.bodies import SelectionPolicy
-from megabake.bodies.cuda.sm100.gemm import BlackwellGemmProvider, emit_blackwell_gemm
+from megabake.bodies.cuda.sm100.gemm import BlackwellGemmProvider
+from megabake.bodies.cuda.sm120.gemm import SM12xGemmProvider
 from megabake.compiler import _target_facts
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
@@ -20,10 +23,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize(
+    "body_name",
+    [None, "sm12x_mma_16x32x16", "sm12x_gemv_warp4"],
+)
 @pytest.mark.parametrize("strided_input", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("shape", [(1, 32, 64), (5, 33, 70), (32, 64, 128)])
-def test_blackwell_mma_tails_and_rebinding(tmp_path, dtype, shape, strided_input):
+def test_blackwell_mma_tails_and_rebinding(tmp_path, dtype, shape, strided_input, body_name):
     m, n, k = shape
 
     class Gemm(torch.nn.Module):
@@ -40,11 +47,19 @@ def test_blackwell_mma_tails_and_rebinding(tmp_path, dtype, shape, strided_input
     prepared = prepare_fx_graph(torch.export.export(Gemm(), (a, b)).graph_module, (a, b))
     graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     region = next(r for r in graph.regions if r.tensor_programs[0].family == "contraction")
-    candidates = BlackwellGemmProvider().get_candidates(
-        region, _target_facts(a.device), SelectionPolicy()
+    target = _target_facts(a.device)
+    provider = (
+        SM12xGemmProvider() if target.architecture.startswith("sm12") else BlackwellGemmProvider()
     )
+    candidates = provider.get_candidates(region, target, SelectionPolicy())
     assert candidates.configurations, candidates.rejections
-    body = emit_blackwell_gemm(region.tensor_programs[0], candidates.configurations[0])
+    config = next(
+        (item for item in candidates.configurations if body_name is None or item.name == body_name),
+        None,
+    )
+    if config is None:
+        pytest.skip("body is unavailable for this architecture or shape")
+    body = provider.emit(region.tensor_programs[0], config)
     path = tmp_path / "blackwell_body.py"
     path.write_text(body.source)
     _load_module(path, "megabake_blackwell_body")
@@ -87,10 +102,18 @@ def test_blackwell_complete_mlp_one_kernel_and_private_isolated_state(tmp_path, 
             (result.float() - reference.float()).norm() / reference.float().norm()
         ).item() < 0.01
         compiled = backend.megabake_last_compiled
-        assert any(s.body.provider == "blackwell_mma" for s in compiled.plan.selection.selections)
+        search_reports = list(tmp_path.rglob("plan_search.json"))
+        assert search_reports
+        report = json.loads(search_reports[-1].read_text())
+        assert report["selected"] == compiled.search.selected_description
+        assert any(candidate["status"] == "measured" for candidate in report["candidates"])
+        gemm_provider = (
+            "sm12x_mma" if torch.cuda.get_device_capability()[0] == 12 else "blackwell_mma"
+        )
+        assert any(s.body.provider == gemm_provider for s in compiled.plan.selection.selections)
         # Search may legitimately mix a scalar tail GEMM with MMA at tiny shapes.
         assert any(
-            c.description.count("blackwell_mma/") == 3 and c.measurement is not None
+            c.description.count(f"{gemm_provider}/") == 3 and c.measurement is not None
             for c in compiled.search.candidates
         )
         trace = kernel_trace(lambda: bound(*args), tmp_path / "trace.json")

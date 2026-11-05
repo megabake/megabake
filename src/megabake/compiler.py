@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import copy
 import functools
+import json
 import sys
 import threading
 import time
@@ -387,11 +388,17 @@ def compile_post_grad(
     else:
         budget = search_budget or SearchBudget()
         if search_budget is None and _uses_table_launch(graph):
-            budget = SearchBudget(max_plans=1, max_compilations=1)
+            budget = (
+                SearchBudget(max_plans=8, max_compilations=8)
+                if selected_target.architecture in {"sm120", "sm121"}
+                else SearchBudget(max_plans=1, max_compilations=1)
+            )
 
     plan_key: str | None = None
     if cache is not None:
-        selections = enumerate_body_selections(graph, selected_target, policy, max_plans=1)
+        selections = enumerate_body_selections(
+            graph, selected_target, policy, max_plans=budget.max_plans
+        )
         key_selection = (
             selections[0]
             if selections
@@ -413,6 +420,13 @@ def compile_post_grad(
             prepared.context,
             scheduler=scheduler,
             body_revisions=body_revisions,
+            search_settings={
+                "revision": "grouped-search-v2",
+                "max_plans": budget.max_plans,
+                "max_compilations": budget.max_compilations,
+                "timing_samples": budget.timing_samples,
+                "deadline_seconds": budget.deadline_seconds,
+            },
         )
 
     def compile_selected() -> CompiledKernel:
@@ -495,6 +509,10 @@ def compile_post_grad(
                 )
             )
         result = replace(result, selected=result.selected_compiled.plan)
+        if output_dir is not None:
+            report_path = Path(output_dir) / "plan_search.json"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(json.dumps(result.report(), indent=2) + "\n")
         return replace(result.selected_compiled, search=result)
 
     cache_hit = False
@@ -1165,14 +1183,19 @@ def _make_plan_evaluator(
     reset_state: Callable[[], None] | None = None,
     teacher_check: _TeacherForcedCheck | None = None,
 ):
+    compiled_plans = {}
+
     def evaluate(plan: KernelPlan, budget: SearchBudget) -> PlanMeasurement:
         try:
-            compiled = compile_plan(
-                plan,
-                prepared.example_inputs,
-                output_dir=output_dir,
-                scheduler=scheduler,
-            )
+            compiled = compiled_plans.get(id(plan))
+            if compiled is None:
+                compiled = compile_plan(
+                    plan,
+                    prepared.example_inputs,
+                    output_dir=output_dir,
+                    scheduler=scheduler,
+                )
+                compiled_plans[id(plan)] = compiled
             bound = bind_callable(
                 compiled,
                 prepared.context,
