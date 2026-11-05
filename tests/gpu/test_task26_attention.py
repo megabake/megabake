@@ -10,9 +10,17 @@ from megabake import make_backend
 from megabake.bodies.cuda.sm90.attention import attention_scratch_rows
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),
-    reason="task 26 requires an SM90 CUDA device",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] not in {9, 12},
+    reason="task 26 requires an SM90 or SM12x CUDA device",
 )
+
+
+def _attention_provider():
+    return "sm12x_attention" if torch.cuda.get_device_capability(0)[0] == 12 else "attention"
+
+
+def _gemm_provider():
+    return "sm12x_mma" if torch.cuda.get_device_capability(0)[0] == 12 else "g0_range"
 
 
 def grouped_attention(source, key, value, mask):
@@ -102,7 +110,7 @@ def test_task26_composes_attention_and_rms_norm(tmp_path):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     providers = [phase.body.provider for phase in backend.megabake_last_compiled.plan.phases]
-    assert "attention" in providers
+    assert _attention_provider() in providers
     assert "generic" in providers
 
 
@@ -232,8 +240,8 @@ def test_task26_composes_gemm_and_attention(tmp_path):
     relative_error = ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
     assert relative_error < 0.01
     providers = Counter(phase.body.provider for phase in backend.megabake_last_compiled.plan.phases)
-    assert providers["g0_range"] >= 1
-    assert providers["attention"] == 1
+    assert providers[_gemm_provider()] >= 1
+    assert providers[_attention_provider()] == 1
 
 
 def test_task26_composes_gemm_attention_and_rms_norm(tmp_path):
@@ -252,6 +260,6 @@ def test_task26_composes_gemm_attention_and_rms_norm(tmp_path):
     relative_error = ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
     assert relative_error < 0.01
     providers = Counter(phase.body.provider for phase in backend.megabake_last_compiled.plan.phases)
-    assert providers["g0_range"] >= 1
-    assert providers["attention"] == 1
+    assert providers[_gemm_provider()] >= 1
+    assert providers[_attention_provider()] == 1
     assert providers["generic"] >= 1
