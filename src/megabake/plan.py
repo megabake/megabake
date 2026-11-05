@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import product
 from math import prod
 from time import monotonic
@@ -525,7 +525,9 @@ def search_plans(
             continue
 
         counts = tuple(sorted(worker_counts, reverse=selected_policy.mode != "decode"))
-        if min(selected_budget.max_plans, selected_budget.max_compilations) < len(counts):
+        if target.architecture in {"sm120", "sm121"} or min(
+            selected_budget.max_plans, selected_budget.max_compilations
+        ) < len(counts):
             # A budget too small to measure every count selects the first one
             # unmeasured; decode's ascending order then left three quarters of
             # the GPU idle. Try the full-machine default first.
@@ -534,12 +536,20 @@ def search_plans(
             )
         worker_variants.append((selection, counts))
 
-    worker_search_selections = max(1, selected_budget.max_compilations // 3)
-    search_variants = []
-    for selection, counts in worker_variants[:worker_search_selections]:
-        search_variants.extend((selection, worker_count) for worker_count in counts)
-    for selection, counts in worker_variants[worker_search_selections:]:
-        search_variants.append((selection, counts[0]))
+    if target.architecture in {"sm120", "sm121"}:
+        # Spend the initial budget on distinct bodies at the incumbent worker
+        # count before exploring smaller grids.
+        search_variants = [(selection, counts[0]) for selection, counts in worker_variants]
+        search_variants.extend(
+            (selection, count) for selection, counts in worker_variants for count in counts[1:]
+        )
+    else:
+        worker_search_selections = max(1, selected_budget.max_compilations // 3)
+        search_variants = []
+        for selection, counts in worker_variants[:worker_search_selections]:
+            search_variants.extend((selection, worker_count) for worker_count in counts)
+        for selection, counts in worker_variants[worker_search_selections:]:
+            search_variants.append((selection, counts[0]))
     for selection, worker_count in search_variants:
         if legal_plan_count >= selected_budget.max_plans:
             exhausted = True
@@ -655,6 +665,36 @@ def search_plans(
         for candidate in candidates
         if candidate.status == "measured" and candidate.measurement is not None
     )
+    if (
+        target.architecture in {"sm120", "sm121"}
+        and len(measured) > 1
+        and selected_budget.evaluator is not None
+    ):
+        finalists = sorted(measured, key=lambda item: _measurement_rank(item.measurement))[:2]
+        if all(item is not measured[0] for item in finalists):
+            finalists.append(measured[0])
+        for finalist in finalists:
+            if (
+                selected_budget.deadline_seconds is not None
+                and monotonic() - started >= selected_budget.deadline_seconds
+            ):
+                exhausted = True
+                break
+            try:
+                checked = selected_budget.evaluator(
+                    finalist.plan, replace(selected_budget, timing_samples=40)
+                )
+            except Exception as error:  # noqa: BLE001
+                checked = PlanMeasurement(error=f"final verification failed: {error}")
+            index = candidates.index(finalist)
+            valid = checked.correct and checked.median_complete_call_us is not None
+            candidates[index] = replace(
+                finalist,
+                measurement=checked,
+                status="measured" if valid else "rejected",
+                reason=None if valid else checked.error or "final verification failed",
+            )
+        measured = tuple(item for item in candidates if item.status == "measured")
     selected = None
     if measured:
         fastest = min(_measurement_rank(candidate.measurement) for candidate in measured)
@@ -665,6 +705,12 @@ def search_plans(
             for candidate in measured
             if _measurement_rank(candidate.measurement) <= fastest * (1 + _TIE_TOLERANCE)
         ]
+        incumbent = measured[0]
+        if (
+            target.architecture in {"sm120", "sm121"}
+            and _measurement_rank(incumbent.measurement) <= fastest * 1.03
+        ):
+            close = [incumbent]
         selected = min(
             close,
             key=lambda candidate: (

@@ -63,3 +63,56 @@ def test_sm12x_stateful_decode_attention_selection(architecture):
     assert config.name == "attention_stateful_decode_rows"
     validate_body_config(config, target, SelectionPolicy(mode="decode"))
     assert provider(config.provider).provider_name == "sm12x_attention"
+
+
+def test_batch_one_gemv_is_reachable_before_mma_in_bounded_search():
+    import torch
+
+    from megabake.planner import _contraction_body_order
+    from tests.unit.test_blackwell import Gemm
+    from tests.unit.test_bodies import _regions
+
+    region = next(
+        region
+        for region in _regions(
+            Gemm(),
+            torch.randn(1, 70, dtype=torch.bfloat16),
+            torch.randn(33, 70, dtype=torch.bfloat16),
+        )
+        if region.tensor_programs[0].family == "contraction"
+    )
+    policy = SelectionPolicy(mode="decode")
+    candidates = SM12xGemmProvider().get_candidates(
+        region, _target(architecture="sm121", supports_wgmma=False), policy
+    )
+    for body in candidates.configurations:
+        validate_body_config(body, _target(architecture="sm121", supports_wgmma=False), policy)
+    ordered = sorted(
+        candidates.configurations,
+        key=lambda body: _contraction_body_order(body, region.tensor_programs[0], policy),
+    )
+    assert ordered[0].name == "sm12x_gemv_warp4"
+
+
+def test_grouped_search_reaches_alternatives_without_cartesian_expansion():
+    from dataclasses import replace
+
+    from megabake.planner import _grouped_combinations
+
+    region = _region()
+    result = SM12xGemmProvider().get_candidates(
+        region, _target(architecture="sm121", supports_wgmma=False), SelectionPolicy()
+    )
+    options = []
+    for index in range(20):
+        current = replace(region, id=f"projection{index}")
+        options.append(
+            [(current, current.tensor_programs[0], body) for body in result.configurations]
+        )
+    first = [items[0] for items in options]
+    plans = list(_grouped_combinations(first, options, 8))
+    assert plans[0] == tuple(first)
+    assert 1 < len(plans) <= 8
+    assert list(_grouped_combinations(first, options, 8)) == plans
+    assert all(len({item[2].name for item in plan}) == 1 for plan in plans)
+    assert len(list(_grouped_combinations(first, options, 1))) == 1

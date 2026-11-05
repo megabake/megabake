@@ -64,11 +64,13 @@ def make_plan_key(
     scheduler: str = "phase",
     toolchain: Mapping[str, str] | None = None,
     body_revisions: Sequence[tuple[str, str, str]] | None = None,
+    search_settings: Mapping[str, Any] | None = None,
 ) -> str:
     payload = {
         "plan": _plan_data(plan, body_revisions),
         "context": _context_data(context),
         "scheduler": scheduler,
+        "search_settings": dict(search_settings or {}),
         "toolchain": dict(toolchain or {}) or _toolchain_versions(),
         # Timed kernels write stamps past the barrier state of an untimed buffer.
         "phase_timer_slots": PHASE_TIMER_SLOTS,

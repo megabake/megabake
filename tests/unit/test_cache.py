@@ -139,3 +139,19 @@ def test_plan_cache_reuses_compiled_artifact_and_stores_diagnostics():
     assert first.diagnostics == {"selected": "test-plan"}
     assert compilations == 1
     assert cache.hits == 1 and cache.misses == 1
+
+
+def test_plan_key_includes_search_budget_and_candidate_revisions():
+    class Model(torch.nn.Module):
+        def forward(self, source):
+            return source + 1
+
+    plan, context = _selected_plan(Model(), torch.randn(4))
+    first = make_plan_key(plan, context, search_settings={"max_plans": 1})
+    assert first != make_plan_key(plan, context, search_settings={"max_plans": 8})
+    assert first != make_plan_key(
+        plan,
+        context,
+        search_settings={"max_plans": 1},
+        body_revisions=(("test", "new", "source_semantics"),),
+    )

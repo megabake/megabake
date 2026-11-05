@@ -21,6 +21,7 @@ import contextlib
 import gc
 import json
 import statistics
+import subprocess
 import sys
 import time
 import traceback
@@ -31,8 +32,17 @@ import torch
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import megabake
 from benchmarks.measure import kernel_trace
 from benchmarks.stateful_models import StatefulCausalLM, layer_types, text_config
+
+_EXPECTED_SOURCE = Path(__file__).resolve().parents[1] / "src" / "megabake"
+if Path(megabake.__file__).resolve().parent != _EXPECTED_SOURCE:
+    raise RuntimeError(
+        f"Benchmark imported {megabake.__file__}; expected {_EXPECTED_SOURCE}. "
+        "Run with PYTHONPATH=src:. from the intended checkout."
+    )
+
 from megabake import graphed, make_backend
 from megabake.fx_handler.hf_attention import (
     ATTENTION_IMPLEMENTATION,
@@ -364,6 +374,25 @@ def bench_decode(model, args) -> dict:
 
 
 def bench_decode_contexts(model, args) -> dict:
+    if args.context_capacity == "shared":
+        return _bench_context_group(model, args)
+    results = {"contexts": sorted(args.decode_contexts), "capacity_by_context": {}}
+    for context in sorted(args.decode_contexts):
+        current = argparse.Namespace(**vars(args))
+        current.decode_contexts = [context]
+        current.out = args.out / f"context-{context}"
+        report = _bench_context_group(model, current)
+        results["capacity_by_context"][str(context)] = report["capacity"]
+        for variant in args.variants:
+            row = report.get(variant, {})
+            if "error" in row:
+                results.setdefault(variant, {})[str(context)] = row
+            elif str(context) in row:
+                results.setdefault(variant, {})[str(context)] = row[str(context)]
+    return results
+
+
+def _bench_context_group(model, args) -> dict:
     """Decode with ``--decode-contexts`` tokens already cached.
 
     Every wrapper keeps an int32 valid length per attention layer; setting
@@ -372,7 +401,8 @@ def bench_decode_contexts(model, args) -> dict:
     once at the capacity of the largest context and is timed at every L.
     """
     contexts = sorted(args.decode_contexts)
-    capacity = contexts[-1] + 2 * args.samples + 8
+    required = contexts[-1] + 2 * args.samples + args.warmup + 4
+    capacity = ((required + 127) // 128) * 128
     stateful, state_shapes = decode_module(model, capacity)
     token = torch.tensor([[504]], device="cuda")
     variants = {
@@ -426,15 +456,21 @@ def bench_decode_contexts(model, args) -> dict:
                     # inside the loop would synchronize every call.
                     positions = [
                         torch.tensor([[context + offset]], device="cuda")
-                        for offset in range(2 * args.samples + 4)
+                        for offset in range(2 * args.samples + args.warmup)
                     ]
+                    # Identical nonzero KV contents across variants and rounds.
+                    # Initialization is outside both timing windows.
+                    torch.manual_seed(20261105)
+                    for tensor in state:
+                        if tensor.is_floating_point():
+                            tensor.normal_(mean=0.0, std=0.02)
                     for length in lengths:
                         length.fill_(context)
-                    for position in positions[:4]:
+                    for position in positions[: args.warmup]:
                         function(token, position, *state)
                     torch.cuda.synchronize()
                     complete = []
-                    for position in positions[4 : 4 + args.samples]:
+                    for position in positions[args.warmup : args.warmup + args.samples]:
                         torch.cuda.synchronize()
                         started = time.perf_counter()
                         function(token, position, *state)
@@ -445,7 +481,7 @@ def bench_decode_contexts(model, args) -> dict:
                             lambda position=position, function=function, state=state: function(
                                 token, position, *state
                             )
-                            for position in positions[4 + args.samples :]
+                            for position in positions[args.warmup + args.samples :]
                         ]
                     )
                     rows[str(context)] = {
@@ -477,6 +513,20 @@ def _bench_model(name: str, revision: str | None, args: argparse.Namespace) -> N
         "layer_types": sorted(set(layer_types(model))),
         "gpu": torch.cuda.get_device_name(),
         "samples": args.samples,
+        "provenance": {
+            "source": str(Path(megabake.__file__).resolve()),
+            "checkpoint_revision": getattr(model.config, "_commit_hash", None),
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "compute_capability": torch.cuda.get_device_capability(),
+            "warmup": args.warmup,
+            "git_revision": subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=_EXPECTED_SOURCE, text=True
+            ).strip(),
+            "git_diff": subprocess.check_output(
+                ["git", "diff", "HEAD"], cwd=_EXPECTED_SOURCE, text=True
+            ),
+        },
     }
     for mode in args.modes:
         report[mode] = (bench_prefill if mode == "prefill" else bench_decode)(model, args)
@@ -527,6 +577,9 @@ def main() -> None:
         nargs="*",
         default=[],
         help="also time decode with this many tokens already cached (e.g. 512 2048)",
+    )
+    parser.add_argument(
+        "--context-capacity", choices=("per-context", "shared"), default="per-context"
     )
     parser.add_argument("--out", type=Path, default=Path("artifacts/full_model"))
     args = parser.parse_args()

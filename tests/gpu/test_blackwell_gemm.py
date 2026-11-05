@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 from cuda.bindings import driver as cuda
@@ -21,10 +23,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize(
+    "body_name",
+    [None, "sm12x_mma_16x32x16", "sm12x_gemv_warp4"],
+)
 @pytest.mark.parametrize("strided_input", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("shape", [(1, 32, 64), (5, 33, 70), (32, 64, 128)])
-def test_blackwell_mma_tails_and_rebinding(tmp_path, dtype, shape, strided_input):
+def test_blackwell_mma_tails_and_rebinding(tmp_path, dtype, shape, strided_input, body_name):
     m, n, k = shape
 
     class Gemm(torch.nn.Module):
@@ -47,7 +53,12 @@ def test_blackwell_mma_tails_and_rebinding(tmp_path, dtype, shape, strided_input
     )
     candidates = provider.get_candidates(region, target, SelectionPolicy())
     assert candidates.configurations, candidates.rejections
-    config = candidates.configurations[0]
+    config = next(
+        (item for item in candidates.configurations if body_name is None or item.name == body_name),
+        None,
+    )
+    if config is None:
+        pytest.skip("body is unavailable for this architecture or shape")
     body = provider.emit(region.tensor_programs[0], config)
     path = tmp_path / "blackwell_body.py"
     path.write_text(body.source)
@@ -91,6 +102,11 @@ def test_blackwell_complete_mlp_one_kernel_and_private_isolated_state(tmp_path, 
             (result.float() - reference.float()).norm() / reference.float().norm()
         ).item() < 0.01
         compiled = backend.megabake_last_compiled
+        search_reports = list(tmp_path.rglob("plan_search.json"))
+        assert search_reports
+        report = json.loads(search_reports[-1].read_text())
+        assert report["selected"] == compiled.search.selected_description
+        assert any(candidate["status"] == "measured" for candidate in report["candidates"])
         gemm_provider = (
             "sm12x_mma" if torch.cuda.get_device_capability()[0] == 12 else "blackwell_mma"
         )
