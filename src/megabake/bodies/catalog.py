@@ -3,6 +3,7 @@ those of the GPU generation its architecture belongs to."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from ..graph import ComputeGraph, Region
@@ -16,12 +17,20 @@ from .interface import (
     InvalidBodyConfig,
     ProviderRejection,
     SelectionPolicy,
+    TableGemmProvider,
     TargetFacts,
     validate_body_config,
 )
 
 GENERIC: tuple[BodyProvider, ...] = (GenericBodyProvider(),)
-GENERATIONS: tuple[Generation, ...] = (sm90.GENERATION, sm100.GENERATION)
+GENERATIONS: tuple[Generation, ...] = (
+    replace(
+        sm90.GENERATION,
+        target_aliases={"sm90": "sm90a"},
+        supports_wgmma=True,
+    ),
+    sm100.GENERATION,
+)
 
 
 def generation(target: TargetFacts) -> Generation | None:
@@ -42,6 +51,54 @@ def provider(name: str) -> BodyProvider:
         if candidate.provider_name == name:
             return candidate
     raise KeyError(f"no body provider named {name!r}")
+
+
+def table_gemm(name: str) -> TableGemmProvider | None:
+    """The table GEMM implementation for a body, if it uses that contract."""
+    return next(
+        (item for found in GENERATIONS for item in found.table_gemms if item.provider_name == name),
+        None,
+    )
+
+
+def is_table_gemm(name: str) -> bool:
+    """Recognize the original Hopper GEMM and registered table implementations."""
+    return name == sm90.G0RangeBodyProvider.provider_name or table_gemm(name) is not None
+
+
+def supported_architecture(architecture: str) -> bool:
+    return any(architecture in found.architectures for found in GENERATIONS)
+
+
+def tuner_for_device():
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("tuning requires a CUDA device")
+    target = cuda_target(torch.cuda.get_device_properties(torch.cuda.current_device()))
+    found = generation(target)
+    if found is None or found.tuner is None:
+        raise RuntimeError(f"no tuning provider for {target.architecture}")
+    return found.tuner
+
+
+def cuda_target(properties: Any) -> TargetFacts:
+    """Translate CUDA device properties to the registered generation's facts."""
+    architecture = f"sm{properties.major}{properties.minor}"
+    for found in GENERATIONS:
+        normalized = found.target_aliases.get(architecture, architecture)
+        if normalized in found.architectures:
+            return TargetFacts(
+                architecture=normalized,
+                threads_per_warp=properties.warp_size,
+                max_threads_per_cta=properties.max_threads_per_block,
+                max_shared_memory_per_cta=properties.shared_memory_per_block_optin,
+                max_registers_per_thread=255,
+                multiprocessor_count=properties.multi_processor_count,
+                supports_tma=True,
+                supports_wgmma=found.supports_wgmma,
+            )
+    raise ValueError(f"unsupported CUDA architecture {architecture}")
 
 
 def launch_options(graph: ComputeGraph, target: TargetFacts, table_launch: bool) -> Any:

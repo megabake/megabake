@@ -7,6 +7,7 @@ from math import prod
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Protocol
 
+from .bodies.catalog import is_table_gemm
 from .bodies.interface import (
     AxisExpression,
     BodyConfig,
@@ -713,7 +714,7 @@ def _projected_shared_memory(plan: KernelPlan) -> int:
             phase.body.scratch.size_bytes,
         )
         for phase in plan.phases
-        if phase.body.provider == "g0_range"
+        if is_table_gemm(phase.body.provider)
     }
     g0_bytes = sum(variant[3] for variant in g0_variants)
     phase_sizes = {
@@ -724,7 +725,7 @@ def _projected_shared_memory(plan: KernelPlan) -> int:
         (
             phase_sizes.get(phase.region_id, 0)
             for phase in plan.phases
-            if phase.body.provider != "g0_range"
+            if not is_table_gemm(phase.body.provider)
         ),
         default=0,
     )
@@ -740,7 +741,7 @@ def _selection_projected_shared_memory(selection: BodySelectionPlan) -> int:
             selected.body.scratch.size_bytes,
         )
         for selected in selection.selections
-        if selected.body.provider == "g0_range"
+        if is_table_gemm(selected.body.provider)
     }
     if not g0_variants:
         return 0
@@ -749,7 +750,7 @@ def _selection_projected_shared_memory(selection: BodySelectionPlan) -> int:
         (
             selected.resources.shared_memory_bytes
             for selected in selection.selections
-            if selected.body.provider != "g0_range"
+            if not is_table_gemm(selected.body.provider)
         ),
         default=0,
     )

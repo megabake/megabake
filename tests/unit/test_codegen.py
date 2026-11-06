@@ -138,6 +138,29 @@ def test_emit_cute_puts_g0_inside_one_cooperative_kernel(tmp_path):
     assert "launch = body" not in generated.source
 
 
+def test_emit_cute_table_dispatches_the_registered_gemm_body(tmp_path):
+    class Model(torch.nn.Module):
+        def forward(self, source, weight):
+            return source @ weight.T
+
+    inputs = (
+        torch.randn(4, 576, dtype=torch.bfloat16),
+        torch.randn(1536, 576, dtype=torch.bfloat16),
+    )
+    prepared = prepare_fx_graph(torch.export.export(Model(), inputs).graph_module, inputs)
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
+    selection = select_bodies(graph, _target(), SelectionPolicy(table_launch=True))
+    plan = assign_storage(make_phase_schedule(selection, derive_dependencies(selection)))
+
+    generated = emit_cute(plan, tmp_path, table=True)
+
+    ast.parse(generated.source)
+    assert any(phase.provider == "g0_range" for phase in generated.launch.phases)
+    assert "HopperWgmmaGemmPersistentKernel(" in generated.source
+    assert "build_table_descriptors(" in generated.source
+    assert generated.launch.gemm_table
+
+
 def test_emit_cute_reuses_g0_scratch_for_duplicate_body_variants(tmp_path):
     class Model(torch.nn.Module):
         def forward(self, source, weight, other_weight):

@@ -8,6 +8,7 @@ therefore approximate, while interval totals are exact.
 
     .venv/bin/python tools/phase_profile.py --model HuggingFaceTB/SmolLM-1.7B --mode prefill
     .venv/bin/python tools/phase_profile.py --mode decode --skip-accuracy-gate
+    .venv/bin/python tools/phase_profile.py --tune-model --model HuggingFaceTB/SmolLM-1.7B --out tuning.json
 
 With --cta every CTA also stamps when its work in each phase is done and when
 it leaves the phase's barrier, which splits each barrier interval into the
@@ -39,6 +40,7 @@ from megabake import (
     compiler,
     make_backend,
 )
+from megabake.bodies.catalog import is_table_gemm, tuner_for_device
 from megabake.runtime import (
     CTA_TIMER_STRIDE,
     GRID_TIMER_SLOTS,
@@ -69,7 +71,7 @@ class _DecodeStepRunner:
 
 def _category(phase) -> str:
     name = re.sub(r"_\d+x\d+$", "", phase.body.name)
-    if phase.body.tiles.mma_family == "wgmma":
+    if phase.body.tiles.mma_family is not None:
         return f"{name} (tensor-core GEMM)"
     kind = phase.region_id.rsplit(":", 1)[-1]
     if kind.startswith(("mm", "bmm", "addmm")) or kind in name:
@@ -108,6 +110,9 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
     release latency runs from the last CTA's arrival to the first CTA's exit.
     """
     phases = compiled.plan.phases
+    programs = {
+        selection.region_id: selection.program for selection in compiled.plan.selection.selections
+    }
     barriers = [row[1] != 0 for row in compiled.generated.launch.phase_table]
     samples = []
     for _ in range(calls):
@@ -155,19 +160,32 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
             times.append(per_cta[-1])
             fastest.append(per_cta[0])
             typical.append(per_cta[len(per_cta) // 2])
-        phase_rows.append(
-            {
-                "index": index,
-                "us": median(times) / 1e3,
-                # A CTA without tiles in the phase still walks it: these are
-                # the fastest and the median CTA's time for the phase.
-                "fastest_cta_us": median(fastest) / 1e3,
-                "median_cta_us": median(typical) / 1e3,
-                "phase": f"{_category(phase)} tiles={len(phase.work_items)}",
-                "recompute": phase.recompute,
-                "barrier": barriers[index],
-            }
-        )
+        row = {
+            "index": index,
+            "us": median(times) / 1e3,
+            # A CTA without tiles in the phase still walks it: these are
+            # the fastest and the median CTA's time for the phase.
+            "fastest_cta_us": median(fastest) / 1e3,
+            "median_cta_us": median(typical) / 1e3,
+            "phase": f"{_category(phase)} tiles={len(phase.work_items)}",
+            "recompute": phase.recompute,
+            "barrier": barriers[index],
+        }
+        program = programs.get(phase.region_id)
+        if is_table_gemm(phase.body.provider) and program is not None:
+            from megabake.bodies.gemm import split_k
+
+            reduction = next(
+                domain.size
+                for domain in program.iteration_domains
+                if domain.axis in program.reduction_axes
+            )
+            row.update(
+                gemm_shape=[*program.store.shape, reduction],
+                feature_tile=phase.body.tiles.cta_shape[1],
+                split_k=split_k(phase.body),
+            )
+        phase_rows.append(row)
     totals = {
         key: sum(row[key] for row, _ in intervals) / 1e3
         for key in ("span", "critical", "mean_busy", "straggler_wait", "release")
@@ -242,7 +260,7 @@ def profile(callable_, compiled, run, calls: int) -> dict:
             counts[_category(phase)] += 1
     total = sum(duration for duration, _ in intervals)
     gemm_tiles = collections.Counter(
-        len(phase.work_items) for phase in phases if phase.body.tiles.mma_family == "wgmma"
+        len(phase.work_items) for phase in phases if phase.body.tiles.mma_family is not None
     )
     return {
         "workers": compiled.plan.launch.grid_size,
@@ -273,9 +291,16 @@ def main() -> None:
     parser.add_argument("--model", default=SMOLLM_MODEL_NAME)
     parser.add_argument("--revision")
     parser.add_argument("--mode", choices=("prefill", "decode"), default="prefill")
+    parser.add_argument("--prompt-tokens", type=int, default=len(PROMPT))
     parser.add_argument("--attention", choices=("eager", "megabake"), default="eager")
     parser.add_argument("--capacity", type=int, default=128)
     parser.add_argument("--calls", type=int, default=9)
+    parser.add_argument("--tune-model", action="store_true", help="sweep GEMM choices for decode")
+    parser.add_argument("--profile-timeout", type=int, default=480)
+    parser.add_argument("--tiles", nargs="+", choices=("auto", "64", "128"), default=("64", "128"))
+    parser.add_argument(
+        "--split-limits", nargs="+", choices=("1", "2", "4", "8"), default=("1", "2", "4", "8")
+    )
     parser.add_argument("--out", type=Path)
     parser.add_argument(
         "--cta", action="store_true", help="also split intervals into work and wait per CTA"
@@ -286,6 +311,11 @@ def main() -> None:
         help="profile a plan even if it fails the accuracy check (diagnostic only)",
     )
     args = parser.parse_args()
+    if args.tune_model:
+        tuner_for_device().tune_model(args, Path(__file__).resolve())
+        return
+    if args.prompt_tokens < 1:
+        parser.error("--prompt-tokens must be positive")
     if args.skip_accuracy_gate:
         compiler._TABLE_PLAN_RELATIVE_L2_LIMIT = float("inf")
         compiler._PLAN_RELATIVE_L2_LIMIT = float("inf")
@@ -294,7 +324,8 @@ def main() -> None:
     backend = make_backend(mode=args.mode, compile_kernel=True, cache=False, scheduler="phase")
     with torch.no_grad():
         if args.mode == "prefill":
-            ids = torch.tensor([PROMPT], device="cuda")
+            prompt = (PROMPT * -(-args.prompt_tokens // len(PROMPT)))[: args.prompt_tokens]
+            ids = torch.tensor([prompt], device="cuda")
             mask = torch.ones_like(ids)
             compiled_model = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
             run = functools.partial(compiled_model, ids, attention_mask=mask)
@@ -323,6 +354,7 @@ def main() -> None:
         report = {
             "model": args.model,
             "mode": args.mode,
+            "prompt_tokens": args.prompt_tokens if args.mode == "prefill" else None,
             **profile(callable_, compiled, run, args.calls),
         }
         if args.cta:

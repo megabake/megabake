@@ -18,8 +18,8 @@ import torch
 from torch.utils import _pytree as pytree
 
 from .bodies import SelectionPolicy, TargetFacts
-from .bodies.catalog import launch_options
-from .bodies.cuda.sm90.gemm import TABLE_DESCRIPTORS_PER_GEMM, cute_gemm_tensors, is_swap_ab
+from .bodies.catalog import cuda_target, is_table_gemm, launch_options
+from .bodies.gemm import TABLE_DESCRIPTORS_PER_GEMM, cute_gemm_tensors, is_swap_ab
 from .cache import PlanCache, make_plan_key
 from .codegen import GEMM_SECOND_A_COLUMN, GeneratedCuTeModule, emit_cute
 from .diagnostics import CompilerDiagnostic, CompilerError
@@ -1027,6 +1027,10 @@ class GraphedCall:
 
     def __init__(self, function: Callable[..., Any], args: tuple[Any, ...], warmup: int):
         global _graph_capture
+        # CUDA graph nodes retain kernel handles, not the Python objects that
+        # own their compiled modules and model weights. Keep those owners alive
+        # for at least as long as the graph can be replayed.
+        self._function = function
         self._inputs, self._spec = pytree.tree_flatten(args)
         saved = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in self._inputs]
         side = torch.cuda.Stream()
@@ -1249,6 +1253,8 @@ def _search_scheduler(
     reset_state: Callable[[], None] | None = None,
     teacher_check: _TeacherForcedCheck | None = None,
 ):
+    if policy is not None:
+        policy = replace(policy, event_schedule=scheduler == "region-events")
     evaluator = (
         budget.evaluator
         if scheduler == "phase" and budget.evaluator is not None
@@ -1467,21 +1473,10 @@ def _target_facts(device: torch.device) -> TargetFacts:
     if device.type != "cuda":
         raise UnsupportedCompiler("MegaBake generated kernels require CUDA")
     properties = torch.cuda.get_device_properties(device)
-    architecture = f"sm{properties.major}{properties.minor}"
-    if architecture not in {"sm90", "sm100", "sm103", "sm120", "sm121"}:
-        raise UnsupportedCompiler(
-            f"generated CuTe kernels require SM90 or Blackwell SM100/103/120/121; found {architecture}"
-        )
-    return TargetFacts(
-        architecture="sm90a" if architecture == "sm90" else architecture,
-        threads_per_warp=properties.warp_size,
-        max_threads_per_cta=properties.max_threads_per_block,
-        max_shared_memory_per_cta=properties.shared_memory_per_block_optin,
-        max_registers_per_thread=255,
-        multiprocessor_count=properties.multi_processor_count,
-        supports_tma=True,
-        supports_wgmma=architecture == "sm90",
-    )
+    try:
+        return cuda_target(properties)
+    except ValueError as error:
+        raise UnsupportedCompiler(str(error)) from error
 
 
 def _common_cuda_device(example_inputs: Sequence[Any]) -> torch.device:
@@ -2052,7 +2047,7 @@ class _RuntimeState:
         g0_tensors = tuple(
             _g0_operands(phase.body, selected, plan.graph, input_tensors, values)
             for phase in plan.phases
-            if phase.body.provider == "g0_range"
+            if is_table_gemm(phase.body.provider)
             and (not table_launch or phase.index in template_phases)
             for selected in plan.selection.selections
             if selected.region_id == phase.region_id

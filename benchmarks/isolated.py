@@ -4,6 +4,8 @@ Graph replay and megabake_fast use prebuilt launches with fixed tensors.
 megabake_call additionally includes CuTe argument marshalling; megabake_bound
 includes the complete public-call binding and allocation overhead.
 
+    .venv/bin/python benchmarks/isolated.py --tune-shapes 2048x8192 --output tuning.json
+
     eager_graph      CUDA Graph replay of the eager kernels
     inductor_graph   CUDA Graph replay of the torch.compile (Inductor) kernels
     megabake_fast    prebuilt CuTe execution arguments, launch entry only
@@ -32,6 +34,7 @@ if __package__ in {None, ""}:
 from benchmarks.measure import kernel_trace
 from benchmarks.workloads import mlp
 from megabake import make_backend
+from megabake.bodies.catalog import tuner_for_device
 from megabake.compiler import _initial_ready, _input_tensors, _RuntimeState
 
 
@@ -204,7 +207,18 @@ def main() -> None:
     parser.add_argument("--burst", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=16)
     parser.add_argument("--scheduler", choices=("auto", "phase", "region-events"), default="auto")
+    parser.add_argument(
+        "--tune-shapes", nargs="+", help="output features x reduction, e.g. 2048x8192"
+    )
+    parser.add_argument("--tune-rows", type=int, default=1)
+    parser.add_argument("--tune-cache-mib", type=int, default=256)
+    parser.add_argument(
+        "--tune-split-limits", nargs="+", choices=("1", "2", "4", "8"), default=("1", "2", "4", "8")
+    )
     arguments = parser.parse_args()
+    if arguments.tune_shapes:
+        tuner_for_device().tune_gemm(arguments)
+        return
     root = arguments.output.parent
     traces = root / "traces"
 
