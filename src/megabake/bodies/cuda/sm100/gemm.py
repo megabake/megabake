@@ -33,6 +33,69 @@ class BlackwellLaunchOptions:
     tma_gemm: bool = True
 
 
+def paired_contraction(program):
+    def reads_second(expression):
+        if isinstance(expression, Accumulator):
+            return expression.index == 1
+        return any(
+            reads_second(getattr(expression, name))
+            for name in ("operand", "lhs", "rhs", "condition", "true_value", "false_value")
+            if getattr(expression, name, None) is not None
+        )
+
+    return program.post is not None and reads_second(program.post)
+
+
+def epilogue_loads(program):
+    return program.loads[3:] if paired_contraction(program) else program.loads[2:]
+
+
+def epilogue_source(program, symbol):
+    from ..generic import _cast_expression, _emit_expression
+
+    loads = epilogue_loads(program)
+    value = _cast_expression(
+        _emit_expression(
+            program.post,
+            {load.id: index for index, load in enumerate(loads)},
+            {"o0": "o0", "o1": "o1"},
+            tuple(loads),
+        ),
+        program.store.dtype,
+    )
+    return (
+        "@cute.jit\n"
+        f"def {symbol}(accumulator, accumulator_1, o0, o1, tensor_bindings):\n"
+        f"    return {value.code}\n"
+    )
+
+
+def split_k(body):
+    match = re.search(r"_k(\d+)(?:_epilogue)?$", body.name)
+    return int(match.group(1)) if match else 1
+
+
+def cute_gemm_tensors(a, b, c, splits=1):
+    from cutlass.cute.runtime import from_dlpack
+
+    if splits != 1:
+        raise ValueError("SM100 TMA descriptors require full operands")
+    if a.ndim > 2:
+        a = a.reshape(-1, a.shape[-1])
+    if b.ndim > 2:
+        b = b.reshape(-1, b.shape[-1])
+    if any(tensor.data_ptr() % 16 for tensor in (a, b, c)):
+        raise ValueError("GEMM tensor base addresses must be 16-byte aligned")
+
+    def view(tensor):
+        leading_dim = next(index for index, stride in enumerate(tensor.stride()) if stride == 1)
+        return from_dlpack(tensor.unsqueeze(-1), assumed_align=16).mark_layout_dynamic(
+            leading_dim=leading_dim
+        )
+
+    return view(a), view(b), view(c)
+
+
 def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
     """Return the short-row body when its contracts hold."""
     mode_enabled = policy.mode == "prefill" or (
@@ -170,7 +233,6 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
 
 def _epilogue_rejection(program, policy):
     from ....ir import AxisAffine
-    from ...gemm import epilogue_loads, epilogue_source, paired_contraction
     from ..generic import UnsupportedMapBody
 
     if not policy.table_launch:

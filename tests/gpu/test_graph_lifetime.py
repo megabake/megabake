@@ -1,4 +1,4 @@
-"""A captured graph must keep its compiled callable and kernel module alive."""
+"""Captured graphs retain the compiled callable that owns their kernels."""
 
 import gc
 import weakref
@@ -15,9 +15,6 @@ pytestmark = pytest.mark.skipif(
 def test_graphed_keeps_compiled_callable_alive(monkeypatch, tmp_path):
     from megabake import compiler, graphed, make_backend
 
-    monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
-    monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
-    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "0")
     monkeypatch.setattr(compiler, "_TABLE_LAUNCH_OPS", 0)
 
     class Gemm(torch.nn.Module):

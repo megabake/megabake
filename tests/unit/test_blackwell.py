@@ -122,7 +122,7 @@ def test_sm100_short_row_candidates_respect_rows_and_architecture(monkeypatch, r
     "persistent,stages,width", [(False, 1, 128), (True, 1, 256), (True, 2, 256), (True, 1, 128)]
 )
 def test_sm100_persistent_contract_variants(monkeypatch, persistent, stages, width):
-    from megabake.bodies.cuda.sm100.table import TABLE_GEMM
+    from megabake.bodies.cuda.sm100 import table as sm100_table
 
     monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
@@ -145,8 +145,8 @@ def test_sm100_persistent_contract_variants(monkeypatch, persistent, stages, wid
     body = next(c for c in candidates.configurations if c.provider == "sm100_tma")
     assert body.participants.participating_threads == width
     assert (f"_persistent{stages}" in body.name) is persistent
-    definition = TABLE_GEMM.table_definition(
-        {"symbol": "gemm", "splits": 1}, (128, 8), "", False, 0
+    definition = sm100_table.table_definition(
+        {"symbol": "gemm", "splits": 1}, (128, 8), ""
     )
     assert ("Sm100PersistentGemm" in definition) is (persistent and width == 256)
     assert ("warp_specialized=True" in definition) is (persistent and width == 128)
@@ -156,38 +156,38 @@ def test_sm100_persistent_contract_variants(monkeypatch, persistent, stages, wid
 
 
 def test_sm100_128_thread_variant_rejects_two_accumulator_stages(monkeypatch):
-    from megabake.bodies.cuda.sm100.table import TABLE_GEMM
+    from megabake.bodies.cuda.sm100 import table as sm100_table
 
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1")
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", "128")
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_STAGES", "2")
     with pytest.raises(ValueError, match="requires one accumulator stage"):
-        TABLE_GEMM.table_definition({"symbol": "gemm", "splits": 1}, (128, 8), "", False, 0)
+        sm100_table.table_definition({"symbol": "gemm", "splits": 1}, (128, 8), "")
 
 
 @pytest.mark.parametrize("stages", [1, 2])
 def test_sm100_cutlass_fork_requires_256_threads(monkeypatch, stages):
-    from megabake.bodies.cuda.sm100.table import TABLE_GEMM
+    from megabake.bodies.cuda.sm100 import table as sm100_table
 
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1")
     monkeypatch.setenv("MEGABAKE_SM100_CUTLASS_FORK", "1")
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_STAGES", str(stages))
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", "256")
-    definition = TABLE_GEMM.table_definition(
-        {"symbol": "gemm", "splits": 1}, (128, 8), "", False, 0
+    definition = sm100_table.table_definition(
+        {"symbol": "gemm", "splits": 1}, (128, 8), ""
     )
     assert "Sm100CutlassForkGemm" in definition
     assert f"acc_stages={stages}" in definition
-    assert "Sm100CutlassForkGemm" in TABLE_GEMM.table_import
+    assert "Sm100CutlassForkGemm" in sm100_table.table_import()
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", "128")
     with pytest.raises(ValueError, match="requires 256 threads"):
-        TABLE_GEMM.table_definition({"symbol": "gemm", "splits": 1}, (128, 8), "", False, 0)
+        sm100_table.table_definition({"symbol": "gemm", "splits": 1}, (128, 8), "")
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "0")
-    assert "Sm100CutlassForkGemm" not in TABLE_GEMM.table_import
+    assert "Sm100CutlassForkGemm" not in sm100_table.table_import()
 
 
 def test_sm100_persistent_defaults_to_cutlass_fork(monkeypatch):
-    from megabake.bodies.cuda.sm100.table import TABLE_GEMM
+    from megabake.bodies.cuda.sm100 import table as sm100_table
 
     monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
     monkeypatch.delenv("MEGABAKE_SM100_PERSISTENT", raising=False)
@@ -211,8 +211,8 @@ def test_sm100_persistent_defaults_to_cutlass_fork(monkeypatch):
     )
     body = next(c for c in candidates.configurations if c.provider == "sm100_tma")
     assert body.participants.participating_threads == 256
-    definition = TABLE_GEMM.table_definition(
-        {"symbol": "gemm", "splits": 1}, (128, 8), "", False, 0
+    definition = sm100_table.table_definition(
+        {"symbol": "gemm", "splits": 1}, (128, 8), ""
     )
     assert "Sm100CutlassForkGemm" in definition and "acc_stages=1" in definition
 
@@ -379,7 +379,7 @@ def test_sm100_tuning_fingerprint_separates_persistent_variants(monkeypatch):
 
 
 def test_sm100_measured_choice_controls_tile_and_split(monkeypatch):
-    from megabake.bodies.gemm import split_k
+    from megabake.bodies.cuda.sm100.gemm import split_k
     from megabake.bodies.cuda.sm100 import tuning
 
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
@@ -411,7 +411,7 @@ def test_sm100_measured_choice_controls_tile_and_split(monkeypatch):
 
 @pytest.mark.parametrize("columns, expected", [(2048, 2), (8192, 1)])
 def test_sm100_split_limit_avoids_second_wave(monkeypatch, columns, expected):
-    from megabake.bodies.gemm import split_k
+    from megabake.bodies.cuda.sm100.gemm import split_k
 
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN_TILE", "128")

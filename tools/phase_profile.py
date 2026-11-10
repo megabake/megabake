@@ -40,7 +40,8 @@ from megabake import (
     compiler,
     make_backend,
 )
-from megabake.bodies.catalog import is_table_gemm, tuner_for_device
+from megabake.bodies.catalog import is_table_gemm, table_gemm, tuner_for_device
+from megabake.bodies.cuda.sm90.gemm import split_k
 from megabake.runtime import (
     CTA_TIMER_STRIDE,
     GRID_TIMER_SLOTS,
@@ -173,8 +174,7 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
         }
         program = programs.get(phase.region_id)
         if is_table_gemm(phase.body.provider) and program is not None:
-            from megabake.bodies.gemm import split_k
-
+            gemm_impl = table_gemm(phase.body.provider)
             reduction = next(
                 domain.size
                 for domain in program.iteration_domains
@@ -183,7 +183,9 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
             row.update(
                 gemm_shape=[*program.store.shape, reduction],
                 feature_tile=phase.body.tiles.cta_shape[1],
-                split_k=split_k(phase.body),
+                split_k=split_k(phase.body)
+                if gemm_impl is None
+                else gemm_impl.gemm.split_k(phase.body),
             )
         phase_rows.append(row)
     totals = {

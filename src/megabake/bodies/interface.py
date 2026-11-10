@@ -212,34 +212,6 @@ class BodyProvider(Protocol):
         launch shares one block size."""
 
 
-class TableGemmProvider(Protocol):
-    """Launch and code-generation contract for a table-driven GEMM body."""
-
-    provider_name: str
-    requires_table: bool
-    supports_streaming: bool
-    supports_mixed_tiles: bool
-    full_operand_descriptors: bool
-    direct_store_with_splits: bool
-    table_import: str
-    generic_import: str
-
-    def table_definition(
-        self,
-        spec: Mapping[str, Any],
-        tile: tuple[int, int],
-        epilogues: str,
-        streaming: bool,
-        stream_stages: int,
-    ) -> str: ...
-
-    def generic_definition(
-        self, symbol: str, tile: tuple[int, ...], cluster: tuple[int, ...]
-    ) -> str: ...
-
-    def source_object(self) -> Any: ...
-
-
 @dataclass(frozen=True)
 class Generation:
     """The providers a GPU generation adds to the generic ones."""
@@ -248,10 +220,6 @@ class Generation:
     providers: tuple[BodyProvider, ...]
     # The ``SelectionPolicy.target_options`` of a graph: (graph, table_launch).
     launch_options: Callable[[ComputeGraph, bool], Any] | None = None
-    table_gemms: tuple[TableGemmProvider, ...] = ()
-    target_aliases: Mapping[str, str] = field(default_factory=dict)
-    supports_wgmma: bool = False
-    tuner: Any = None
 
 
 def widened_participants(config: BodyConfig, threads: int) -> ParticipantContract:

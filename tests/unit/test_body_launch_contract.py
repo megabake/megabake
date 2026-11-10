@@ -1,39 +1,103 @@
 import ast
-from dataclasses import replace
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from megabake.bodies import SelectionPolicy, catalog
-from megabake.compiler import _search_scheduler
+from megabake.compiler import UnsupportedCompiler, _search_scheduler, _target_facts
 from megabake.plan import PlanSearchResult, SearchBudget
 from megabake.planner import _contraction_body_order
 
 
-def test_table_gemm_contracts_are_registered_with_their_generations():
-    blackwell = catalog.table_gemm("sm100_tma")
+def test_sm100_table_dispatch_keeps_hopper_on_its_existing_path():
+    from megabake.bodies.cuda.sm100 import table
+
     assert catalog.is_table_gemm("g0_range")
     assert catalog.table_gemm("g0_range") is None
-    assert blackwell is not None
-    assert blackwell.requires_table
-    assert not blackwell.supports_streaming
-    assert blackwell.supports_mixed_tiles
-    assert blackwell.full_operand_descriptors
-    assert blackwell.direct_store_with_splits
+    assert catalog.is_table_gemm("sm100_tma")
+    assert catalog.table_gemm("sm100_tma") is table
+    assert table.DESCRIPTORS_PER_GEMM == 4
     assert not catalog.is_table_gemm("generic")
     assert catalog.table_gemm("generic") is None
 
 
-def test_table_gemm_registry_accepts_a_new_generation_body(monkeypatch):
-    extra = SimpleNamespace(provider_name="new_gemm")
-    first = catalog.GENERATIONS[0]
-    monkeypatch.setattr(
-        catalog,
-        "GENERATIONS",
-        (replace(first, table_gemms=(*first.table_gemms, extra)), *catalog.GENERATIONS[1:]),
+def test_sm100_split_k_does_not_replace_hopper_helper():
+    from megabake.bodies.cuda.sm100.gemm import split_k as sm100_split_k
+    from megabake.bodies.cuda.sm90.gemm import split_k as hopper_split_k
+
+    hopper = SimpleNamespace(name="g0_range_swapab_16x64_k4_bias")
+    sm100 = SimpleNamespace(name="sm100_tma_swapab_8x128_persistent1_fork_k8_epilogue")
+    assert hopper_split_k(hopper) == 4
+    assert hopper_split_k(sm100) == 1
+    assert sm100_split_k(sm100) == 8
+
+
+def test_sm100_table_codegen_configuration():
+    from megabake.bodies.cuda.sm100 import table
+    from megabake.ir import Accumulator
+
+    body = SimpleNamespace(
+        name="sm100_tma_swapab_8x128_persistent1_fork_k8_epilogue",
+        tiles=SimpleNamespace(cta_shape=(8, 128, 64)),
     )
-    assert catalog.table_gemm("new_gemm") is extra
+    assert table.codegen_config(body, SimpleNamespace(post=None)) == (
+        (128, 8), 8, False, True, False, True
+    )
+    with pytest.raises(ValueError, match="paired contractions"):
+        table.codegen_config(body, SimpleNamespace(post=Accumulator("float32", index=1)))
+
+
+def test_sm100_table_owns_layout_and_launch_decisions():
+    from megabake.bodies.cuda.sm100 import table
+
+    table.validate_launch(None, True)
+    for schedule, enabled in ((None, False), (object(), True)):
+        with pytest.raises(ValueError, match="phase-table launch"):
+            table.validate_launch(schedule, enabled)
+    assert not table.supports_weight_streaming()
+    assert table.valid_tile_layout({73728}, {(128, 8), (64, 8)})
+    assert not table.valid_tile_layout({73728, 86016}, {(128, 8)})
+    assert table.needs_output_address({"swap_ab": True, "splits": 8})
+    assert not table.needs_output_address({"swap_ab": False, "splits": 1})
+    assert table.descriptor_splits((1, 4, 8)) == (1, 1, 1)
+
+    selection = object()
+    assert table.widen_selection(selection, 256) is selection
+    activation = torch.randn(1, 4)
+    weight = torch.randn(8, 4)
+    output = torch.randn(1, 8)
+    a, b, c = table.arrange_operands(activation, (weight,), output)
+    assert a is weight and b is activation
+    assert c.shape == (8, 1) and c.data_ptr() == output.data_ptr()
+
+
+@pytest.mark.parametrize(
+    ("persistent", "width", "fork", "filename"),
+    [
+        ("0", "256", "0", "tcgen_gemm.py"),
+        ("1", "128", "0", "tcgen_gemm.py"),
+        ("1", "256", "0", "persistent_gemm.py"),
+        ("1", "256", "1", "cutlass_gemm.py"),
+    ],
+)
+def test_sm100_source_map_uses_the_selected_body(monkeypatch, persistent, width, fork, filename):
+    from megabake.bodies.cuda.sm100 import table
+
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", persistent)
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", width)
+    monkeypatch.setenv("MEGABAKE_SM100_CUTLASS_FORK", fork)
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_STAGES", "1")
+    assert Path(inspect.getsourcefile(table.source_object())).name == filename
+
+
+def test_sm100_descriptors_require_full_operands():
+    from megabake.bodies.cuda.sm100.gemm import cute_gemm_tensors
+
+    with pytest.raises(ValueError, match="require full operands"):
+        cute_gemm_tensors(None, None, None, splits=2)
 
 
 def test_planner_accepts_provider_selection_priority():
@@ -48,18 +112,9 @@ def test_planner_accepts_provider_selection_priority():
 
 
 def test_core_dispatch_does_not_hardcode_table_gemm_providers():
-    body_names = {
-        body.provider_name for generation in catalog.GENERATIONS for body in generation.table_gemms
-    }
+    body_names = {"sm100_tma"}
     core = Path(__file__).resolve().parents[2] / "src" / "megabake"
-    provider_modules = {
-        type(body).__module__.rsplit(".", 1)[0]
-        for generation in catalog.GENERATIONS
-        for body in generation.table_gemms
-    }
-    hardware_modules = tuple(
-        provider_modules | {name.removeprefix("megabake.") for name in provider_modules}
-    )
+    hardware_modules = ("megabake.bodies.cuda.sm100", "bodies.cuda.sm100")
     for name in ("codegen.py", "compiler.py", "plan.py", "planner.py"):
         tree = ast.parse((core / name).read_text())
         for node in ast.walk(tree):
@@ -75,7 +130,7 @@ def test_core_dispatch_does_not_hardcode_table_gemm_providers():
     ("major", "minor", "architecture", "wgmma"),
     [(9, 0, "sm90a", True), (10, 0, "sm100", False), (12, 1, "sm121", False)],
 )
-def test_cuda_target_facts_come_from_generation(major, minor, architecture, wgmma):
+def test_cuda_target_facts_preserve_existing_architecture_mapping(monkeypatch, major, minor, architecture, wgmma):
     properties = SimpleNamespace(
         major=major,
         minor=minor,
@@ -84,15 +139,16 @@ def test_cuda_target_facts_come_from_generation(major, minor, architecture, wgmm
         shared_memory_per_block_optin=200_000,
         multi_processor_count=100,
     )
-    target = catalog.cuda_target(properties)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: properties)
+    target = _target_facts(torch.device("cuda:0"))
     assert target.architecture == architecture
     assert target.supports_wgmma is wgmma
-    assert catalog.supported_architecture(architecture)
 
 
-def test_cuda_target_rejects_unregistered_device():
-    with pytest.raises(ValueError, match="unsupported CUDA architecture"):
-        catalog.cuda_target(SimpleNamespace(major=8, minor=0))
+def test_cuda_target_rejects_unregistered_device(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(major=8, minor=0))
+    with pytest.raises(UnsupportedCompiler, match="found sm80"):
+        _target_facts(torch.device("cuda:0"))
 
 
 def test_event_scheduler_preserves_launch_options(monkeypatch):

@@ -18,8 +18,8 @@ import torch
 from torch.utils import _pytree as pytree
 
 from .bodies import SelectionPolicy, TargetFacts
-from .bodies.catalog import cuda_target, is_table_gemm, launch_options
-from .bodies.gemm import TABLE_DESCRIPTORS_PER_GEMM, cute_gemm_tensors, is_swap_ab
+from .bodies.catalog import is_table_gemm, launch_options, table_gemm
+from .bodies.cuda.sm90.gemm import TABLE_DESCRIPTORS_PER_GEMM, cute_gemm_tensors, is_swap_ab
 from .cache import PlanCache, make_plan_key
 from .codegen import GEMM_SECOND_A_COLUMN, GeneratedCuTeModule, emit_cute
 from .diagnostics import CompilerDiagnostic, CompilerError
@@ -1027,9 +1027,7 @@ class GraphedCall:
 
     def __init__(self, function: Callable[..., Any], args: tuple[Any, ...], warmup: int):
         global _graph_capture
-        # CUDA graph nodes retain kernel handles, not the Python objects that
-        # own their compiled modules and model weights. Keep those owners alive
-        # for at least as long as the graph can be replayed.
+        # The graph retains kernel handles, so their compiled owner must stay alive.
         self._function = function
         self._inputs, self._spec = pytree.tree_flatten(args)
         saved = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in self._inputs]
@@ -1473,10 +1471,21 @@ def _target_facts(device: torch.device) -> TargetFacts:
     if device.type != "cuda":
         raise UnsupportedCompiler("MegaBake generated kernels require CUDA")
     properties = torch.cuda.get_device_properties(device)
-    try:
-        return cuda_target(properties)
-    except ValueError as error:
-        raise UnsupportedCompiler(str(error)) from error
+    architecture = f"sm{properties.major}{properties.minor}"
+    if architecture not in {"sm90", "sm100", "sm103", "sm120", "sm121"}:
+        raise UnsupportedCompiler(
+            f"generated CuTe kernels require SM90 or Blackwell SM100/103/120/121; found {architecture}"
+        )
+    return TargetFacts(
+        architecture="sm90a" if architecture == "sm90" else architecture,
+        threads_per_warp=properties.warp_size,
+        max_threads_per_cta=properties.max_threads_per_block,
+        max_shared_memory_per_cta=properties.shared_memory_per_block_optin,
+        max_registers_per_thread=255,
+        multiprocessor_count=properties.multi_processor_count,
+        supports_tma=True,
+        supports_wgmma=architecture == "sm90",
+    )
 
 
 def _common_cuda_device(example_inputs: Sequence[Any]) -> torch.device:
@@ -1830,6 +1839,10 @@ class _RuntimeState:
         self._values = values
         self._values_stale = False
         self.g0_tensors = g0_tensors
+        self._table_gemm_impl = next(
+            (impl for phase in plan.phases if (impl := table_gemm(phase.body.provider)) is not None),
+            None,
+        )
         self._normal_view_cache: dict[str, tuple[tuple[Any, ...], Any]] = {}
         self._work_iterator_view_cache: dict[str, tuple[tuple[Any, ...], Any]] = {}
         self._g0_view_cache: dict[int, tuple[tuple[tuple[Any, ...], ...], tuple[Any, ...]]] = {}
@@ -2380,7 +2393,13 @@ class _RuntimeState:
                 self._stream_table = (stream_table, _cute_view(stream_table))
             if self._tma_descriptors is None:
                 descriptors = torch.zeros(
-                    len(launch.gemm_table) * TABLE_DESCRIPTORS_PER_GEMM * 16,
+                    len(launch.gemm_table)
+                    * (
+                        TABLE_DESCRIPTORS_PER_GEMM
+                        if self._table_gemm_impl is None
+                        else self._table_gemm_impl.DESCRIPTORS_PER_GEMM
+                    )
+                    * 16,
                     dtype=torch.int64,
                     device=device,
                 )
@@ -2591,10 +2610,12 @@ class _RuntimeState:
             or any(old != new for old, new in zip(entry[0], identities))
         ):
             splits = self.generated.launch.gemm_splits
-            entry = (
-                identities,
-                cute_gemm_tensors(*tensors, splits=splits[group_index] if splits else 1),
+            bind_tensors = (
+                cute_gemm_tensors
+                if self._table_gemm_impl is None
+                else self._table_gemm_impl.gemm.cute_gemm_tensors
             )
+            entry = (identities, bind_tensors(*tensors, splits=splits[group_index] if splits else 1))
             self._g0_view_cache[group_index] = entry
         return entry[1]
 
@@ -2746,6 +2767,9 @@ def _g0_operands(
     if output.dim() != 2:
         # A fused epilogue stores its chain's result, viewed as the GEMM output.
         output = output.reshape(selected.program.store.shape)
+    gemm_impl = table_gemm(body.provider)
+    if gemm_impl is not None:
+        return gemm_impl.arrange_operands(activation, weights, output)
     if is_swap_ab(body):
         return (*weights, activation, output.t())
     return (activation, *weights, output)

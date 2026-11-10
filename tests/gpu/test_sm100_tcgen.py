@@ -18,8 +18,8 @@ def test_shape_tuning_file_accepts_original_settings(monkeypatch, tmp_path):
     from argparse import Namespace
 
     from megabake import compiler
-    from megabake.bodies.catalog import cuda_target
     from megabake.bodies.cuda.sm100 import tuning
+    from megabake.compiler import _target_facts
 
     for name in (
         "MEGABAKE_SM100_TUNING_FILE",
@@ -44,7 +44,7 @@ def test_shape_tuning_file_accepts_original_settings(monkeypatch, tmp_path):
         )
     monkeypatch.setenv("MEGABAKE_SM100_EPILOGUE", "1")
     monkeypatch.setenv("MEGABAKE_SM100_TUNING_FILE", str(output))
-    target = cuda_target(torch.cuda.get_device_properties(0))
+    target = _target_facts(torch.device("cuda:0"))
     assert tuning.choice_for_shape(target, 1, 128, 512) in ((64, 1), (128, 1))
 
 
@@ -135,7 +135,7 @@ def test_sm100_auto_tile_mixes_tiles_in_one_kernel(monkeypatch, tmp_path):
 )
 def test_sm100_split_k_repeats_and_rebinds(monkeypatch, tmp_path, tile, splits, rows, columns):
     from megabake import compiler, make_backend
-    from megabake.bodies.gemm import split_k
+    from megabake.bodies.cuda.sm100.gemm import split_k
 
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN_TILE", str(tile))
@@ -264,7 +264,7 @@ def test_sm100_tcgen_extended_prefill_rows(monkeypatch, tmp_path, rows):
 )
 def test_sm100_wider_token_tiles(monkeypatch, tmp_path, rows, token_tile, feature_tile, splits):
     from megabake import compiler, make_backend
-    from megabake.bodies.gemm import split_k
+    from megabake.bodies.cuda.sm100.gemm import split_k
 
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN_TILE", str(feature_tile))
@@ -427,7 +427,7 @@ def test_sm100_tcgen_multiple_tiles_per_worker(
     monkeypatch, tmp_path, fused, splits, persistent, acc_stages, width, fork
 ):
     from megabake import compiler, graphed, make_backend
-    from megabake.bodies.gemm import split_k
+    from megabake.bodies.cuda.sm100.gemm import split_k
     from megabake.bodies.cuda.sm100 import tuning
 
     monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
@@ -537,7 +537,7 @@ def test_persistent_gemm_matches_existing_body(
     monkeypatch, tmp_path, rows, fused, splits, width, acc_stages, fork
 ):
     from megabake import compiler, make_backend
-    from megabake.bodies.gemm import split_k
+    from megabake.bodies.cuda.sm100.gemm import split_k
 
     monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")

@@ -29,7 +29,6 @@ def _device_details(device_index: int) -> dict:
         Path(__file__).with_name("__init__.py"),
         root / "bodies/interface.py",
         root / "bodies/catalog.py",
-        root / "bodies/gemm.py",
         Path(__file__).with_name("attention.py"),
         *(
             root / name
@@ -145,7 +144,7 @@ def tune_gemm(args) -> None:
     import torch
 
     from megabake import compiler, graphed, make_backend
-    from megabake.bodies.gemm import split_k
+    from .gemm import split_k
 
     class Gemm(torch.nn.Module):
         def forward(self, source, weight):

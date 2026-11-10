@@ -1,7 +1,6 @@
 """Show how MegaBake's CUTLASS GEMM bodies differ from pinned upstream files.
 
-Each body's upstream snapshot and checksum are specified in
-``src/megabake/bodies/vendor_sources.py``.
+Upstream snapshots are stored beside the architecture-specific bodies.
 
     .venv/bin/python tools/vendor_cutlass.py          # diff upstream -> fork
     .venv/bin/python tools/vendor_cutlass.py --stat   # changed line counts only
@@ -15,27 +14,44 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import runpy
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-REFERENCES = runpy.run_path(str(ROOT / "src" / "megabake" / "bodies" / "vendor_sources.py"))[
-    "references"
-]()
+BODIES = ROOT / "src" / "megabake" / "bodies" / "cuda"
+UPSTREAM = BODIES / "sm90" / "cutlass_upstream"
+FORKS = {"dense_gemm_persistent.py": BODIES / "sm90" / "cutlass_gemm.py"}
+SM100_UPSTREAM = BODIES / "sm100" / "cutlass_upstream"
+SM100_FORKS = {
+    "fp16_gemm_0.py": (
+        BODIES / "sm100" / "tcgen_gemm.py",
+        "a15471df9a2a9c80a6a772416210ea256a58b142aa4b6358ca01851f6f02362a",
+    ),
+    "dense_gemm_persistent.py": (
+        BODIES / "sm100" / "cutlass_gemm.py",
+        "4f3d5fa8c6032c2190933cb43c71d358bb200225fe7c0ec0b54014a9a6235362",
+    ),
+}
+SM100_HEADER = b"# ruff: noqa\n# fmt: off\n"
 
 
 def check_upstream() -> None:
     """Fail unless every upstream copy has its recorded prefix and hash."""
-    for reference in REFERENCES:
-        original = reference["original"]
+    for line in (UPSTREAM / "UPSTREAM").read_text().splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() != "sha256":
+            continue
+        name, expected = value.split()
+        actual = hashlib.sha256((UPSTREAM / name).read_bytes()).hexdigest()
+        if actual != expected:
+            raise SystemExit(f"cutlass_upstream/{name} was modified ({actual} != {expected})")
+    for name, (_, expected) in SM100_FORKS.items():
+        original = SM100_UPSTREAM / name
         source = original.read_bytes()
-        header = reference["header"]
-        if not source.startswith(header):
+        if not source.startswith(SM100_HEADER):
             raise SystemExit(f"upstream {original} lint header was modified")
-        actual = hashlib.sha256(source[len(header) :]).hexdigest()
-        expected = reference["sha256"]
+        actual = hashlib.sha256(source[len(SM100_HEADER) :]).hexdigest()
         if actual != expected:
             raise SystemExit(f"upstream {original} was modified ({actual} != {expected})")
 
@@ -48,15 +64,17 @@ def main() -> int:
     check_upstream()
     if args.check:
         return 0
-    for reference in REFERENCES:
+    forks = [(UPSTREAM / name, fork) for name, fork in FORKS.items()]
+    forks.extend((SM100_UPSTREAM / name, fork) for name, (fork, _) in SM100_FORKS.items())
+    for original, fork in forks:
         subprocess.run(
             [
                 "git",
                 "diff",
                 "--no-index",
                 *(["--stat"] if args.stat else []),
-                str(reference["original"].relative_to(ROOT)),
-                str(reference["adaptation"].relative_to(ROOT)),
+                str(original.relative_to(ROOT)),
+                str(fork.relative_to(ROOT)),
             ],
             check=False,
             cwd=ROOT,

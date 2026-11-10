@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import subprocess
 import sys
 from importlib.util import module_from_spec, spec_from_file_location
@@ -43,6 +44,20 @@ def test_sm100_persistent_fork_preserves_upstream_kernel():
     assert method(fork, "table_kernel")
 
 
+def test_hopper_hash_check_validates_every_record(monkeypatch, tmp_path):
+    spec = spec_from_file_location("vendor_cutlass", ROOT / "tools" / "vendor_cutlass.py")
+    vendor = module_from_spec(spec)
+    spec.loader.exec_module(vendor)
+    (tmp_path / "first.py").write_bytes(b"first")
+    (tmp_path / "second.py").write_bytes(b"second")
+    first_hash = hashlib.sha256(b"first").hexdigest()
+    (tmp_path / "UPSTREAM").write_text(f"sha256: first.py {first_hash}\nsha256: second.py bad\n")
+    monkeypatch.setattr(vendor, "UPSTREAM", tmp_path)
+    monkeypatch.setattr(vendor, "SM100_FORKS", {})
+    with pytest.raises(SystemExit, match="second.py was modified"):
+        vendor.check_upstream()
+
+
 @pytest.mark.parametrize("modify_header", [False, True])
 @pytest.mark.parametrize("filename", ["fp16_gemm_0.py", "dense_gemm_persistent.py"])
 def test_sm100_upstream_hash_check_rejects_modified_content(
@@ -52,9 +67,9 @@ def test_sm100_upstream_hash_check_rejects_modified_content(
     vendor = module_from_spec(spec)
     spec.loader.exec_module(vendor)
     modified = tmp_path / filename
-    reference = next(item for item in vendor.REFERENCES if item["original"].name == filename)
-    source = reference["original"].read_bytes()
+    source = (vendor.SM100_UPSTREAM / filename).read_bytes()
     modified.write_bytes(b"# changed\n" + source if modify_header else source + b"\n# changed\n")
-    monkeypatch.setitem(reference, "original", modified)
+    monkeypatch.setattr(vendor, "SM100_UPSTREAM", tmp_path)
+    monkeypatch.setattr(vendor, "SM100_FORKS", {filename: vendor.SM100_FORKS[filename]})
     with pytest.raises(SystemExit, match="upstream .* modified"):
         vendor.check_upstream()
