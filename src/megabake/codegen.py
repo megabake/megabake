@@ -2063,12 +2063,17 @@ def _event_worker_loop(
         )
         for phase in plan.phases
     )
+    entry_source = ("," + chr(10)).join(
+        f"            ({entry[0]}, {entry[1]}, {entry[2]}, {entry[3]})" for entry in entries
+    )
+    if len(entries) == 1:
+        entry_source += ","
     return f"""    cooperative_event_worker_loop(
         ready,
         workers,
         epoch,
         (
-{("," + chr(10)).join(f"            ({entry[0]}, {entry[1]}, {entry[2]}, {entry[3]})" for entry in entries)}
+{entry_source}
         ),
     )
 """

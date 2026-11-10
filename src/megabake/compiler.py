@@ -1027,6 +1027,8 @@ class GraphedCall:
 
     def __init__(self, function: Callable[..., Any], args: tuple[Any, ...], warmup: int):
         global _graph_capture
+        # The graph retains kernel handles, so their compiled owner must stay alive.
+        self._function = function
         self._inputs, self._spec = pytree.tree_flatten(args)
         saved = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in self._inputs]
         side = torch.cuda.Stream()
