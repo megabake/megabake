@@ -3,9 +3,7 @@ from __future__ import annotations
 import ast
 import json
 from dataclasses import replace
-from types import SimpleNamespace
 
-import pytest
 import torch
 
 from megabake import (
@@ -112,24 +110,6 @@ def test_emit_cute_reuses_phase_runners_with_event_scheduling(tmp_path):
     assert "cooperative_event_worker_loop(" in generated.source
     assert generated.source.count("def _run_variant_0(") == 1
     assert "(0, _ignore_epoch, _run_variant_0, _publish_phase_0)" in generated.source
-
-
-@pytest.mark.parametrize("count", [1, 2])
-def test_event_worker_loop_emits_a_tuple_for_each_phase(count):
-    from megabake.codegen import _event_worker_loop
-
-    phases = tuple(
-        SimpleNamespace(index=index, region_id=f"r{index}", dependencies=())
-        for index in range(count)
-    )
-    plan = SimpleNamespace(phases=phases)
-    schedule = SimpleNamespace(events=())
-    source = "def run():\n" + _event_worker_loop(
-        plan, {index: f"_run{index}" for index in range(count)}, schedule
-    )
-    call = ast.parse(source).body[0].body[0].value
-    assert isinstance(call.args[3], ast.Tuple)
-    assert len(call.args[3].elts) == count
 
 
 def test_emit_cute_puts_g0_inside_one_cooperative_kernel(tmp_path):

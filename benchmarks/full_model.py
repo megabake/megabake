@@ -672,7 +672,7 @@ def bench_decode_audit(model, name: str, revision: str | None, args) -> dict:
                 "native_greedy_ids": native_sequence,
                 "variants": {},
             }
-            for name, function, state in variants:
+            for variant, function, state in variants:
                 for value in state:
                     value.zero_()
                 rels, matches, finite, out = [], 0, True, None
@@ -706,7 +706,7 @@ def bench_decode_audit(model, name: str, revision: str | None, args) -> dict:
                     ),
                     None,
                 )
-                case["variants"][name] = {
+                case["variants"][variant] = {
                     "prompt_top_matches_native": matches,
                     "prompt_positions": len(ids),
                     "prompt_relative_l2_median_vs_native": statistics.median(rels),

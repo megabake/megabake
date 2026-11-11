@@ -2,7 +2,6 @@
 
 from ....platform import TensorMapManager, TensorMapUpdateMode, cute, cutlass
 
-
 _TABLE_TENSORMAPS = TensorMapManager(TensorMapUpdateMode.GMEM, 128)
 _DESCRIPTORS_PER_GEMM = 4
 

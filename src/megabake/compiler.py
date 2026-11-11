@@ -1027,8 +1027,6 @@ class GraphedCall:
 
     def __init__(self, function: Callable[..., Any], args: tuple[Any, ...], warmup: int):
         global _graph_capture
-        # The graph retains kernel handles, so their compiled owner must stay alive.
-        self._function = function
         self._inputs, self._spec = pytree.tree_flatten(args)
         saved = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in self._inputs]
         side = torch.cuda.Stream()
@@ -1839,10 +1837,6 @@ class _RuntimeState:
         self._values = values
         self._values_stale = False
         self.g0_tensors = g0_tensors
-        self._table_gemm_impl = next(
-            (impl for phase in plan.phases if (impl := table_gemm(phase.body.provider)) is not None),
-            None,
-        )
         self._normal_view_cache: dict[str, tuple[tuple[Any, ...], Any]] = {}
         self._work_iterator_view_cache: dict[str, tuple[tuple[Any, ...], Any]] = {}
         self._g0_view_cache: dict[int, tuple[tuple[tuple[Any, ...], ...], tuple[Any, ...]]] = {}
@@ -2393,13 +2387,7 @@ class _RuntimeState:
                 self._stream_table = (stream_table, _cute_view(stream_table))
             if self._tma_descriptors is None:
                 descriptors = torch.zeros(
-                    len(launch.gemm_table)
-                    * (
-                        TABLE_DESCRIPTORS_PER_GEMM
-                        if self._table_gemm_impl is None
-                        else self._table_gemm_impl.DESCRIPTORS_PER_GEMM
-                    )
-                    * 16,
+                    len(launch.gemm_table) * TABLE_DESCRIPTORS_PER_GEMM * 16,
                     dtype=torch.int64,
                     device=device,
                 )
@@ -2610,12 +2598,10 @@ class _RuntimeState:
             or any(old != new for old, new in zip(entry[0], identities))
         ):
             splits = self.generated.launch.gemm_splits
-            bind_tensors = (
-                cute_gemm_tensors
-                if self._table_gemm_impl is None
-                else self._table_gemm_impl.gemm.cute_gemm_tensors
+            entry = (
+                identities,
+                cute_gemm_tensors(*tensors, splits=splits[group_index] if splits else 1),
             )
-            entry = (identities, bind_tensors(*tensors, splits=splits[group_index] if splits else 1))
             self._g0_view_cache[group_index] = entry
         return entry[1]
 

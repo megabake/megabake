@@ -208,7 +208,7 @@ def emit_cute(
                     raise UnsupportedCodegen(str(error)) from error
 
     if event_schedule is None and (
-        table or not any(is_table_gemm(phase.body.provider) for phase in plan.phases)
+        table or not any(phase.body.provider == "g0_range" for phase in plan.phases)
     ):
         source, launch, source_map = _emit_table_module(plan)
     else:
@@ -248,7 +248,7 @@ def _emit_generic_module(
     event_schedule: EventSchedule | None = None,
 ) -> tuple[str, LaunchMetadata, tuple[SourceMapEntry, ...]]:
     selected = {selection.region_id: selection for selection in plan.selection.selections}
-    has_g0 = any(is_table_gemm(phase.body.provider) for phase in plan.phases)
+    has_g0 = any(phase.body.provider == "g0_range" for phase in plan.phases)
     normalized = (
         {
             region_id: _widened_selection(selection, plan.launch.threads_per_block)
@@ -288,7 +288,7 @@ def _emit_generic_module(
 
     for phase in plan.phases:
         selection = normalized[phase.region_id]
-        if is_table_gemm(phase.body.provider):
+        if phase.body.provider == "g0_range":
             variant_key = (
                 phase.body.provider,
                 phase.body.tiles.cta_shape[:2],
@@ -734,13 +734,12 @@ def _emit_table_module(
     static layout, so kernel parameters and generated code stay bounded by the
     number of distinct bodies rather than by the number of layers.
     """
-    gemm_providers = {
-        phase.body.provider for phase in plan.phases if is_table_gemm(phase.body.provider)
-    }
-    if len(gemm_providers) > 1:
-        raise UnsupportedCodegen("different table GEMM implementations cannot share one launch")
-    gemm_impl = table_gemm(next(iter(gemm_providers))) if gemm_providers else None
-    has_gemm = bool(gemm_providers)
+    has_gemm = any(phase.body.provider == "g0_range" for phase in plan.phases)
+    gemm_impl = next(
+        (impl for phase in plan.phases if (impl := table_gemm(phase.body.provider)) is not None),
+        None,
+    )
+    has_gemm = has_gemm or gemm_impl is not None
     selected = {
         selection.region_id: (
             _widened_selection(selection, plan.launch.threads_per_block) if has_gemm else selection
@@ -866,25 +865,20 @@ def _emit_table_module(
                 for domain in program.iteration_domains
                 if domain.axis in program.reduction_axes
             )
-            if gemm_impl is None:
-                tile = kernel_tile(phase.body)
-                splits = split_k(phase.body)
-                bias = has_bias(phase.body)
-                fused = has_fused_epilogue(phase.body)
-                paired = is_paired(phase.body)
-                swap_ab = is_swap_ab(phase.body)
-                load_epilogue = epilogue_loads
-                emit_epilogue = epilogue_source
-            else:
+            tile = kernel_tile(phase.body)
+            splits = split_k(phase.body)
+            bias = has_bias(phase.body)
+            fused = has_fused_epilogue(phase.body)
+            paired = is_paired(phase.body)
+            swap_ab = is_swap_ab(phase.body)
+            if gemm_impl is not None:
                 try:
                     tile, splits, bias, fused, paired, swap_ab = gemm_impl.codegen_config(
                         phase.body, program
                     )
                 except ValueError as error:
                     raise UnsupportedCodegen(str(error)) from error
-                load_epilogue = gemm_impl.gemm.epilogue_loads
-                emit_epilogue = gemm_impl.gemm.epilogue_source
-            fused_loads = load_epilogue(program) if fused else ()
+            fused_loads = epilogue_loads(program) if fused else ()
             fused_layouts = tuple(
                 tensor_arguments[
                     _tensor_argument_index(
@@ -921,7 +915,7 @@ def _emit_table_module(
                 gemm_splits.append(splits)
                 gemm_template_phases.append(phase.index)
                 symbol = f"_gemm_{gemm_variant}"
-                variants[("table_gemm", gemm_key)] = (symbol, len(variants), None)
+                variants[("g0_range", gemm_key)] = (symbol, len(variants), None)
                 gemm_variant_specs[gemm_variant] = {
                     "symbol": symbol,
                     "scratch": phase.body.scratch.size_bytes,
@@ -935,7 +929,7 @@ def _emit_table_module(
             epilogue_kind = 0
             if fused:
                 entry = (
-                    emit_epilogue(program, "_epilogue"),
+                    epilogue_source(program, "_epilogue"),
                     tuple(_layout_key(layout) for layout in fused_layouts),
                 )
                 kinds = variant_epilogues.setdefault(gemm_variant, [])
@@ -946,11 +940,11 @@ def _emit_table_module(
                 if entry not in known:
                     kinds.append((entry[0], fused_layouts))
                     epilogue_definitions.append(
-                        emit_epilogue(program, f"_epilogue_{gemm_variant}_{len(kinds)}")
+                        epilogue_source(program, f"_epilogue_{gemm_variant}_{len(kinds)}")
                     )
                     known.append(entry)
                 epilogue_kind = known.index(entry) + 1
-            body_symbol, body_variant_id, _ = variants[("table_gemm", gemm_key)]
+            body_symbol, body_variant_id, _ = variants[("g0_range", gemm_key)]
             gemm_slots = [
                 _tensor_argument_index(
                     tensor_arguments,
@@ -976,17 +970,9 @@ def _emit_table_module(
             gemm_of_phase[phase.index] = gemm_index
             # swapAB GEMMs load the weight as CUTLASS A, which streaming
             # loads ahead when no region of the launch writes it.
-            may_stream = (
-                swap_ab
-                if gemm_impl is None
-                else swap_ab and gemm_impl.supports_weight_streaming()
-            )
-            if (
-                may_stream
-                and all(
-                    _read_only_input(plan, tensor_arguments[slot])
-                    for slot in (gemm_slots[0], *((second_a_slot - 1,) if paired else ()))
-                )
+            if is_swap_ab(phase.body) and all(
+                _read_only_input(plan, tensor_arguments[slot])
+                for slot in (gemm_slots[0], *((second_a_slot - 1,) if paired else ()))
             ):
                 streamable_gemms.add(gemm_index)
             gemm_rows.append((gemm_variant, *gemm_slots, bias_slot))
@@ -1000,7 +986,7 @@ def _emit_table_module(
                     output_tiles * splits * tile[0] * tile[1],
                     output_tiles,
                 )
-            runner_key = ("table_gemm", gemm_variant)
+            runner_key = ("g0_range", gemm_variant)
             if runner_key not in runner_variants:
                 representative_phases.append(phase)
                 # Lines are written once every phase's epilogue kind is known.
@@ -1256,32 +1242,31 @@ def _emit_table_module(
         epilogues = "".join(
             f"_epilogue_{gemm_variant}_{kind}, " for kind in range(1, len(kinds) + 1)
         )
-        if gemm_impl is None:
-            gemm_definitions.append(
-                f"{spec['symbol']} = HopperWgmmaGemmPersistentKernel(\n"
-                "    cutlass.Float32,\n"
-                f"    {gemm_kernel_tiles[gemm_variant]!r},\n"
-                "    (1, 1),\n"
-                "    1,\n"
-                "    True,\n"
-                f"    smem_capacity={spec['scratch']},\n"
-                "    reallocate_registers=False,\n"
-                f"    splits={spec['splits']},\n"
-                f"    bias_features={spec['bias_features']},\n"
-                f"    bias_along_m={spec['swap_ab']!r},\n"
-                f"    direct_store={spec['swap_ab'] and spec['splits'] == 1!r},\n"
-                + (f"    epilogues=({epilogues}),\n" if kinds else "")
-                + ("    paired=True,\n" if spec["paired"] else "")
-                + (
-                    f"    stream_stages={WEIGHT_STREAM_STAGES},\n"
-                    if gemm_variant in streamed_variants
-                    else ""
-                )
-                + ")"
+        gemm_definitions.append(
+            f"{spec['symbol']} = HopperWgmmaGemmPersistentKernel(\n"
+            "    cutlass.Float32,\n"
+            f"    {gemm_kernel_tiles[gemm_variant]!r},\n"
+            "    (1, 1),\n"
+            "    1,\n"
+            "    True,\n"
+            f"    smem_capacity={spec['scratch']},\n"
+            "    reallocate_registers=False,\n"
+            f"    splits={spec['splits']},\n"
+            f"    bias_features={spec['bias_features']},\n"
+            f"    bias_along_m={spec['swap_ab']!r},\n"
+            f"    direct_store={spec['swap_ab'] and spec['splits'] == 1!r},\n"
+            + (f"    epilogues=({epilogues}),\n" if kinds else "")
+            + ("    paired=True,\n" if spec["paired"] else "")
+            + (
+                f"    stream_stages={WEIGHT_STREAM_STAGES},\n"
+                if gemm_variant in streamed_variants
+                else ""
             )
-        else:
-            gemm_definitions.append(
-                gemm_impl.table_definition(spec, gemm_kernel_tiles[gemm_variant], epilogues)
+            + ")"
+        )
+        if gemm_impl is not None:
+            gemm_definitions[-1] = gemm_impl.table_definition(
+                spec, gemm_kernel_tiles[gemm_variant], epilogues
             )
         split_state = (
             [
@@ -1327,13 +1312,8 @@ def _emit_table_module(
             if kinds
             else []
         )
-        needs_output_address = (
-            spec["swap_ab"] and spec["splits"] == 1
-            if gemm_impl is None
-            else gemm_impl.needs_output_address(spec)
-        )
-        runner_id = runner_variants[("table_gemm", gemm_variant)][0]
-        runner_variants[("table_gemm", gemm_variant)] = (
+        runner_id = runner_variants[("g0_range", gemm_variant)][0]
+        runner_variants[("g0_range", gemm_variant)] = (
             runner_id,
             0,
             [
@@ -1346,7 +1326,7 @@ def _emit_table_module(
                 *(line for line in bias_state if line),
                 *(
                     ["                c_address=addresses[gemm_table[phase_table[phase, 6], 3]],"]
-                    if needs_output_address
+                    if spec["swap_ab"] and (spec["splits"] == 1 or gemm_impl is not None)
                     else []
                 ),
                 *epilogue_state,
@@ -1426,13 +1406,9 @@ def _emit_table_module(
     scratch_prelude = _scratch_prelude(scratch_plan, scratch_elements)
     shared_memory_bytes = plan.launch.dynamic_shared_memory_bytes
     if has_gemm:
-        tiles = {key[0] for key in gemm_variants}
-        valid_layout = (
-            len(gemm_scratch_bytes) == 1 and len(tiles) == 1
-            if gemm_impl is None
-            else gemm_impl.valid_tile_layout(gemm_scratch_bytes, tiles)
-        )
-        if not valid_layout:
+        if len(gemm_scratch_bytes) != 1 or (
+            gemm_impl is None and len({key[0] for key in gemm_variants}) != 1
+        ):
             raise UnsupportedCodegen(
                 "table-launched GEMMs must share one tile and shared-memory layout"
             )
@@ -1595,19 +1571,18 @@ def _emit_table_module(
     )
     phase_table_width = len(phase_table[0])
     gemm_import = (
-        gemm_impl.table_import()
-        if gemm_impl is not None
-        else (
-            "from megabake.bodies.cuda.sm90.gemm import (\n"
-            "    HopperWgmmaGemmPersistentKernel,\n"
-            "    build_table_descriptors,\n"
-            "    table_descriptors,\n"
-            "    union_shared_storage,\n"
-            ")\n"
-            if has_gemm
-            else ""
-        )
+        "from megabake.bodies.cuda.sm90.gemm import (\n"
+        "    HopperWgmmaGemmPersistentKernel,\n"
+        "    build_table_descriptors,\n"
+        "    table_descriptors,\n"
+        "    union_shared_storage,\n"
+        ")\n"
+        if has_gemm
+        else ""
     )
+    if gemm_impl is not None:
+        gemm_import = gemm_impl.table_import()
+        gemm_splits = list(gemm_impl.descriptor_splits(gemm_splits))
     source = f"""import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
@@ -1802,11 +1777,7 @@ def launch(
         gemm_table=tuple(gemm_rows),
         stream_table=tuple(stream_rows) if streaming else (),
         gemm_template_phases=tuple(gemm_template_phases),
-        gemm_splits=(
-            tuple(gemm_splits)
-            if gemm_impl is None
-            else gemm_impl.descriptor_splits(gemm_splits)
-        ),
+        gemm_splits=tuple(gemm_splits),
         phase_float_elements=float_elements,
         phase_counter_count=counter_count,
     )
@@ -2092,17 +2063,12 @@ def _event_worker_loop(
         )
         for phase in plan.phases
     )
-    entry_source = ("," + chr(10)).join(
-        f"            ({entry[0]}, {entry[1]}, {entry[2]}, {entry[3]})" for entry in entries
-    )
-    if len(entries) == 1:
-        entry_source += ","
     return f"""    cooperative_event_worker_loop(
         ready,
         workers,
         epoch,
         (
-{entry_source}
+{("," + chr(10)).join(f"            ({entry[0]}, {entry[1]}, {entry[2]}, {entry[3]})" for entry in entries)}
         ),
     )
 """
@@ -2459,14 +2425,26 @@ def _source_map(
     selected = {selection.region_id: selection for selection in plan.selection.selections}
     entries: list[SourceMapEntry] = []
     for record in phase_records:
-        if is_table_gemm(record.provider):
-            gemm_impl = table_gemm(record.provider)
-            if gemm_impl is None:
-                source_object = HopperWgmmaGemmPersistentKernel.run
-                source_path = Path(inspect.getsourcefile(HopperWgmmaGemmPersistentKernel))
-            else:
-                source_object = gemm_impl.source_object()
-                source_path = Path(inspect.getsourcefile(source_object))
+        if record.provider == "g0_range":
+            source_path = Path(inspect.getsourcefile(HopperWgmmaGemmPersistentKernel))
+            lines, line_start = inspect.getsourcelines(HopperWgmmaGemmPersistentKernel.run)
+            entries.append(
+                SourceMapEntry(
+                    record.body_symbol,
+                    "device_body",
+                    line_start,
+                    line_start + len(lines) - 1,
+                    record.index,
+                    record.region_id,
+                    record.provider,
+                    record.body_name,
+                    selected[record.region_id].source_op_ids,
+                    str(source_path),
+                )
+            )
+        elif (gemm_impl := table_gemm(record.provider)) is not None:
+            source_object = gemm_impl.source_object()
+            source_path = Path(inspect.getsourcefile(source_object))
             lines, line_start = inspect.getsourcelines(source_object)
             entries.append(
                 SourceMapEntry(

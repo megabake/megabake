@@ -2,11 +2,10 @@
 
 import inspect
 
-from . import gemm as gemm
+from . import gemm
 from .config import persistent_gemm_settings
 
 PROVIDER_NAME = "sm100_tma"
-DESCRIPTORS_PER_GEMM = 4
 
 
 def validate_launch(event_schedule, table):
@@ -16,18 +15,6 @@ def validate_launch(event_schedule, table):
 
 def widen_selection(selection, threads):
     return selection
-
-
-def supports_weight_streaming():
-    return False
-
-
-def valid_tile_layout(scratch_sizes, tiles):
-    return len(scratch_sizes) == 1
-
-
-def needs_output_address(spec):
-    return spec["swap_ab"]
 
 
 def descriptor_splits(splits):

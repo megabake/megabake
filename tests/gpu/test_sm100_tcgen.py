@@ -38,8 +38,12 @@ def test_shape_tuning_file_accepts_original_settings(monkeypatch, tmp_path):
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
         tuning.tune_gemm(
             Namespace(
-                tune_shapes=["128x512"], tune_rows=1, tune_cache_mib=0,
-                tune_split_limits=["1"], samples=5, output=output,
+                tune_shapes=["128x512"],
+                tune_rows=1,
+                tune_cache_mib=0,
+                tune_split_limits=["1"],
+                samples=5,
+                output=output,
             )
         )
     monkeypatch.setenv("MEGABAKE_SM100_EPILOGUE", "1")
@@ -427,8 +431,8 @@ def test_sm100_tcgen_multiple_tiles_per_worker(
     monkeypatch, tmp_path, fused, splits, persistent, acc_stages, width, fork
 ):
     from megabake import compiler, graphed, make_backend
-    from megabake.bodies.cuda.sm100.gemm import split_k
     from megabake.bodies.cuda.sm100 import tuning
+    from megabake.bodies.cuda.sm100.gemm import split_k
 
     monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
@@ -625,15 +629,17 @@ def test_sm100_event_scheduler_uses_fallback_gemm(monkeypatch, tmp_path):
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
     monkeypatch.setattr(compiler, "_TABLE_LAUNCH_OPS", 0)
 
-    class Gemm(torch.nn.Module):
-        def forward(self, source, weight):
-            return source @ weight.T
+    # Two GEMMs, so the event schedule has more than one phase.
+    class Gemms(torch.nn.Module):
+        def forward(self, source, first, second):
+            return (source @ first.T) @ second.T
 
     args = (
         torch.randn(4, 128, device="cuda", dtype=torch.bfloat16) / 16,
         torch.randn(256, 128, device="cuda", dtype=torch.bfloat16) / 16,
+        torch.randn(192, 256, device="cuda", dtype=torch.bfloat16) / 16,
     )
-    model = Gemm().eval()
+    model = Gemms().eval()
     backend = make_backend(
         mode="prefill",
         compile_kernel=True,

@@ -145,9 +145,7 @@ def test_sm100_persistent_contract_variants(monkeypatch, persistent, stages, wid
     body = next(c for c in candidates.configurations if c.provider == "sm100_tma")
     assert body.participants.participating_threads == width
     assert (f"_persistent{stages}" in body.name) is persistent
-    definition = sm100_table.table_definition(
-        {"symbol": "gemm", "splits": 1}, (128, 8), ""
-    )
+    definition = sm100_table.table_definition({"symbol": "gemm", "splits": 1}, (128, 8), "")
     assert ("Sm100PersistentGemm" in definition) is (persistent and width == 256)
     assert ("warp_specialized=True" in definition) is (persistent and width == 128)
     if persistent and width == 256:
@@ -173,9 +171,7 @@ def test_sm100_cutlass_fork_requires_256_threads(monkeypatch, stages):
     monkeypatch.setenv("MEGABAKE_SM100_CUTLASS_FORK", "1")
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_STAGES", str(stages))
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", "256")
-    definition = sm100_table.table_definition(
-        {"symbol": "gemm", "splits": 1}, (128, 8), ""
-    )
+    definition = sm100_table.table_definition({"symbol": "gemm", "splits": 1}, (128, 8), "")
     assert "Sm100CutlassForkGemm" in definition
     assert f"acc_stages={stages}" in definition
     assert "Sm100CutlassForkGemm" in sm100_table.table_import()
@@ -211,9 +207,7 @@ def test_sm100_persistent_defaults_to_cutlass_fork(monkeypatch):
     )
     body = next(c for c in candidates.configurations if c.provider == "sm100_tma")
     assert body.participants.participating_threads == 256
-    definition = sm100_table.table_definition(
-        {"symbol": "gemm", "splits": 1}, (128, 8), ""
-    )
+    definition = sm100_table.table_definition({"symbol": "gemm", "splits": 1}, (128, 8), "")
     assert "Sm100CutlassForkGemm" in definition and "acc_stages=1" in definition
 
 
@@ -379,8 +373,8 @@ def test_sm100_tuning_fingerprint_separates_persistent_variants(monkeypatch):
 
 
 def test_sm100_measured_choice_controls_tile_and_split(monkeypatch):
-    from megabake.bodies.cuda.sm100.gemm import split_k
     from megabake.bodies.cuda.sm100 import tuning
+    from megabake.bodies.cuda.sm100.gemm import split_k
 
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
     monkeypatch.setattr(

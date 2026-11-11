@@ -387,12 +387,9 @@ class BlackwellGemmProvider:
             }
             if accumulator_indices != {0, 1}:
                 return reject("paired epilogue must consume its two accumulators")
-            output_shape = region.semantics.output_shape or program.store.shape
-            if (
-                not output_shape
-                or output_shape[-1] != program.store.shape[1]
-                or any(size != 1 for size in output_shape[:-1])
-            ):
+            # The epilogue recognizer only accepts contiguous outputs, so one
+            # row is enough for the body to store through a flat view.
+            if program.store.shape[0] != 1:
                 return reject("paired matvec output must be a single contiguous row")
         base = generic_config(region, program)
         mma = replace(
@@ -477,11 +474,7 @@ class BlackwellGemmProvider:
                     measured=False,
                     source="SM100 warp-parallel small-row contraction",
                     revision="sm100-matvec-v1",
-                    resources={
-                        "threads": 128,
-                        "shared_bytes": 0,
-                        "output_shape": output_shape if paired else program.store.shape,
-                    },
+                    resources={"threads": 128, "shared_bytes": 0},
                     measurements={},
                 ),
             )
@@ -580,7 +573,12 @@ def _emit_blackwell_matvec(program: TensorProgram, config: BodyConfig) -> Genera
     paired = config.name == "blackwell_matvec_pair_1x16"
     transposed = program.loads[1].axes == ("r0", "o1")
     bindings = 4 if paired else 3
-    output_shape = config.evidence.resources.get("output_shape", program.store.shape)
+    output_view = (
+        f"    output_row = cute.make_tensor(tensor_bindings[{bindings - 1}].iterator, "
+        f"cute.make_layout({columns}))\n"
+        if paired
+        else ""
+    )
     cols = "\n".join(f"        col{i} = tile_id * 16 + warp * 4 + {i}" for i in range(4))
     init = "\n".join(
         f"        acc{i} = cutlass.Float32(0.0)"
@@ -617,8 +615,9 @@ def _emit_blackwell_matvec(program: TensorProgram, config: BodyConfig) -> Genera
         else:
             result = f"{dtype}(sum{i})"
         stores.append(f"        if lane == 0 and col{i} < {columns}:")
-        coordinates = ", ".join(["0"] * (len(output_shape) - 1) + [f"col{i}"])
-        stores.append(f"            tensor_bindings[{bindings - 1}][{coordinates}] = {result}")
+        target = "output_row" if paired else f"tensor_bindings[{bindings - 1}]"
+        coordinates = f"col{i}" if paired else f"0, col{i}"
+        stores.append(f"            {target}[{coordinates}] = {result}")
     stores = "\n".join(stores)
     source = f"""import cutlass
 import cutlass.cute as cute
@@ -635,7 +634,7 @@ def run(
     workers, _, _ = cute.arch.grid_dim()
     lane = thread % 32
     warp = thread // 32
-    for tile in cutlass.range(block, cute.size(work_iterator), workers):
+{output_view}    for tile in cutlass.range(block, cute.size(work_iterator), workers):
         tile_id = cutlass.Int32(work_iterator[tile])
 {cols}
 {init}

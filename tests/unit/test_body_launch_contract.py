@@ -19,14 +19,13 @@ def test_sm100_table_dispatch_keeps_hopper_on_its_existing_path():
     assert catalog.table_gemm("g0_range") is None
     assert catalog.is_table_gemm("sm100_tma")
     assert catalog.table_gemm("sm100_tma") is table
-    assert table.DESCRIPTORS_PER_GEMM == 4
     assert not catalog.is_table_gemm("generic")
     assert catalog.table_gemm("generic") is None
 
 
 def test_sm100_split_k_does_not_replace_hopper_helper():
-    from megabake.bodies.cuda.sm100.gemm import split_k as sm100_split_k
     from megabake.bodies.cuda.sm90.gemm import split_k as hopper_split_k
+    from megabake.bodies.cuda.sm100.gemm import split_k as sm100_split_k
 
     hopper = SimpleNamespace(name="g0_range_swapab_16x64_k4_bias")
     sm100 = SimpleNamespace(name="sm100_tma_swapab_8x128_persistent1_fork_k8_epilogue")
@@ -44,7 +43,12 @@ def test_sm100_table_codegen_configuration():
         tiles=SimpleNamespace(cta_shape=(8, 128, 64)),
     )
     assert table.codegen_config(body, SimpleNamespace(post=None)) == (
-        (128, 8), 8, False, True, False, True
+        (128, 8),
+        8,
+        False,
+        True,
+        False,
+        True,
     )
     with pytest.raises(ValueError, match="paired contractions"):
         table.codegen_config(body, SimpleNamespace(post=Accumulator("float32", index=1)))
@@ -57,11 +61,6 @@ def test_sm100_table_owns_layout_and_launch_decisions():
     for schedule, enabled in ((None, False), (object(), True)):
         with pytest.raises(ValueError, match="phase-table launch"):
             table.validate_launch(schedule, enabled)
-    assert not table.supports_weight_streaming()
-    assert table.valid_tile_layout({73728}, {(128, 8), (64, 8)})
-    assert not table.valid_tile_layout({73728, 86016}, {(128, 8)})
-    assert table.needs_output_address({"swap_ab": True, "splits": 8})
-    assert not table.needs_output_address({"swap_ab": False, "splits": 1})
     assert table.descriptor_splits((1, 4, 8)) == (1, 1, 1)
 
     selection = object()
@@ -72,6 +71,14 @@ def test_sm100_table_owns_layout_and_launch_decisions():
     a, b, c = table.arrange_operands(activation, (weight,), output)
     assert a is weight and b is activation
     assert c.shape == (8, 1) and c.data_ptr() == output.data_ptr()
+
+
+def test_sm100_descriptors_fit_the_shared_table_allocation():
+    # The shared runtime sizes the descriptor table with Hopper's count.
+    from megabake.bodies.cuda.sm90.gemm import TABLE_DESCRIPTORS_PER_GEMM
+    from megabake.bodies.cuda.sm100 import descriptors
+
+    assert descriptors._DESCRIPTORS_PER_GEMM == TABLE_DESCRIPTORS_PER_GEMM
 
 
 @pytest.mark.parametrize(
@@ -130,7 +137,9 @@ def test_core_dispatch_does_not_hardcode_table_gemm_providers():
     ("major", "minor", "architecture", "wgmma"),
     [(9, 0, "sm90a", True), (10, 0, "sm100", False), (12, 1, "sm121", False)],
 )
-def test_cuda_target_facts_preserve_existing_architecture_mapping(monkeypatch, major, minor, architecture, wgmma):
+def test_cuda_target_facts_preserve_existing_architecture_mapping(
+    monkeypatch, major, minor, architecture, wgmma
+):
     properties = SimpleNamespace(
         major=major,
         minor=minor,
@@ -146,7 +155,9 @@ def test_cuda_target_facts_preserve_existing_architecture_mapping(monkeypatch, m
 
 
 def test_cuda_target_rejects_unregistered_device(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(major=8, minor=0))
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda device: SimpleNamespace(major=8, minor=0)
+    )
     with pytest.raises(UnsupportedCompiler, match="found sm80"):
         _target_facts(torch.device("cuda:0"))
 
