@@ -3,7 +3,9 @@ from __future__ import annotations
 import ast
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 
+import pytest
 import torch
 
 from megabake import (
@@ -112,6 +114,24 @@ def test_emit_cute_reuses_phase_runners_with_event_scheduling(tmp_path):
     assert "(0, _ignore_epoch, _run_variant_0, _publish_phase_0)" in generated.source
 
 
+@pytest.mark.parametrize("count", [1, 2])
+def test_event_worker_loop_emits_a_tuple_for_each_phase(count):
+    from megabake.codegen import _event_worker_loop
+
+    phases = tuple(
+        SimpleNamespace(index=index, region_id=f"r{index}", dependencies=())
+        for index in range(count)
+    )
+    plan = SimpleNamespace(phases=phases)
+    schedule = SimpleNamespace(events=())
+    source = "def run():\n" + _event_worker_loop(
+        plan, {index: f"_run{index}" for index in range(count)}, schedule
+    )
+    call = ast.parse(source).body[0].body[0].value
+    assert isinstance(call.args[3], ast.Tuple)
+    assert len(call.args[3].elts) == count
+
+
 def test_emit_cute_puts_g0_inside_one_cooperative_kernel(tmp_path):
     class Model(torch.nn.Module):
         def forward(self, source, weight):
@@ -136,6 +156,33 @@ def test_emit_cute_puts_g0_inside_one_cooperative_kernel(tmp_path):
     assert ".prepare(" in generated.source
     assert ".run(" in generated.source
     assert "launch = body" not in generated.source
+
+
+def test_emit_cute_table_dispatches_the_registered_gemm_body(tmp_path):
+    from megabake.bodies.cuda.sm90 import cutlass_gemm
+
+    class Model(torch.nn.Module):
+        def forward(self, source, weight):
+            return source @ weight.T
+
+    inputs = (
+        torch.randn(4, 576, dtype=torch.bfloat16),
+        torch.randn(1536, 576, dtype=torch.bfloat16),
+    )
+    prepared = prepare_fx_graph(torch.export.export(Model(), inputs).graph_module, inputs)
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
+    selection = select_bodies(graph, _target(), SelectionPolicy(table_launch=True))
+    plan = assign_storage(make_phase_schedule(selection, derive_dependencies(selection)))
+
+    generated = emit_cute(plan, tmp_path, table=True)
+
+    ast.parse(generated.source)
+    assert any(phase.provider == "g0_range" for phase in generated.launch.phases)
+    assert "HopperWgmmaGemmPersistentKernel(" in generated.source
+    assert "build_table_descriptors(" in generated.source
+    assert generated.launch.gemm_table
+    entry = next(entry for entry in generated.source_map if entry.body_provider == "g0_range")
+    assert entry.source_path == cutlass_gemm.__file__
 
 
 def test_emit_cute_reuses_g0_scratch_for_duplicate_body_variants(tmp_path):

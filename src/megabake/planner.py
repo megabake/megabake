@@ -426,6 +426,8 @@ def _attention_body_order(
 def _contraction_body_order(
     config: BodyConfig, program: TensorProgram, policy: SelectionPolicy
 ) -> tuple[int, ...]:
+    if config.selection_priority:
+        return (config.selection_priority, 0, 0, 0, *_body_cost(config))
     small_m = program.store.shape[0] <= 16
     mode_priority = 0 if (policy.mode == "decode") == small_m else 1
     small_tile = config.tiles.cta_shape[-1] <= 64

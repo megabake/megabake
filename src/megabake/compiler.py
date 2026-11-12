@@ -18,7 +18,7 @@ import torch
 from torch.utils import _pytree as pytree
 
 from .bodies import SelectionPolicy, TargetFacts
-from .bodies.catalog import launch_options
+from .bodies.catalog import is_table_gemm, launch_options, table_gemm
 from .bodies.cuda.sm90.gemm import TABLE_DESCRIPTORS_PER_GEMM, cute_gemm_tensors, is_swap_ab
 from .cache import PlanCache, make_plan_key
 from .codegen import GEMM_SECOND_A_COLUMN, GeneratedCuTeModule, emit_cute
@@ -1027,6 +1027,8 @@ class GraphedCall:
 
     def __init__(self, function: Callable[..., Any], args: tuple[Any, ...], warmup: int):
         global _graph_capture
+        # The graph retains kernel handles, so their compiled owner must stay alive.
+        self._function = function
         self._inputs, self._spec = pytree.tree_flatten(args)
         saved = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in self._inputs]
         side = torch.cuda.Stream()
@@ -1249,6 +1251,8 @@ def _search_scheduler(
     reset_state: Callable[[], None] | None = None,
     teacher_check: _TeacherForcedCheck | None = None,
 ):
+    if policy is not None:
+        policy = replace(policy, event_schedule=scheduler == "region-events")
     evaluator = (
         budget.evaluator
         if scheduler == "phase" and budget.evaluator is not None
@@ -2052,7 +2056,7 @@ class _RuntimeState:
         g0_tensors = tuple(
             _g0_operands(phase.body, selected, plan.graph, input_tensors, values)
             for phase in plan.phases
-            if phase.body.provider == "g0_range"
+            if is_table_gemm(phase.body.provider)
             and (not table_launch or phase.index in template_phases)
             for selected in plan.selection.selections
             if selected.region_id == phase.region_id
@@ -2751,6 +2755,9 @@ def _g0_operands(
     if output.dim() != 2:
         # A fused epilogue stores its chain's result, viewed as the GEMM output.
         output = output.reshape(selected.program.store.shape)
+    gemm_impl = table_gemm(body.provider)
+    if gemm_impl is not None:
+        return gemm_impl.arrange_operands(activation, weights, output)
     if is_swap_ab(body):
         return (*weights, activation, output.t())
     return (activation, *weights, output)

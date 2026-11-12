@@ -44,6 +44,27 @@ def provider(name: str) -> BodyProvider:
     raise KeyError(f"no body provider named {name!r}")
 
 
+def table_gemm(name: str):
+    """SM100 table helpers; Hopper retains its existing GEMM path."""
+    return sm100.table if name == sm100.table.PROVIDER_NAME else None
+
+
+def is_table_gemm(name: str) -> bool:
+    """Recognize Hopper and SM100 table GEMMs."""
+    return name == sm90.G0RangeBodyProvider.provider_name or table_gemm(name) is not None
+
+
+def tuner_for_device():
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("tuning requires a CUDA device")
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) != (10, 0):
+        raise RuntimeError(f"no tuning provider for sm{major}{minor}")
+    return sm100.tuning
+
+
 def launch_options(graph: ComputeGraph, target: TargetFacts, table_launch: bool) -> Any:
     """The ``SelectionPolicy.target_options`` of a launch of ``graph``."""
     found = generation(target)

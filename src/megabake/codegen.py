@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from .bodies.catalog import provider
+from .bodies.catalog import is_table_gemm, provider, table_gemm
 from .bodies.cuda.generic import emit_map_body
 from .bodies.cuda.sm90.cutlass_gemm import STREAM_TAG_SLOT
 from .bodies.cuda.sm90.gemm import (
@@ -198,6 +198,14 @@ def emit_cute(
     verify_plan(plan)
     if plan.launch.architecture not in {"sm90a", "sm100", "sm103", "sm120", "sm121"}:
         raise UnsupportedCodegen("codegen supports SM90 and Blackwell plans only")
+    if event_schedule is not None or not table:
+        for phase in plan.phases:
+            gemm_impl = table_gemm(phase.body.provider)
+            if gemm_impl is not None:
+                try:
+                    gemm_impl.validate_launch(event_schedule, table)
+                except ValueError as error:
+                    raise UnsupportedCodegen(str(error)) from error
 
     if event_schedule is None and (
         table or not any(phase.body.provider == "g0_range" for phase in plan.phases)
@@ -727,6 +735,11 @@ def _emit_table_module(
     number of distinct bodies rather than by the number of layers.
     """
     has_gemm = any(phase.body.provider == "g0_range" for phase in plan.phases)
+    gemm_impl = next(
+        (impl for phase in plan.phases if (impl := table_gemm(phase.body.provider)) is not None),
+        None,
+    )
+    has_gemm = has_gemm or gemm_impl is not None
     selected = {
         selection.region_id: (
             _widened_selection(selection, plan.launch.threads_per_block) if has_gemm else selection
@@ -840,7 +853,7 @@ def _emit_table_module(
 
     for phase in plan.phases:
         selection = selected[phase.region_id]
-        if phase.body.provider == "g0_range":
+        if is_table_gemm(phase.body.provider):
             if phase.conversion_bodies:
                 raise UnsupportedCodegen(
                     f"table GEMM phase {phase.region_id} needs a layout conversion"
@@ -857,6 +870,14 @@ def _emit_table_module(
             bias = has_bias(phase.body)
             fused = has_fused_epilogue(phase.body)
             paired = is_paired(phase.body)
+            swap_ab = is_swap_ab(phase.body)
+            if gemm_impl is not None:
+                try:
+                    tile, splits, bias, fused, paired, swap_ab = gemm_impl.codegen_config(
+                        phase.body, program
+                    )
+                except ValueError as error:
+                    raise UnsupportedCodegen(str(error)) from error
             fused_loads = epilogue_loads(program) if fused else ()
             fused_layouts = tuple(
                 tensor_arguments[
@@ -888,7 +909,7 @@ def _emit_table_module(
                 # CUTLASS problem shape; swapAB computes the transposed product.
                 gemm_shapes.append(
                     (columns, rows, reduction, True)
-                    if is_swap_ab(phase.body)
+                    if swap_ab
                     else (rows, columns, reduction, False)
                 )
                 gemm_splits.append(splits)
@@ -900,7 +921,7 @@ def _emit_table_module(
                     "scratch": phase.body.scratch.size_bytes,
                     "splits": splits,
                     "bias_features": columns if bias else 0,
-                    "swap_ab": is_swap_ab(phase.body),
+                    "swap_ab": swap_ab,
                     "bias": bias,
                     "paired": paired,
                 }
@@ -936,7 +957,7 @@ def _emit_table_module(
             second_a_slot = gemm_slots.pop() + 1 if paired else 0
             # Row: variant, A, B, C, then the bias slot + 1 (0 without bias).
             bias_slot = gemm_slots.pop() + 1 if bias else 0
-            if is_swap_ab(phase.body):
+            if swap_ab:
                 # CUTLASS A is the weight and B the activation.
                 gemm_slots = [gemm_slots[1], gemm_slots[0], *gemm_slots[2:]]
             gemm_slots.append(
@@ -1243,6 +1264,10 @@ def _emit_table_module(
             )
             + ")"
         )
+        if gemm_impl is not None:
+            gemm_definitions[-1] = gemm_impl.table_definition(
+                spec, gemm_kernel_tiles[gemm_variant], epilogues
+            )
         split_state = (
             [
                 "                (",
@@ -1301,7 +1326,7 @@ def _emit_table_module(
                 *(line for line in bias_state if line),
                 *(
                     ["                c_address=addresses[gemm_table[phase_table[phase, 6], 3]],"]
-                    if spec["swap_ab"] and spec["splits"] == 1
+                    if spec["swap_ab"] and (spec["splits"] == 1 or gemm_impl is not None)
                     else []
                 ),
                 *epilogue_state,
@@ -1381,7 +1406,9 @@ def _emit_table_module(
     scratch_prelude = _scratch_prelude(scratch_plan, scratch_elements)
     shared_memory_bytes = plan.launch.dynamic_shared_memory_bytes
     if has_gemm:
-        if len(gemm_scratch_bytes) != 1 or len({key[0] for key in gemm_variants}) != 1:
+        if len(gemm_scratch_bytes) != 1 or (
+            gemm_impl is None and len({key[0] for key in gemm_variants}) != 1
+        ):
             raise UnsupportedCodegen(
                 "table-launched GEMMs must share one tile and shared-memory layout"
             )
@@ -1553,6 +1580,9 @@ def _emit_table_module(
         if has_gemm
         else ""
     )
+    if gemm_impl is not None:
+        gemm_import = gemm_impl.table_import()
+        gemm_splits = list(gemm_impl.descriptor_splits(gemm_splits))
     source = f"""import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
@@ -2033,12 +2063,17 @@ def _event_worker_loop(
         )
         for phase in plan.phases
     )
+    entry_source = ("," + chr(10)).join(
+        f"            ({entry[0]}, {entry[1]}, {entry[2]}, {entry[3]})" for entry in entries
+    )
+    if len(entries) == 1:
+        entry_source += ","
     return f"""    cooperative_event_worker_loop(
         ready,
         workers,
         epoch,
         (
-{("," + chr(10)).join(f"            ({entry[0]}, {entry[1]}, {entry[2]}, {entry[3]})" for entry in entries)}
+{entry_source}
         ),
     )
 """
@@ -2047,6 +2082,9 @@ def _event_worker_loop(
 def _widened_selection(selection: SelectedBody, threads: int) -> SelectedBody:
     """``selection`` with its body run by CTAs of the launch's ``threads``."""
     body = selection.body
+    gemm_impl = table_gemm(body.provider)
+    if gemm_impl is not None:
+        return gemm_impl.widen_selection(selection, threads)
     if body.participants.participating_threads == threads:
         return selection
     return replace(selection, body=provider(body.provider).widen(selection.program, body, threads))
@@ -2219,7 +2257,7 @@ def _affine_work_iterator(body_source: str, step: int, tile_count: int) -> str:
 def _generic_scratch_bytes(plan: KernelPlan, scratch_elements: Mapping[int, int]) -> int:
     sizes = []
     for phase in plan.phases:
-        if phase.body.provider == "g0_range":
+        if is_table_gemm(phase.body.provider):
             continue
         offset = 0
         for _ in phase.body.pipeline.barriers:
@@ -2237,11 +2275,11 @@ def _shared_scratch_source(plan: KernelPlan, scratch_elements: Mapping[int, int]
     worker = plan.storage.worker_scratch[0]
     phase_structs: list[str] = []
     scratch_phase_indices: list[int] = []
-    generic_phases = tuple(phase for phase in plan.phases if phase.body.provider != "g0_range")
+    generic_phases = tuple(phase for phase in plan.phases if not is_table_gemm(phase.body.provider))
     if not any(_phase_has_scratch_fields(phase) for phase in generic_phases):
         return ""
     for phase_layout, phase in zip(worker.phases, plan.phases, strict=True):
-        if phase.body.provider == "g0_range":
+        if is_table_gemm(phase.body.provider):
             continue
         fields: list[str] = []
         for index, name in enumerate(phase.body.pipeline.barriers):
@@ -2297,12 +2335,12 @@ def _shared_scratch_source(plan: KernelPlan, scratch_elements: Mapping[int, int]
 
 
 def _scratch_prelude(plan: KernelPlan, scratch_elements: Mapping[int, int]) -> str:
-    generic_phases = tuple(phase for phase in plan.phases if phase.body.provider != "g0_range")
+    generic_phases = tuple(phase for phase in plan.phases if not is_table_gemm(phase.body.provider))
     if not any(_phase_has_scratch_fields(phase) for phase in generic_phases):
         return ""
     lines = ["    _worker_scratch = cutlass.utils.SmemAllocator().allocate(_WorkerScratch)"]
     for phase in plan.phases:
-        if phase.body.provider == "g0_range":
+        if is_table_gemm(phase.body.provider):
             continue
         if _phase_has_scratch_fields(phase):
             elements = _phase_scratch_elements(plan, phase, scratch_elements)
@@ -2311,7 +2349,7 @@ def _scratch_prelude(plan: KernelPlan, scratch_elements: Mapping[int, int]) -> s
                 f".get_tensor(cute.make_layout({elements}))"
             )
     for phase in plan.phases:
-        if phase.body.provider == "g0_range":
+        if is_table_gemm(phase.body.provider):
             continue
         if _phase_has_scratch_fields(phase):
             for index in range(len(phase.body.pipeline.barriers)):
@@ -2395,6 +2433,24 @@ def _source_map(
         if record.provider == "g0_range":
             source_path = Path(inspect.getsourcefile(HopperWgmmaGemmPersistentKernel))
             lines, line_start = inspect.getsourcelines(HopperWgmmaGemmPersistentKernel.run)
+            entries.append(
+                SourceMapEntry(
+                    record.body_symbol,
+                    "device_body",
+                    line_start,
+                    line_start + len(lines) - 1,
+                    record.index,
+                    record.region_id,
+                    record.provider,
+                    record.body_name,
+                    selected[record.region_id].source_op_ids,
+                    str(source_path),
+                )
+            )
+        elif (gemm_impl := table_gemm(record.provider)) is not None:
+            source_object = gemm_impl.source_object()
+            source_path = Path(inspect.getsourcefile(source_object))
+            lines, line_start = inspect.getsourcelines(source_object)
             entries.append(
                 SourceMapEntry(
                     record.body_symbol,

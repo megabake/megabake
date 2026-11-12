@@ -48,6 +48,7 @@ class SelectionPolicy:
     target_options: Any = None
     numerical_policy: str = "source_semantics"
     require_measured: bool = False
+    event_schedule: bool = False
 
 
 @dataclass(frozen=True)
@@ -156,6 +157,9 @@ class BodyConfig:
     completion: CompletionContract
     evidence: ResourceEvidence
     entrypoint: DeviceEntry = DeviceEntry()
+    # Providers may prioritize a compatible implementation over the default
+    # cost ordering. Zero retains the generic planner's normal ordering.
+    selection_priority: int = 0
 
 
 @dataclass(frozen=True)
