@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 import platform
 import threading
@@ -14,7 +15,14 @@ import torch
 from .graph import ComputeGraph
 from .plan import BodySelectionPlan, KernelPlan
 from .platform import cutlass
-from .runtime import PHASE_TIMER_SLOTS, WEIGHT_STREAM_STAGES
+from .runtime import (
+    PHASE_TIMER_SLOTS,
+    WEIGHT_STREAM_STAGES,
+    producer_ring_pages,
+    producer_warp_enabled,
+    stall_inject_phase,
+    stall_timeout_ns,
+)
 
 if TYPE_CHECKING:
     from .frontend import CaptureContext
@@ -64,6 +72,7 @@ def make_plan_key(
     scheduler: str = "phase",
     toolchain: Mapping[str, str] | None = None,
     body_revisions: Sequence[tuple[str, str, str]] | None = None,
+    device: str | None = None,
 ) -> str:
     payload = {
         "plan": _plan_data(plan, body_revisions),
@@ -73,6 +82,26 @@ def make_plan_key(
         # Timed kernels write stamps past the barrier state of an untimed buffer.
         "phase_timer_slots": PHASE_TIMER_SLOTS,
         "weight_stream_stages": WEIGHT_STREAM_STAGES,
+        # Stall checks (X0.3) are compiled in or out when the kernel is generated.
+        "stall_timeout_ns": stall_timeout_ns(),
+        "stall_inject": stall_inject_phase(),
+        "producer_warp": producer_warp_enabled(),
+        "ring_pages": producer_ring_pages(),
+        # The device tree's digest: the planner's choices follow its numbers.
+        "device": device,
+        "stall_inject_ring": os.environ.get("MEGABAKE_STALL_INJECT_RING"),
+        # Counted GEMMs change the schedule's barriers.
+        "counted_gemm": os.environ.get("MEGABAKE_COUNTED_GEMM", "1"),
+        # Forced split-K changes the selected GEMM bodies.
+        "split_k_force": os.environ.get("MEGABAKE_SPLIT_K_FORCE"),
+        # CTA balancing changes every phase's rotation.
+        "balance_ctas": os.environ.get("MEGABAKE_BALANCE_CTAS", "0"),
+        # GEMV bodies change the selected bodies of narrow decode GEMMs.
+        "gemv": (
+            os.environ.get("MEGABAKE_GEMV", "1"),
+            os.environ.get("MEGABAKE_GEMV_MIN_ROWS"),
+            os.environ.get("MEGABAKE_GEMV_MAX_ROWS"),
+        ),
     }
     encoded = json.dumps(
         _canonical(payload), sort_keys=True, separators=(",", ":"), allow_nan=False

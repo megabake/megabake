@@ -148,8 +148,8 @@ def test_split_context_decode_matches_eager_at_long_contexts(tmp_path, table_lau
     from megabake import make_backend
     from megabake.bodies.cuda.sm90.attention import (
         DECODE_PACKED_KEYS_PER_HEAD,
-        decode_chunks,
         decode_packed_heads,
+        decode_split_steps,
     )
 
     torch.manual_seed(11)
@@ -199,9 +199,70 @@ def test_split_context_decode_matches_eager_at_long_contexts(tmp_path, table_lau
             assert all(int(length.item()) == context + 1 for length in actual_state[2 * LAYERS :])
     # The longest context splits each row over several chunks, and the
     # contexts run both the one-head and the packed rows.
-    assert decode_chunks(3, backend.megabake_last_compiled.plan.launch.grid_size) > 1
+    workers = backend.megabake_last_compiled.plan.launch.grid_size
+    steps = decode_split_steps(3, workers, 3, 64, capacity)
+    assert any(first <= 1001 and count > 1 for first, count in steps)
     packed = decode_packed_heads(3, 64)
     assert packed == 3 and 200 < DECODE_PACKED_KEYS_PER_HEAD * packed <= 1000
+
+
+def test_forced_split_k_decode_matches_fp32_like_eager(tmp_path, table_launch, monkeypatch):
+    """Every decode GEMM split over K (paired, residual-epilogue and plain
+    variants): logits and KV entries over four calls are as close to fp32 as
+    eager bf16 is, and repeat bit-exactly (fixed-owner sums in split order)."""
+    import copy
+
+    from megabake import make_backend
+
+    # SmolLM-135M shapes (output tiles, K tiles): q/o (9, 9), k/v (3, 9),
+    # gate/up (24, 9), down (9, 24), vocabulary (768, 9).
+    monkeypatch.setenv(
+        "MEGABAKE_SPLIT_K_FORCE", "9,9:3;3,9:3;24,9:3;9,24:4;768,9:3"
+    )
+    torch.manual_seed(7)
+    model = StatefulSmolLMArchitecture(layers=LAYERS, device="cuda", dtype=torch.bfloat16)
+    exact_model = copy.deepcopy(model).float()
+
+    def state(dtype):
+        return [
+            *(torch.zeros(1, 6, 3, 64, device="cuda", dtype=dtype) for _ in range(2 * LAYERS)),
+            *(torch.zeros(1, device="cuda", dtype=torch.int32) for _ in range(LAYERS)),
+        ]
+
+    def relative(actual, expected):
+        return (actual.float() - expected.float()).norm().item() / expected.float().norm().item()
+
+    backend = make_backend(
+        mode="decode", compile_kernel=True, cache=False, dump_dir=tmp_path, scheduler="phase"
+    )
+    optimized = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
+    runs = []
+    with torch.no_grad():
+        for _ in range(2):
+            actual_state, reference_state = state(torch.bfloat16), state(torch.bfloat16)
+            exact_state = state(torch.float32)
+            outputs = []
+            for position, token in enumerate((5, 6, 7, 8)):
+                token_ids = torch.tensor([[token]], device="cuda")
+                position_ids = torch.tensor([[position]], device="cuda")
+                actual = optimized(token_ids, position_ids, *actual_state)
+                expected = model(token_ids, position_ids, *reference_state)
+                exact = exact_model(token_ids, position_ids, *exact_state)
+                assert relative(actual, exact) <= 1.25 * relative(expected, exact) + 1e-3
+                outputs.append(actual.clone())
+            for actual_cache, exact_cache in zip(actual_state, exact_state, strict=True):
+                if actual_cache.dtype != torch.int32:
+                    assert relative(actual_cache[:, :4], exact_cache[:, :4]) <= 2e-2
+            runs.append(outputs)
+    for first, second in zip(*runs, strict=True):
+        assert torch.equal(first, second)
+    names = [
+        phase.body.name
+        for phase in backend.megabake_last_compiled.plan.phases
+        if phase.body.provider == "g0_range"
+    ]
+    assert len(names) == PROJECTIONS
+    assert all("_k" in name for name in names), names
 
 
 def test_table_launch_streams_weights_in_stateful_decode(tmp_path, table_launch, monkeypatch):

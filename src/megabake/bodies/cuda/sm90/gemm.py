@@ -11,6 +11,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from math import prod
+from typing import Any
 
 from ....graph import ComputeGraph, Region
 from ....ir import TensorProgram
@@ -117,7 +118,10 @@ def build_table_descriptors(
     )
     operands = 3
     if cutlass.const_expr(a2_address is not None):
-        tensors = (*tensors, _bf16_tensor(a2_address, (m, k, 1), (k, 1, m * k)))
+        tensors = (
+            *tensors,
+            _bf16_tensor(a2_address, (m, chunk, splits), (k, 1, chunk if splits > 1 else m * k)),
+        )
         operands = 4
     for operand in cutlass.range_constexpr(operands):
         pointer = table_descriptor(descriptors, gemm, operand, cute.AddressSpace.gmem)
@@ -351,13 +355,17 @@ class G0RangeBodyProvider:
                 token_tile = options.swap_ab_rows
                 if rows > token_tile:
                     return reject(f"swapAB GEMMs of this launch take at most {token_tile} rows")
+                tiles = -(-columns // 64)
                 splits = (
-                    split_k_count(
-                        -(-columns // 64), reduction_size // 64, target.multiprocessor_count
-                    )
+                    split_k_count(tiles, reduction_size // 64, target.multiprocessor_count)
                     if options.split_k and not fused
                     else 1
                 )
+                if options.splits and not fused:
+                    splits = dict(options.splits).get((tiles, reduction_size // 64), 1)
+                forced = _forced_splits(tiles, reduction_size // 64)
+                if forced is not None:
+                    splits = forced
                 return CandidateSet(
                     (
                         _g0_config(
@@ -421,6 +429,22 @@ def split_k_count(tiles: int, k_tiles: int, workers: int) -> int:
     return best
 
 
+def _forced_splits(tiles: int, k_tiles: int) -> int | None:
+    """Experiment knob: ``MEGABAKE_SPLIT_K_FORCE="tiles,k_tiles:splits;..."``
+    forces the split of GEMMs with that many output tiles and K tiles."""
+    spec = os.environ.get("MEGABAKE_SPLIT_K_FORCE")
+    if not spec:
+        return None
+    for entry in spec.split(";"):
+        shape, splits = entry.split(":")
+        if tuple(int(v) for v in shape.split(",")) == (tiles, k_tiles):
+            splits = int(splits)
+            if k_tiles % splits or k_tiles // splits < SPLIT_K_MIN_K_TILES:
+                raise ValueError(f"cannot split {k_tiles} K tiles {splits} ways")
+            return splits
+    return None
+
+
 def has_bias(body: BodyConfig) -> bool:
     """Whether a G0 GEMM body adds a bias in its epilogue (addmm)."""
     return body.name.endswith("_bias")
@@ -476,8 +500,11 @@ def _bias_epilogue_rejection(program) -> str | None:
 
 
 def split_k(body: BodyConfig) -> int:
-    """K splits of a G0 GEMM body (1 without split-K)."""
-    match = re.search(r"_k(\d+)(?:_bias)?$", body.name)
+    """K splits of a G0 GEMM body (1 without split-K, and for other
+    providers' bodies, such as SM100's, which name their splits alike)."""
+    if not body.name.startswith("g0_range_"):
+        return 1
+    match = re.search(r"_k(\d+)(?=_|$)", body.name)
     return int(match.group(1)) if match else 1
 
 
@@ -519,23 +546,126 @@ class HopperLaunchOptions:
     # Split the K range of swapAB GEMMs that have fewer weight tiles than
     # SMs (see split_k_count).
     split_k: bool = False
+    # The planner's choice with a device tree (``plan_splits``): K splits of
+    # the GEMMs with (output tiles, K tiles), 1 for shapes not listed.
+    splits: tuple[tuple[tuple[int, int], int], ...] = ()
 
 
-def launch_options(graph: ComputeGraph, table_launch: bool) -> HopperLaunchOptions:
-    """SwapAB when every GEMM of a table launch is small-M; split-K on
-    request (``MEGABAKE_SPLIT_K=1``)."""
-    shapes = tuple(
-        tuple(operation.tensor_program.store.shape)
+def launch_options(
+    graph: ComputeGraph, table_launch: bool, device: Any = None
+) -> HopperLaunchOptions:
+    """SwapAB when every GEMM of a table launch is small-M. With a device
+    tree the planner chooses each GEMM shape's K split from the cost model
+    (``plan_splits``); without one, split-K is on request
+    (``MEGABAKE_SPLIT_K=1``)."""
+    programs = tuple(
+        operation.tensor_program
         for operation in graph.ops.values()
         if isinstance(operation.tensor_program, TensorProgram)
         and operation.tensor_program.family == "contraction"
         and len(operation.tensor_program.store.shape) == 2
     )
+    shapes = tuple(tuple(program.store.shape) for program in programs)
     swap_ab = table_launch and wants_swap_ab(shapes)
+    rows = swap_ab_rows(shapes) if swap_ab else 16
+    forced = os.environ.get("MEGABAKE_SPLIT_K") == "1"
     return HopperLaunchOptions(
         swap_ab=swap_ab,
-        swap_ab_rows=swap_ab_rows(shapes) if swap_ab else 16,
-        split_k=swap_ab and os.environ.get("MEGABAKE_SPLIT_K") == "1",
+        swap_ab_rows=rows,
+        split_k=swap_ab and forced,
+        # Only on a calibrated tree: a spec tree's rates are assumptions.
+        splits=plan_splits(programs, rows, device)
+        if swap_ab and device is not None and device.measured and not forced
+        else (),
+    )
+
+
+def plan_splits(
+    programs: Sequence[TensorProgram], token_rows: int, tree: Any
+) -> tuple[tuple[tuple[int, int], int], ...]:
+    """The K split of each swapAB GEMM shape class of a launch, from the cost
+    model: ``((output tiles, K tiles), splits)`` for the shapes that split.
+
+    Splitting is a launch-wide trade. A split GEMM puts more leaves on the
+    root edge, which pays where the edge is not yet saturated; but one split
+    GEMM takes the producer away from every GEMM of the kernel (its pages
+    hold whole K ranges), so the unsplit kernel keeps its staged starts. Both
+    kernels are joined class by class and the split one must win by the
+    model's margin."""
+    from ....costmodel import Interval, gemm_work, interval_time
+    from ....einsum import einsum_view
+    from ....runtime import producer_warp_enabled
+    from ....search import Candidate, ShapeClass, best_of, join
+
+    workers = tree.workers
+    counts: dict[tuple[int, int, int], int] = {}
+    for program in programs:
+        view = einsum_view(program)
+        reduction = next(view.ranks[axis] for axis in program.reduction_axes)
+        columns = program.store.shape[1]
+        if columns % 64 or reduction % 64:
+            continue
+        key = (-(-columns // 64), reduction // 64, program.store.shape[0])
+        counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return ()
+    staged = token_rows == 16 and producer_warp_enabled()
+    if staged:
+        # Keep the producer. Its gain is run-ahead: the next interval's weights
+        # load during norms, attention and barriers. The per-interval model
+        # below has no term for that (fitted on a full H200, staged_start_s
+        # 1.44 us against start_s 1.42 us), so it prefers split-K. Measured on
+        # Llama-3.2-1B decode, 132 SMs (2026-11-20): split q/k/v with no
+        # producer 1,327-1,330 us; unsplit with the producer 1,176 us, and
+        # 1,159 us with counted GEMMs, which need the producer.
+        return ()
+
+    def seconds(tiles: int, k_tiles: int, token: int, splits: int, staged: bool) -> float:
+        tile_bytes = 64 * k_tiles * 64 * 2 + (token * k_tiles * 64 + token * 64) * 2
+        work = gemm_work(
+            "gemm", tree, tiles=tiles, tile_bytes=tile_bytes,
+            tile_flops=2.0 * token * 64 * k_tiles * 64, splits=splits, staged=staged,
+        )
+        return interval_time(Interval((work,), workers, "none"), tree).critical_s
+
+    def classes(split: bool) -> list[ShapeClass]:
+        result = []
+        for (tiles, k_tiles, token), count in counts.items():
+            options = [1]
+            if split:
+                options += [
+                    splits
+                    for splits in range(2, SPLIT_K_MAX + 1)
+                    if k_tiles % splits == 0
+                    and k_tiles // splits >= SPLIT_K_MIN_K_TILES
+                    and tiles * splits <= workers
+                ]
+            result.append(
+                ShapeClass(
+                    (tiles, k_tiles, token),
+                    count,
+                    tuple(
+                        Candidate(
+                            splits,
+                            seconds(tiles, k_tiles, token, splits, staged and not split),
+                            # Split partials: FP32 accumulators in phase scratch.
+                            {"phase_scratch_bytes": 0.0 if splits == 1 else token * 64 * 4.0 * splits},
+                        )
+                        for splits in options
+                    ),
+                )
+            )
+        return result
+
+    alternatives = {"unsplit": join(classes(False)), "split": join(classes(True))}
+    if best_of(alternatives) != "split":
+        return ()
+    return tuple(
+        sorted(
+            ((tiles, k_tiles), splits)
+            for (tiles, k_tiles, _), splits in alternatives["split"].choices.items()
+            if splits > 1
+        )
     )
 
 

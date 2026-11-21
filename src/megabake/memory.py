@@ -680,7 +680,8 @@ def _state_value_ids(graph: ComputeGraph) -> frozenset[str]:
             operation.effects.get("mutates_inputs") or operation.effects.get("may_mutate_inputs")
         ):
             continue
-        state_ids.update(value_id for value_id in operation.operands if value_id in graph.inputs)
+        written = operation.effects.get("mutated_operands", operation.operands)
+        state_ids.update(value_id for value_id in written if value_id in graph.inputs)
     return frozenset(state_ids)
 
 

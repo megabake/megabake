@@ -10,12 +10,19 @@ linear-attention layers own a convolution window and a recurrent state.
 from __future__ import annotations
 
 import inspect
+import os
 import sys
 
 import torch
 from transformers.activations import ACT2FN
 
 from megabake.ops.attention import kv_attention
+from megabake.fx_handler.hf_attention import linear_mixer
+
+# MEGABAKE_LINEAR_ATTENTION=0 runs linear-attention decode as its decomposed
+# ops (an A/B switch); by default each layer's token mixer is one declared
+# ``megabake::linear_attention``.
+DECLARED_LINEAR_ATTENTION = os.environ.get("MEGABAKE_LINEAR_ATTENTION", "1") != "0"
 
 
 def text_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -67,7 +74,9 @@ class StatefulCausalLM(torch.nn.Module):
                 mixer = layer.linear_attn
                 shapes.append(
                     [
-                        ((1, mixer.conv_dim, mixer.conv_kernel_size - 1), torch.bfloat16),
+                        # The declared op's window is a ring of kernel slots; the
+                        # decomposed step shifts kernel - 1 of them.
+                        ((1, mixer.conv_dim, mixer.conv_kernel_size - (0 if DECLARED_LINEAR_ATTENTION else 1)), torch.bfloat16),
                         ((1, mixer.num_v_heads, mixer.head_k_dim, mixer.head_v_dim), torch.float32),
                     ]
                 )
@@ -115,7 +124,12 @@ class StatefulCausalLM(torch.nn.Module):
             attended = attended * torch.sigmoid(gate)
         return attention.o_proj(attended)
 
-    def _linear_attention(self, mixer, normalized, conv_state, recurrent_state):
+    def _linear_attention(self, mixer, normalized, conv_state, recurrent_state, position_ids):
+        if DECLARED_LINEAR_ATTENTION:
+            return linear_mixer(mixer).decode(mixer, normalized, conv_state, recurrent_state, position_ids)
+        return self._decomposed_linear_attention(mixer, normalized, conv_state, recurrent_state)
+
+    def _decomposed_linear_attention(self, mixer, normalized, conv_state, recurrent_state):
         batch, sequence, _ = normalized.shape
         mixed = mixer.in_proj_qkv(normalized).transpose(1, 2)
         window = torch.cat([conv_state, mixed], dim=-1)
@@ -154,6 +168,11 @@ class StatefulCausalLM(torch.nn.Module):
         position_ids = position_ids.to(torch.int64)
         rotary_positions = _rotary_positions(self.config, position_ids)
         rotary = {}
+        rotary_positions = position_ids
+        if hasattr(self.model.rotary_emb, "mrope_section") and position_ids.ndim == 2:
+            # Multimodal RoPE (Qwen3.5) takes (3, batch, positions); text-only
+            # input repeats the same positions, as the Hugging Face model does.
+            rotary_positions = position_ids[None].expand(3, *position_ids.shape)
         for kind in set(self.layer_types) - {"linear_attention"}:
             arguments = (kind,) if self.rotary_takes_type else ()
             rotary[kind] = self.model.rotary_emb(hidden, rotary_positions, *arguments)
@@ -162,9 +181,7 @@ class StatefulCausalLM(torch.nn.Module):
             residual = hidden
             normalized = layer.input_layernorm(hidden)
             if kind == "linear_attention":
-                mixed = self._linear_attention(
-                    layer.linear_attn, normalized, *state[offset : offset + 2]
-                )
+                mixed = self._linear_attention(layer.linear_attn, normalized, *state[offset : offset + 2], position_ids)
                 offset += 2
             else:
                 mixed = self._attention(

@@ -83,10 +83,8 @@ def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path
     source_lines = generated.source.splitlines()
     for symbol, expected in (
         ("_body_0", "sync_threads"),
-        (
-            "megabake_kernel",
-            "counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])",
-        ),
+        # Stall checks (X0.3) are on by default: the checked barrier.
+        ("megabake_kernel", "checked_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1],"),
         ("launch", ".launch("),
     ):
         entry = next(entry for entry in generated.source_map if entry.symbol == symbol)
@@ -261,7 +259,10 @@ def test_emit_cute_keeps_g0_variants_with_different_configurations(tmp_path):
     assert generated.launch.shared_memory_bytes == 444_416
 
 
-def test_emit_cute_emits_explicit_layout_conversion(tmp_path):
+def test_emit_cute_emits_explicit_layout_conversion(tmp_path, monkeypatch):
+    # relu -> sum would fuse as a reduction prologue, leaving no conversion.
+    monkeypatch.setenv("MEGABAKE_REDUCTION_PROLOGUE", "0")
+
     class Model(torch.nn.Module):
         def forward(self, value):
             return value.relu().sum(dim=-1)

@@ -605,6 +605,22 @@ def make_backend(**options: Any) -> Callable[..., Any]:
             input_kinds=input_kinds,
             parameter_names=parameter_names,
         )
+        hoisted = None
+        if parameter_names:
+            from .hoist import hoist_prepared, hoisting_enabled
+
+            if hoisting_enabled():
+                # Parameter-only work becomes extra parameter inputs (hoist.py).
+                prepared, hoisted = hoist_prepared(prepared)
+        original_inputs = tuple(example_inputs)
+
+        def wrap(forward: Callable[..., Any]) -> Callable[..., Any]:
+            if hoisted is None:
+                return forward
+            from .hoist import WithHoistedParameters
+
+            return WithHoistedParameters(forward, hoisted, original_inputs)
+
         backend.megabake_last_prepared = prepared
         compile_kernel = validated_options["compile_kernel"]
         should_compile = compile_kernel is True or (
@@ -632,7 +648,7 @@ def make_backend(**options: Any) -> Callable[..., Any]:
             except CompilerError as error:
                 if validated_options["fallback"] != "inductor" or not error.safe_for_fallback:
                     raise
-                forward = compile_inductor_fallback(prepared, str(error))
+                forward = wrap(compile_inductor_fallback(prepared, str(error)))
                 backend.megabake_last_fallback = forward
                 forward.megabake_contexts = contexts
                 forward.megabake_cache = cache
@@ -644,6 +660,7 @@ def make_backend(**options: Any) -> Callable[..., Any]:
         else:
             forward = prepared.forward
             backend.megabake_last_fallback = None
+        forward = wrap(forward)
         forward.megabake_contexts = contexts
         forward.megabake_cache = cache
         forward.megabake_plan_cache = plan_cache

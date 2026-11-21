@@ -60,7 +60,17 @@ def kv_attention(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     valid_length: torch.Tensor,
+    scale: float = 0.0,
+    window: int = 0,
+    softcap: float = 0.0,
 ) -> torch.Tensor:
+    """One-token decode attention that appends to bounded KV caches.
+
+    Scores are the BF16 q·k products scaled in FP32 by ``scale`` (0 means
+    head_dim**-0.5), then mapped to softcap * tanh(s / softcap) when
+    ``softcap`` is set. With ``window`` set the query sees only the last
+    ``window`` keys (its own included): sliding-window attention over a
+    linear cache."""
     if source.shape[1] != 1:
         raise RuntimeError("megabake kv_attention supports one-token decode only")
     start = int(valid_length.item())
@@ -79,7 +89,11 @@ def kv_attention(
         group_size = query.shape[1] // keys.shape[1]
         keys = keys.repeat_interleave(group_size, dim=1)
         values = values.repeat_interleave(group_size, dim=1)
-    scores = (query @ keys.transpose(-2, -1)).float() * source.shape[-1] ** -0.5
+    scores = (query @ keys.transpose(-2, -1)).float() * (scale or source.shape[-1] ** -0.5)
+    if softcap:
+        scores = softcap * torch.tanh(scores / softcap)
+    if window and end > window:
+        scores[..., : end - window] = float("-inf")
     probabilities = torch.softmax(scores, dim=-1).to(source.dtype)
     output = probabilities @ values
     return output.permute(0, 2, 1, 3).reshape(
@@ -95,6 +109,9 @@ def _kv_attention_fake(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     valid_length: torch.Tensor,
+    scale: float = 0.0,
+    window: int = 0,
+    softcap: float = 0.0,
 ) -> torch.Tensor:
     return torch.empty(
         (
@@ -215,20 +232,93 @@ class CacheEffects:
 
 
 @dataclass(frozen=True)
-class Prologue:
-    """An elementwise producer of an attention operand that the body
-    evaluates in place of reading its result."""
+class PrologueStage:
+    """A source program the attention body evaluates wherever its result is
+    read: elementwise, or a row reduction (``combine`` summed over its
+    reduction axis, then ``post``) such as a q/k RMSNorm.
 
-    combine: ScalarExpression
-    loads: tuple[IndexedLoad, ...]
-    dtype: str
+    ``inputs`` maps a load of ``program`` to the earlier stage whose result
+    it reads (through views), and ``offsets`` gives that load's storage
+    offset from the stage result's storage. Other loads read memory."""
+
+    program: TensorProgram
+    inputs: Mapping[str, int] = field(default_factory=dict)
+    offsets: Mapping[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Prologue:
+    """Producers of an attention operand that the body evaluates for each
+    row it needs, in place of reading the operand. The last stage produces
+    the operand's storage; ``operand`` is the attention's own load of it, at
+    ``offset`` from that storage."""
+
+    operand: IndexedLoad
+    stages: tuple[PrologueStage, ...]
+    offset: int = 0
+
+
+@dataclass(frozen=True)
+class LinearRecurrence:
+    """Linear attention (``algorithm="linear"``): one decode token of a
+    recurrence over a per-value-head state ``S`` of ``head_k_dim x
+    head_v_dim`` FP32 elements (``megabake::linear_attention``).
+
+    One form covers Gated DeltaNet (Qwen3.5, Qwen3-Next), Kimi Delta
+    Attention, Mamba2 and plain gated linear attention:
+
+    1. ``x`` = causal conv(qkv), through SiLU when ``conv_silu``, when
+       ``conv_kernel`` is set, else qkv;
+       q, k and v are channel ranges of ``x`` from their offsets;
+    2. q and k L2-normalized when ``qk_l2norm``; q scaled by ``Attention.scale``;
+    3. log decay ``g``: ``-exp(A_log) * softplus(a + dt_bias)`` (``decay=
+       "softplus_gate"``) or the input itself (``"log"``), one per head or,
+       with ``decay_per_key``, one per key dimension;
+    4. ``S <- exp(g) * S``, then ``S <- S + k u^T`` with ``u = sigmoid(b)
+       (v - k^T S)`` (``update="delta"``) or ``u = v``, times
+       ``softplus(a + dt_bias)`` when ``dt_update`` (``"additive"``, Mamba2);
+    5. ``o = q^T S``, plus ``D * v`` when ``skip``; then, when ``norm``, each
+       head's RMSNorm with the ``output_gate`` activation of the gate input.
+
+    ``Attention.grouping`` reads value heads as query heads, key heads as KV
+    heads and head_k_dim as head_dim. ``state_layout`` is ``"kv"`` for a
+    ``[k, v]`` state (Hugging Face GDN/KDA) or ``"vk"`` (Mamba2). The
+    convolution window is read, not shifted: the declaring model shifts it.
+    """
+
+    state_value_id: str
+    state_layout: Literal["kv", "vk"]
+    head_v_dim: int
+    conv_kernel: int
+    q_offset: int
+    k_offset: int
+    v_offset: int
+    decay: Literal["softplus_gate", "log"]
+    decay_per_key: bool
+    update: Literal["delta", "additive"]
+    dt_update: bool
+    qk_l2norm: bool
+    skip: bool
+    output_gate: Literal["none", "silu", "sigmoid"]
+    norm: bool
+    norm_eps: float = 1e-6
+    # Round the normalized head to the input dtype before the weight product
+    # (Qwen3.5's gated norm); Kimi keeps it in FP32.
+    norm_rounds: bool = True
+    # SiLU after the causal convolution (every model here but the ComplexKDA
+    # checkpoints trained with ``drop_silu``).
+    conv_silu: bool = True
+    # The window is a ring of ``conv_kernel`` slots indexed by the token
+    # position, which the op writes (else ``conv_kernel - 1`` slots, read only).
+    conv_ring: bool = False
 
 
 @dataclass(frozen=True)
 class Attention:
-    """Softmax attention over the query, key and value accesses."""
+    """Softmax attention over the query, key and value accesses, or, with
+    ``algorithm="linear"``, a ``LinearRecurrence`` over a per-head state."""
 
-    algorithm: Literal["stable_softmax", "online_softmax"]
+    algorithm: Literal["stable_softmax", "online_softmax", "linear"]
     numerics: NumericalPolicy
     q: IndexedLoad
     k: IndexedLoad
@@ -244,6 +334,9 @@ class Attention:
     kv_state: KVCacheAccess | None = None
     # Keyed by the operand load they replace: attention:q or attention:new_k.
     prologues: Mapping[str, Prologue] = field(default_factory=dict)
+    # Scaled scores s become softcap * tanh(s / softcap) when set.
+    softcap: float = 0.0
+    recurrent: LinearRecurrence | None = None
 
 
 def _declared_grouping(query: IndexedLoad, key: IndexedLoad) -> HeadGrouping:
@@ -589,6 +682,8 @@ def stateful_candidate(operation: Op, graph: ComputeGraph) -> RegionCandidate | 
     state = program.state_accesses[0]
     loads = {load.id: load for load in program.loads}
     output_id = operation.results[0]
+    scale, window, softcap = _kv_attention_options(operation)
+    head_dim = loads["attention:q"].source_shape[3]
     return RegionCandidate(
         id=f"region:{operation.id.removeprefix('op:')}:kv_attention",
         source_op_ids=(operation.id,),
@@ -602,8 +697,12 @@ def stateful_candidate(operation: Op, graph: ComputeGraph) -> RegionCandidate | 
             k=loads["attention:k"],
             v=loads["attention:v"],
             grouping=_declared_grouping(loads["attention:q"], loads["attention:k"]),
-            scale=loads["attention:q"].source_shape[3] ** -0.5,
-            mask=Mask("stateful_causal", causal_offset=0),
+            scale=scale or head_dim**-0.5,
+            mask=Mask(
+                "stateful_causal",
+                causal_offset=0,
+                window_offsets=(1 - window, 0) if window else None,
+            ),
             outputs=(output_id,),
             boundary_output=output_id if output_id in graph.outputs else None,
             cache=CacheEffects(
@@ -620,6 +719,7 @@ def stateful_candidate(operation: Op, graph: ComputeGraph) -> RegionCandidate | 
                 ),
             ),
             kv_state=state,
+            softcap=softcap,
         ),
         cost_bytes=(
             2
@@ -632,25 +732,359 @@ def stateful_candidate(operation: Op, graph: ComputeGraph) -> RegionCandidate | 
     )
 
 
+def _kv_attention_options(operation: Op) -> tuple[float, int, float]:
+    """``scale``, ``window`` and ``softcap`` of a ``megabake::kv_attention``
+    call, positional or keyword, with the op's defaults."""
+    arguments = tuple(operation.attributes.get("fx_args", ()))[6:]
+    keywords = dict(operation.attributes.get("fx_kwargs", {}) or {})
+    names = ("scale", "window", "softcap")
+    values = dict(zip(names, arguments))
+    values.update({name: keywords[name] for name in names if name in keywords})
+    scale, window, softcap = (values.get(name, 0) for name in names)
+    if not all(isinstance(value, (int, float)) for value in (scale, window, softcap)):
+        raise UnsupportedLowering("KV attention scale, window and soft cap must be static")
+    return float(scale), int(window), float(softcap)
+
+
+# Prologue limits: stages per operand, and the elements a reduction stage's
+# row may span (OLMo-2 normalizes the whole projection, 2,048-4,096 wide).
+PROLOGUE_STAGES = 12
+PROLOGUE_ROW_ELEMENTS = 8192
+
+
+def prologue_enabled() -> bool:
+    """``MEGABAKE_ATTENTION_PROLOGUE=0`` keeps the query and key producers
+    as their own regions (an A/B switch)."""
+    import os
+
+    return os.environ.get("MEGABAKE_ATTENTION_PROLOGUE", "1") != "0"
+
+
+def dense_axes(store: TensorStore) -> tuple[tuple[int, int], ...] | None:
+    """(stride, size) per store axis when the store is dense, so that axis j
+    of the element at storage offset e is ``e // stride % size``; size-1
+    axes get (0, 1) and are always 0. None for any other layout."""
+    if len(store.shape) != len(store.strides):
+        return None
+    wide = sorted(
+        (stride, size) for stride, size in zip(store.strides, store.shape) if size != 1
+    )
+    expected = 1
+    for stride, size in wide:
+        if stride != expected:
+            return None
+        expected *= size
+    return tuple(
+        (stride, size) if size != 1 else (0, 1)
+        for stride, size in zip(store.strides, store.shape)
+    )
+
+
+def axis_value(axis: AxisExpression, coordinates: Mapping[str, int]) -> int:
+    """An access axis at integer iteration coordinates."""
+    if isinstance(axis, str):
+        return coordinates[axis]
+    if isinstance(axis, int):
+        return axis
+    if not isinstance(axis, AxisAffine):
+        raise UnsupportedLowering(f"prologue axis {axis!r} is data dependent")
+    value = axis.offset
+    for term in axis.terms:
+        coordinate = coordinates[term.axis] // term.divisor
+        if term.modulus:
+            coordinate %= term.modulus
+        value += coordinate * term.scale
+    return value
+
+
+def output_axes(program: TensorProgram) -> tuple[str, ...]:
+    return tuple(
+        domain.axis
+        for domain in program.iteration_domains
+        if domain.axis not in program.reduction_axes
+    )
+
+
+def _translate(
+    load: IndexedLoad, offset: int, coordinates: Mapping[str, int], stage: PrologueStage
+) -> dict[str, int] | None:
+    """The coordinates of ``stage`` that ``load`` reads at ``coordinates``;
+    None where the load is out of its bounds (it then reads zero)."""
+    values = [axis_value(axis, coordinates) for axis in load.axes]
+    if load.source_shape is not None and any(
+        not 0 <= value < size for value, size in zip(values, load.source_shape)
+    ):
+        return None
+    element = offset + sum(value * stride for value, stride in zip(values, load.strides))
+    axes = dense_axes(stage.program.store)
+    assert axes is not None
+    return {
+        axis: (element // stride % size if stride else 0)
+        for axis, (stride, size) in zip(output_axes(stage.program), axes)
+    }
+
+
+def _reduction_rows(
+    stages: tuple[PrologueStage, ...], index: int, coordinates: Mapping[str, int],
+    path: tuple[str, ...], found: dict[int, dict[tuple[str, ...], tuple[int, ...]]],
+) -> None:
+    """Record the row of every reduction stage that evaluating stage
+    ``index`` at ``coordinates`` reads, keyed by the load path to it."""
+    stage = stages[index]
+    program = stage.program
+    if program.reduction_axes:
+        found.setdefault(index, {})[path] = tuple(coordinates[axis] for axis in row_axes(program))
+    for load in program.loads:
+        if load.id in stage.inputs and not _load_axes(load) & set(program.reduction_axes):
+            inner = _translate(load, stage.offsets[load.id], coordinates, stages[stage.inputs[load.id]])
+            if inner is not None:
+                _reduction_rows(stages, stage.inputs[load.id], inner, (*path, load.id), found)
+
+
+def operand_coordinates(prologue: Prologue, b: int, head: int, d: int) -> dict[str, int]:
+    """Coordinates of the last stage at the operand element (b, 0, head, d)."""
+    element = prologue.offset + sum(
+        value * stride for value, stride in zip((b, 0, head, d), prologue.operand.strides)
+    )
+    program = prologue.stages[-1].program
+    axes = dense_axes(program.store)
+    assert axes is not None
+    return {
+        axis: (element // stride % size if stride else 0)
+        for axis, (stride, size) in zip(output_axes(program), axes)
+    }
+
+
+def _load_axes(load: IndexedLoad) -> set[str]:
+    axes: set[str] = set()
+    for axis in load.axes:
+        if isinstance(axis, str):
+            axes.add(axis)
+        elif isinstance(axis, AxisAffine):
+            axes.update(term.axis for term in axis.terms)
+    return axes
+
+
+def row_axes(program: TensorProgram) -> tuple[str, ...]:
+    """Output axes of a reduction stage that select its row: those its
+    reduction loads read besides the reduction axis."""
+    axes: set[str] = set()
+    for load in program.loads:
+        used = _load_axes(load)
+        if used & set(program.reduction_axes):
+            axes |= used
+    return tuple(axis for axis in output_axes(program) if axis in axes)
+
+
+def reduction_witnesses(
+    prologue: Prologue, heads: int, batch: int, head_dim: int
+) -> dict[int, tuple[int, tuple[str, ...]]] | None:
+    """For each reduction stage, a head dimension d and a load path from the
+    last stage that reach it in bounds for every (batch, head); the body
+    finds the head's row there. None if a (batch, head) reads more than one
+    row of a stage at any head dimension, so one statistic per head row
+    cannot serve it."""
+    witnesses: dict[int, set[tuple[int, tuple[str, ...]]]] = {}
+    for b in range(batch):
+        for head in range(heads):
+            rows: dict[int, set[tuple[int, ...]]] = {}
+            reached: dict[int, set[tuple[int, tuple[str, ...]]]] = {}
+            for d in range(head_dim):
+                found: dict[int, dict[tuple[str, ...], tuple[int, ...]]] = {}
+                _reduction_rows(
+                    prologue.stages, len(prologue.stages) - 1,
+                    operand_coordinates(prologue, b, head, d), (), found,
+                )
+                for index, paths in found.items():
+                    rows.setdefault(index, set()).update(paths.values())
+                    reached.setdefault(index, set()).update((d, path) for path in paths)
+            if any(len(values) != 1 for values in rows.values()):
+                return None
+            for index, pairs in reached.items():
+                witnesses[index] = witnesses[index] & pairs if index in witnesses else pairs
+    reductions = [
+        index for index, stage in enumerate(prologue.stages) if stage.program.reduction_axes
+    ]
+    if any(not witnesses.get(index) for index in reductions):
+        return None
+    return {index: min(witnesses[index]) for index in reductions}
+
+
+def _prologue_units(
+    graph: ComputeGraph, producers: tuple[RegionCandidate, ...]
+) -> dict[str, tuple[TensorProgram, tuple[str, ...]]]:
+    """Programs a prologue may absorb, keyed by the value they produce:
+    recognized candidates (RoPE, RMSNorm, elementwise chains), largest
+    first, then single elementwise ops."""
+    units: dict[str, tuple[TensorProgram, tuple[str, ...]]] = {}
+    for candidate in sorted(producers, key=lambda item: -len(item.source_op_ids)):
+        program = candidate.tensor_program
+        if (
+            not candidate.executable
+            or program is None
+            or len(candidate.live_outputs) != 1
+            or program.store.value_id != candidate.live_outputs[0]
+        ):
+            continue
+        if program.family in {"elementwise", "copy"} or program.source_target == "rms_norm":
+            units.setdefault(program.store.value_id, (program, candidate.source_op_ids))
+    for operation in graph.ops.values():
+        program = operation.tensor_program
+        if (
+            isinstance(program, TensorProgram)
+            and program.family in {"elementwise", "copy"}
+            and len(operation.results) == 1
+            and program.store.value_id == operation.results[0]
+            and not has_illegal_effects(operation)
+        ):
+            units.setdefault(operation.results[0], (program, (operation.id,)))
+    return units
+
+
+def _storage(value_id: str, graph: ComputeGraph) -> str | None:
+    relation = graph.values[value_id].storage_relation
+    if relation.unknown:
+        return None
+    return relation.storage_id or value_id
+
+
+def _build_prologues(
+    graph: ComputeGraph,
+    operands: Mapping[str, IndexedLoad],
+    units: Mapping[str, tuple[TensorProgram, tuple[str, ...]]],
+    banned: set[str],
+) -> tuple[dict[str, Prologue], dict[str, tuple[str, ...]]]:
+    """One prologue per operand from the absorbable producers not in
+    ``banned``, and the source ops each absorbed storage value brings."""
+    prologues: dict[str, Prologue] = {}
+    absorbed: dict[str, tuple[str, ...]] = {}
+    for load_id, operand in operands.items():
+        stages: list[PrologueStage] = []
+        index_of: dict[str, int] = {}
+
+        def absorb(owner: str) -> int | None:
+            if owner in index_of:
+                return index_of[owner]
+            unit = units.get(owner)
+            if unit is None or owner in banned or owner in graph.outputs:
+                return None
+            program, op_ids = unit
+            if (
+                dense_axes(program.store) is None
+                or program.store.value_id != owner
+                or any(
+                    not isinstance(axis, (str, int, AxisAffine))
+                    for load in program.loads
+                    for axis in load.axes
+                )
+                or (
+                    program.reduction_axes
+                    and (
+                        program.accumulator_dtype != "torch.float32"
+                        or not _is_sum(program.combine)
+                        or len(program.reduction_axes) != 1
+                        or next(
+                            domain.size
+                            for domain in program.iteration_domains
+                            if domain.axis == program.reduction_axes[0]
+                        ) > PROLOGUE_ROW_ELEMENTS
+                    )
+                )
+            ):
+                return None
+            inputs: dict[str, int] = {}
+            offsets: dict[str, int] = {}
+            for load in program.loads:
+                base = _storage(load.value_id, graph)
+                inner = None if base is None else absorb(base)
+                if inner is None:
+                    continue
+                if program.reduction_axes and _has_reduction(stages, inner):
+                    # One statistic level: the body sums a row of plain stages.
+                    return None
+                store = stages[inner].program.store
+                offset = graph.values[load.value_id].storage_offset - graph.values[base].storage_offset
+                if (
+                    load.dtype != store.dtype
+                    or load.source_shape is None
+                    or any(stride < 0 for stride in load.strides)
+                    or offset < 0
+                    or offset + sum((size - 1) * stride for size, stride in zip(load.source_shape, load.strides))
+                    >= _elements(store.shape)
+                ):
+                    return None
+                inputs[load.id] = inner
+                offsets[load.id] = offset
+            if len(stages) >= PROLOGUE_STAGES:
+                return None
+            stages.append(PrologueStage(program, inputs, offsets))
+            index_of[owner] = len(stages) - 1
+            absorbed[owner] = op_ids
+            return len(stages) - 1
+
+        owner = _storage(operand.value_id, graph)
+        if owner is None or absorb(owner) is None or index_of[owner] != len(stages) - 1:
+            continue
+        store = stages[-1].program.store
+        offset = graph.values[operand.value_id].storage_offset - graph.values[owner].storage_offset
+        if (
+            operand.dtype != store.dtype
+            or operand.source_shape is None
+            or offset + sum((size - 1) * stride for size, stride in zip(operand.source_shape, operand.strides))
+            >= _elements(store.shape)
+        ):
+            continue
+        prologues[load_id] = Prologue(operand, tuple(stages), offset)
+    return prologues, absorbed
+
+
+def _has_reduction(stages: list[PrologueStage], index: int) -> bool:
+    stage = stages[index]
+    return bool(stage.program.reduction_axes) or any(
+        _has_reduction(stages, inner) for inner in stage.inputs.values()
+    )
+
+
+def _elements(shape: tuple[int, ...]) -> int:
+    count = 1
+    for size in shape:
+        count *= size
+    return count
+
+
+def _is_sum(combine: ScalarExpression) -> bool:
+    from ..ir import Accumulator, Binary
+
+    return (
+        isinstance(combine, Binary)
+        and combine.operator == "add"
+        and isinstance(combine.lhs, Accumulator) != isinstance(combine.rhs, Accumulator)
+    )
+
+
 def prologue_candidates(
     graph: ComputeGraph, producers: tuple[RegionCandidate, ...]
 ) -> tuple[RegionCandidate, ...]:
     """Stateful decode attention that computes its query and new key from
-    their elementwise producers (RoPE) instead of reading them.
+    their producers instead of reading them: RoPE, and before it q/k norms
+    (Qwen3, OLMo-2, Gemma-3), their weight scales and casts.
 
-    The attention then binds the producer's input in place of its result,
-    which never materializes, and the producer's other operands (cos, sin)
-    as extra loads. Its body evaluates each producer's program for the one
-    row it needs (``Attention.prologues``).
+    From each operand the walk follows storage (so views between producer
+    and attention are transparent) back through absorbable producers. A
+    producer is absorbed only while every use of its result, and of every
+    view of it, is in the region; the walk repeats without any producer that
+    fails this. The attention binds the remaining leaf inputs, and its body
+    evaluates the stages for the rows it needs (``Attention.prologues``):
+    each reduction stage once per head row, checked here to read one row.
     """
-    by_output = {
-        candidate.live_outputs[0]: candidate
-        for candidate in producers
-        if candidate.executable
-        and len(candidate.live_outputs) == 1
-        and candidate.tensor_program is not None
-        and candidate.tensor_program.family == "elementwise"
-    }
+    if not prologue_enabled():
+        return ()
+    units = _prologue_units(graph, producers)
+    views_of: dict[str, list[str]] = {}
+    for value in graph.values.values():
+        owner = _storage(value.id, graph)
+        if owner is not None and owner != value.id:
+            views_of.setdefault(owner, []).append(value.id)
     candidates = []
     for operation in graph.ops.values():
         attention = stateful_candidate(operation, graph)
@@ -659,87 +1093,95 @@ def prologue_candidates(
         program = attention.tensor_program
         assert program is not None
         loads = list(program.loads)
-        prologues: dict[str, Prologue] = {}
-        operations: list[Op] = []
-        extra: dict[str, IndexedLoad] = {}
-        for load_id in ("attention:q", "attention:new_k"):
-            position = next(index for index, load in enumerate(loads) if load.id == load_id)
-            load = loads[position]
-            producer = by_output.get(load.value_id)
-            if (
-                producer is None
-                or load.value_id in graph.outputs
-                or graph.values[load.value_id].users != (operation.id,)
-            ):
-                continue
-            producer_program = producer.tensor_program
-            assert producer_program is not None
-            if (
-                producer_program.store.shape != load.source_shape
-                or producer_program.store.strides != load.strides
-            ):
-                continue
-            identity = tuple(domain.axis for domain in producer_program.iteration_domains)
-            # The producer input read at the output position takes the
-            # result's place in the attention's bindings.
-            source = next(
-                (
-                    candidate
-                    for candidate in producer_program.loads
-                    if candidate.axes == identity
-                    and candidate.strides == load.strides
-                    and candidate.dtype == load.dtype
-                ),
-                None,
-            )
-            if source is None:
-                continue
-            loads[position] = replace(load, value_id=source.value_id)
-            prologues[load_id] = Prologue(
-                producer_program.combine, producer_program.loads, producer_program.store.dtype
-            )
-            operations.extend(graph.ops[op_id] for op_id in producer.source_op_ids)
-            for candidate in producer_program.loads:
-                extra.setdefault(candidate.value_id, candidate)
+        operands = {load.id: load for load in loads if load.id in ("attention:q", "attention:new_k")}
+        grouping = attention.semantics.grouping
+        heads = {"attention:q": grouping.query_heads, "attention:new_k": grouping.kv_heads}
+        banned: set[str] = set()
+        while True:
+            prologues, absorbed = _build_prologues(graph, operands, units, banned)
+            try:
+                prologues = {
+                    load_id: prologue
+                    for load_id, prologue in prologues.items()
+                    if reduction_witnesses(
+                        prologue, heads[load_id], grouping.batch, grouping.head_dim
+                    )
+                    is not None
+                }
+            except UnsupportedLowering:
+                prologues = {}
+            used = {
+                stage.program.store.value_id: absorbed[stage.program.store.value_id]
+                for prologue in prologues.values()
+                for stage in prologue.stages
+            }
+            members = {op_id for op_ids in used.values() for op_id in op_ids}
+            members |= {
+                graph.values[view].producer
+                for owner in used
+                for view in views_of.get(owner, ())
+                if graph.values[view].producer is not None
+            }
+            members.add(operation.id)
+            # An absorbed result, and each of its views, is used only in the
+            # region and is no graph output.
+            leaking = {
+                owner
+                for owner in used
+                if any(
+                    value_id in graph.outputs
+                    or any(user not in members for user in graph.values[value_id].users)
+                    for value_id in (owner, *views_of.get(owner, ()))
+                )
+            }
+            if not leaking:
+                break
+            banned |= leaking
         if not prologues:
             continue
-        bound = {load.value_id for load in loads}
-        for value_id, candidate in extra.items():
-            if value_id not in bound:
-                # Point accesses keep the attention's access maps valid; the
-                # body reads these through the prologue's own loads.
-                loads.append(
-                    replace(
-                        candidate,
-                        id=f"prologue:{len(loads)}",
-                        axes=(0,) * len(candidate.strides),
-                    )
-                )
-                bound.add(value_id)
-        fused = replace(program, loads=tuple(loads))
-        fused_loads = {load.id: load for load in fused.loads}
-        operation_ids = {item.id for item in operations}
-        if len(operation_ids) != len(operations):
+        # Leaf loads of every stage. Each prologued operand becomes a point
+        # access to a leaf of its own prologue, which keeps the attention's
+        # access maps valid (the body reads operands through the stages);
+        # phase slots are per value, so every load must bind its own value.
+        point: dict[str, dict[str, IndexedLoad]] = {}
+        for load_id, prologue in prologues.items():
+            leaves = point.setdefault(load_id, {})
+            for stage in prologue.stages:
+                for load in stage.program.loads:
+                    if load.id not in stage.inputs:
+                        leaves.setdefault(load.value_id, replace(load, axes=(0,) * len(load.strides)))
+        bound = {load.value_id for load in loads if load.id not in prologues}
+        rebound = True
+        for position, load in enumerate(loads):
+            if load.id in prologues:
+                leaf = next((item for value_id, item in point[load.id].items() if value_id not in bound), None)
+                if leaf is None:
+                    rebound = False
+                    break
+                loads[position] = replace(leaf, id=load.id)
+                bound.add(leaf.value_id)
+        if not rebound:
             continue
+        for leaves in point.values():
+            for value_id, load in leaves.items():
+                if value_id not in bound:
+                    loads.append(replace(load, id=f"prologue:{len(loads)}"))
+                    bound.add(value_id)
+        fused = replace(program, loads=tuple(loads))
         candidates.append(
             RegionCandidate(
                 id=f"region:{operation.id.removeprefix('op:')}:attention_prologue",
-                source_op_ids=tuple(
-                    item.id
-                    for item in graph.ops.values()
-                    if item.id in operation_ids or item.id == operation.id
-                ),
+                source_op_ids=tuple(item.id for item in graph.ops.values() if item.id in members),
                 external_inputs=tuple(dict.fromkeys(load.value_id for load in fused.loads)),
                 live_outputs=attention.live_outputs,
                 tensor_program=fused,
-                semantics=replace(
-                    attention.semantics, q=fused_loads["attention:q"], prologues=prologues
-                ),
+                semantics=replace(attention.semantics, prologues=prologues),
                 cost_bytes=attention.cost_bytes
                 + sum(
-                    2 * value_bytes(load.value_id, graph)
-                    for load in program.loads
-                    if load.id in prologues
+                    2 * value_bytes(owner, graph)
+                    for prologue in prologues.values()
+                    for stage in prologue.stages
+                    for owner in (stage.program.store.value_id,)
                 ),
             )
         )
