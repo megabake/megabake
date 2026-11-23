@@ -53,7 +53,7 @@ Reproduce on an SM90 device:
 
 ```bash
 .venv/bin/python benchmarks/full_model.py --model HuggingFaceTB/SmolLM-135M HuggingFaceTB/SmolLM-1.7B
-.venv/bin/python benchmarks/full_model.py --variants inductor megabake --modes decode   # a subset
+.venv/bin/python benchmarks/full_model.py --modes decode --contexts 0 4096               # decode only, two contexts
 MEGABAKE_PHASE_TIMER=1 .venv/bin/python tools/phase_profile.py --mode decode            # time per barrier interval
 .venv/bin/python tools/dump_megakernels.py --checkpoint                                   # correctness check plus generated source
 ```

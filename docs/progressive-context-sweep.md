@@ -110,8 +110,7 @@ Beam’s load also reported missing embedding and LM-head weights, so treat its 
 
 Reproduce one model with:
 
-    TORCHINDUCTOR_CACHE_DIR=... .venv/bin/python benchmarks/full_model.py --model HuggingFaceTB/SmolLM-135M --modes \
-        --decode-contexts 16 32 64 128 256 512 1000 2000 4000 8000 \
-        --variants inductor_hf megabake_graphed --hf-attention eager
+    TORCHINDUCTOR_CACHE_DIR=... .venv/bin/python benchmarks/full_model.py --model HuggingFaceTB/SmolLM-135M --modes decode \
+        --contexts 16 32 64 128 256 512 1000 2000 4000 8000 --hf-attention eager
 
 Artifacts (per-model `report.json` and logs) are in `artifacts/fair_sweep_2026-11-15/`; the whole sweep is `experiments/newarch/fair_sweep.sh`.

@@ -73,6 +73,6 @@ mkdir -p "$OUT"
 .venv/bin/python tools/greedy_check.py --model "$MODEL" --tokens 64 --capacity 256 | tee "$OUT/greedy.out"
 
 step "Benchmark: decode, KV capacity 256"
-.venv/bin/python benchmarks/full_model.py --model "$MODEL" --modes decode --capacity 256 --out "$OUT/bench"
+.venv/bin/python benchmarks/full_model.py --model "$MODEL" --modes decode --out "$OUT/bench"
 
 step "Done. Results in $OUT"

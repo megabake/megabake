@@ -52,22 +52,8 @@ def test_shape_tuning_file_accepts_original_settings(monkeypatch, tmp_path):
     assert tuning.choice_for_shape(target, 1, 128, 512) in ((64, 1), (128, 1))
 
 
-def test_graphed_baseline_copies_new_tokens():
-    from benchmarks.full_model import GraphedStep
-
-    token = torch.tensor([[1]], device="cuda")
-    step = GraphedStep(lambda token, position: token + position, token, [])
-    for token_value, position_value in ((3, 2), (8, 5)):
-        result = step(
-            torch.tensor([[token_value]], device="cuda"),
-            torch.tensor([[position_value]], device="cuda"),
-        )
-        assert result.item() == token_value + position_value
-
-
 def test_graphed_prefill_copies_new_inputs(monkeypatch, tmp_path):
-    from benchmarks.full_model import GraphedPrefill
-    from megabake import compiler, make_backend
+    from megabake import compiler, graphed, make_backend
 
     monkeypatch.setattr(compiler, "_TABLE_LAUNCH_OPS", 0)
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
@@ -85,10 +71,10 @@ def test_graphed_prefill_copies_new_inputs(monkeypatch, tmp_path):
     )
     function = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
     with torch.no_grad():
-        graph = GraphedPrefill(function, source, mask)
+        graph = graphed(lambda tokens, attention_mask: function(tokens, attention_mask=attention_mask), source, mask)
         for x, y in ((source, mask), (source + 0.125, mask - 0.125)):
             torch.testing.assert_close(
-                graph(x, attention_mask=y), model(x, attention_mask=y), atol=0.01, rtol=0.03
+                graph(x, y), model(x, attention_mask=y), atol=0.01, rtol=0.03
             )
 
 
